@@ -1,0 +1,27 @@
+# Secrets / local config (the Clay session cookie must never be committed)
+.env
+*.env
+!.env.example
+references/*.env
+!references/.env.example
+clay-session.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Tool output / scratch
+scripts/tmp/
+tmp/
+**/clay-artifacts/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
