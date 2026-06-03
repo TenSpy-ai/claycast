@@ -61,13 +61,30 @@ claycast/                      # ~/.claude/skills/claycast/  (or  <project>/.cla
 
 ## Authentication
 
-ClayCast reads your Clay session cookie from the `CLAY_SESSION` environment variable (or a `.env` file discovered by walking up from your working directory). Nothing is hardcoded and no cookie is stored in the repo.
+ClayCast authenticates with your Clay **session cookie** (`claysession` in your browser — grab it from DevTools → Application → Cookies; full steps in [`references/cookie-setup.md`](references/cookie-setup.md)). Nothing is hardcoded and no cookie is stored in the repo.
 
-```bash
-export CLAY_SESSION='s%3A...your-cookie...'
-```
+It resolves the cookie in this order:
 
-See [`references/cookie-setup.md`](references/cookie-setup.md) for how to grab the cookie from your browser and the supported `.env` layout.
+1. The **`CLAY_SESSION` environment variable** — simplest, works from anywhere:
+   ```bash
+   export CLAY_SESSION='s%3A...your-cookie...'
+   ```
+2. Otherwise, the nearest **`.env`** file containing `CLAY_SESSION=`, found by walking **up from your current directory to your project root** (the walk stops at the first `.git`, your home dir, or `/`).
+
+### Activate it with a `.env` file
+
+- **Already have a `.env` containing `CLAY_SESSION=` somewhere from your working dir up to your project root? You're done — nothing to do.**
+- **Otherwise**, turn the bundled template into a real `.env`:
+  ```bash
+  cp references/.env.example .env        # place it at your PROJECT root
+  ```
+  Open the new `.env`, set your cookie, and save:
+  ```
+  CLAY_SESSION=s%3A...your-cookie-value...
+  ```
+  ClayCast picks it up on the next run.
+
+> ⚠️ `references/.env.example` is only the **format template**. Copy it out to a `.env` that sits **on the walk-up path** — your project root (or your clone's root if you run ClayCast standalone). Just renaming it in place inside `references/` won't be found: the loader searches *up the directory tree from where you run it*, not inside the skill's own folder. `.env` is gitignored — never commit it.
 
 ## Use it directly from Python
 
