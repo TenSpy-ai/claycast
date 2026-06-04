@@ -237,7 +237,7 @@ clay.run_column(TABLE_ID, [ai_field_id], record_ids=RECORD_IDS)
 
 ```python
 # ✅ CORRECT — field ID reference
-"{{f_<field_id>}}"
+"{{f_xxx}}"
 
 # ❌ WRONG — Clay formula parser ignores name references
 "{{Company URL}}"
@@ -1018,7 +1018,7 @@ field = clay.create_column(table_id, {
     "type": "text",
     "name": "Company URL"
 })
-field_id = field["id"]   # e.g. "f_<field_id>"
+field_id = field["id"]   # e.g. "f_xxx"
 
 # 3. Create in existing workbook
 table = clay.create_table("My Table", workbook_id="wb_xxx")
@@ -1454,7 +1454,7 @@ When the user hovers or opens a preset's config, Clay fires `GET /v3/tables/{t}/
 
 ## Audience endpoints (documented, NOT yet wrapped in claycast)
 
-Captured via browser request-interception on 2026-04-30. These power Clay's "Find People" / "Find Companies" / audience-search product surface. **Not yet exposed via claycast SDK methods** — until they're implemented, call them via the raw HTTP escape hatch (`clay.get(path, params=...)` for GETs, `clay.post(path, body)` for POSTs). Closing the SDK gap here would partially close `feature-gaps.md` #2 ("Find People sourced-table creation").
+Captured during clay-spy smoke tests on 2026-04-30. These power Clay's "Find People" / "Find Companies" / audience-search product surface. **Not yet exposed via claycast SDK methods** — until they're implemented, call them via the raw HTTP escape hatch (`clay.get(path, params=...)` for GETs, `clay.post(path, body)` for POSTs). Closing the SDK gap here would partially close `feature-gaps.md` #2 ("Find People sourced-table creation").
 
 Required query params and body shapes are listed verbatim from the captured calls — Clay's server validates these, so they are NOT optional unless noted.
 
@@ -1482,7 +1482,7 @@ Required query params and body shapes are listed verbatim from the captured call
 | `GET /v3/workspaces/{ws}/tables/{t}/views/{v}/ad-audiences` | none | observed `null` in capture (may need a different state to populate) |
 | `GET /v3/workspaces/{ws}/ad-audiences/sync-limit-status` | none | `{limit, used, remaining, canStartNewSync, isEnabled}` |
 
-Concrete request/response payloads can be obtained by intercepting the corresponding `kind: "http"` calls in the browser.
+Concrete request/response payloads for any of these are in the local clay-spy capture archives (look for the corresponding `kind: "http"` lines).
 
 ---
 
@@ -1498,7 +1498,7 @@ Captured during the Find leads UI walkthrough on 2026-04-30. **This is the endpo
 
 ```json
 {
-  "workspaceId": 123456,
+  "workspaceId": 12345,
   "workbookName": "People Search",
   "workbookId": null,                          // null = create new workbook; or existing wb_<id>
   "conversationId": "cc_<id>",                 // chat-conversation that built filters; can be null for direct creation
@@ -1580,7 +1580,7 @@ The Find leads UI fires this on every filter change. Body shape:
 
 ```json
 {
-  "workspaceId": "123456",                  // STRING (numeric value rejected with `"workspaceId" must be a string`)
+  "workspaceId": "12345",                  // STRING (numeric value rejected with `"workspaceId" must be a string`)
   "enrichmentType": "<one of allowed list>",
   "options": {"sync": true, "returnTaskId": true, "returnActionMetadata": true},
   "inputs": {"limit": 50, ...filter dict...}
@@ -1630,7 +1630,7 @@ For the `*-preview` variants:
 | `GET /v3/ai-quickstart/{ws}/sculptor-suggestions` | AI-suggested filter values based on workspace context |
 | `GET /v3/workspaces/{ws}/rollover-multiplier?billingSchedule=monthly\|annually` | Rollover credit rate per billing period |
 | `GET /v3/credit-accrual?workspaceId={ws}&rewardsOnly=true` | Credit accrual filtered to rewards-only |
-| `POST /v3/123456/ai-generation/chat-conversation` | Create new ai-chat-conversation (Find leads filter UI lives in one of these) |
+| `POST /v3/12345/ai-generation/chat-conversation` | Create new ai-chat-conversation (Find leads filter UI lives in one of these) |
 | `GET /v3/{ws}/ai-generation/chat-conversation/{cc_id}/source-state` | Read filter state for a conversation |
 | `PATCH /v3/{ws}/ai-generation/chat-conversation/{cc_id}/source-state` | Update filter state (fires on every UI filter change) |
 | `GET /v3/{ws}/ai-generation/chat-conversation/{cc_id}/messages` | Read messages in conversation |
@@ -1770,19 +1770,19 @@ After running a preview, the "Continue" button has 3 menu items. **Options 1 and
 
 **Unified contract for options 1 + 2:** the same endpoint handles both new-table and existing-table flows. The presence of `cpjConfig.destinationTableId` is the discriminator. Response shape is identical except for `isNewTable`.
 
-Verified live 2026-04-30 by pushing the "test" preset into existing table `t_<existing_table_id>`:
+Verified live 2026-04-30 by pushing the "test" preset into existing table `t_xxx`:
 
 ```json
 // Body (Save-to-existing variant)
 {
-  "workspaceId": "123456",
+  "workspaceId": "12345",
   "workbookName": "People Search",          // still sent even though new wb isn't created
   "workbookId": null,                        // null even though target table has a known workbook
   "conversationId": "cc_<id>",
   "assignedFieldId": "f_people_search",
   "cpjConfig": {
     "type": "people",
-    "destinationTableId": "t_<existing_table_id>",   // <-- the discriminator
+    "destinationTableId": "t_xxx",   // <-- the discriminator
     "typeSettings": {<same as new-table flow>},
     "clientSettings": {"tableType": "people"},
     "basicFields": [<same 7 default fields>],
@@ -1792,9 +1792,9 @@ Verified live 2026-04-30 by pushing the "test" preset into existing table `t_<ex
 
 // Response
 {
-  "tableId": "t_<existing_table_id>",
-  "viewId": "gv_<view_id>",         // existing view of the existing table
-  "workbookId": "wb_<workbook_id>",     // resolved server-side from destinationTableId
+  "tableId": "t_xxx",
+  "viewId": "gv_xxx",         // existing view of the existing table
+  "workbookId": "wb_xxx",     // resolved server-side from destinationTableId
   "sourceId": "s_<NEW source id>",            // a NEW source is created even on append
   "isNewTable": false
 }

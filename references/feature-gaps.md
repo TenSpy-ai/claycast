@@ -4,7 +4,7 @@ Snapshot of capabilities users commonly need for **mostly-headless Clay workflow
 
 **When to consult this doc:** if a user asks "can claycast do X?" and X isn't in the capability map in SKILL.md, check here before saying "no, use the Clay UI." Some gaps have achievable workarounds; others genuinely block automation.
 
-**How this doc was generated:** analyzed Clay's primary use cases against the current claycast SDK surface. Reviewed 2026-04.
+**How this doc was generated:** analyzed Clay's primary use cases against the claycast SDK surface after the clay_record_writer_v2 port, the WIP-new 8-tool port, and the WIP-merge export/inspection port. Reviewed 2026-04.
 
 ## Recently closed
 
@@ -18,7 +18,7 @@ Snapshot of capabilities users commonly need for **mostly-headless Clay workflow
 - `CLOSED 2026-04-30:` workspace-metadata helpers added — `clay.list_workspace_users(...)`, `clay.get_workbook_overview(...)`, `clay.list_agent_configs(...)`.
 - `CLOSED 2026-04-30:` source run history added — `clay.list_source_runs(source_id, limit=...)`.
 - `CLOSED 2026-04-30:` dynamic action-field resolution added — `clay.get_dynamic_action_fields([...])`. Lets callers learn valid options for action dropdowns (e.g. Salesforce `object_type`) before invoking `apply_preset` / `create_action_column`.
-- `CLOSED 2026-04-30:` Find People AND Find Companies sourced-table creation is now available via `clay.preview_sourced_table(...)` + `clay.create_sourced_table(...)`. Both `cpj_type="people"` and `cpj_type="companies"` are live-verified (a test workspace).
+- `CLOSED 2026-04-30:` Find People AND Find Companies sourced-table creation is now available via `clay.preview_sourced_table(...)` + `clay.create_sourced_table(...)`. Both `cpj_type="people"` and `cpj_type="companies"` are live-verified (workspace 12345).
 - `CLOSED 2026-04-30:` credit-usage / spend reporting is now available via `clay.get_credit_usage(...)`, `clay.get_table_credit_usage(...)`, and `clay.get_default_workbook_credit_limit(...)`. The UI's client-side credit-usage CSV recreation remains intentionally deferred.
 - `CLOSED 2026-04-30:` audience-segment export is now available via `clay.list_audience_segments(...)`, `clay.count_audience_segment(...)`, and `clay.export_audience_segment(...)`.
 
@@ -101,7 +101,7 @@ ClayCast has `list_subroutines` but no `run_subroutine(subroutine_id, inputs=...
 
 **Why it matters:** Clay's UI exposes rich credit-spend analytics (per-workbook, per-integration, per-signal, per-trigger, per-MCP-server, per-API-key) plus per-table drill-down (time-series, by-column, by-run breakdowns). For ops dashboards, cost-attribution to teams or campaigns, or anomaly detection, you'd want to query this data programmatically — and currently you'd have to. Plus the default-credit-limit endpoint is the only safe path for governance ("set default of X credits for any new workbook so a runaway pipeline can't burn the workspace").
 
-**Endpoints captured live 2026-04-30 in a test workspace:**
+**Endpoints captured live 2026-04-30 in workspace 12345:**
 
 #### A. Top-level credit reporting (the 6 tab views)
 
@@ -132,11 +132,11 @@ GET /v3/credit-reporting/{ws}/creditReportType/{type}
   "entities": [
     {
       "id": "f_<id>",                                     // folder id (or wb_<id> at next level)
-      "entity": {"name": "My Folder", "isDeleted": false, "__kind": "folder"},
-      "credits": 1234.5,
-      "actionExecutions": 1000,
+      "entity": {"name": "TRA", "isDeleted": false, "__kind": "folder"},
+      "credits": 15109.5,
+      "actionExecutions": 12266,
       "subentities": [
-        {"id": "wb_<id>", "entity": {"name": "Lead Scoring", "__kind": "workbook"}, "credits": ..., "actionExecutions": ..., "subentities": [...]}
+        {"id": "wb_<id>", "entity": {"name": "JR: Scoring WIP", "__kind": "workbook"}, "credits": ..., "actionExecutions": ..., "subentities": [...]}
       ]
     }
   ],
@@ -318,7 +318,7 @@ def _encode_filters(*, owner_ids, integration_ids, is_recurring_only, has_credit
 
 **Tier:** 2 (high value, workaround-able). Workaround is hand-rolling the URL with bracket-array params, which is doable but undiscoverable from claycast's capability map and easy to get wrong (the workspaceId-must-be-string gotcha from `validate_auth_credentials` doesn't apply here, but bracket-array encoding is its own footgun).
 
-**Walkthrough notes:** the verified filter-param schema, the radio-toggle / Download-CSV client-side findings, and the URL-state observations were captured during a UI walkthrough on 2026-04-30.
+**Walkthrough notes:** detailed UI walkthrough at `/tmp/credit-usage-walkthrough-notes.md` (workspace 12345, captured 2026-04-30) — has the verified filter-param schema, the radio-toggle / Download-CSV client-side findings, and the URL-state observations.
 
 ### 9. Audience-segment export (the only path to >50K rows)
 
@@ -392,7 +392,7 @@ while True:
 **Notable design points:**
 
 - The 300-row default `page_size` matches what the Clay UI uses (verified in HAR captures). Bumpable but unverified-above-300.
-- `audiences/contacts` returns full per-row data inline via `contact.entity.fields[]` — same field set the per-contact detail endpoint (`GET /audiences/contacts/{id}`) returns. **No N+1 detail fetches needed for the standard fields.** Verified 2026-04-30 by diffing both responses against the same record (id <record_id>): same 17 `field_id` entries, just wrapped differently.
+- `audiences/contacts` returns full per-row data inline via `contact.entity.fields[]` — same field set the per-contact detail endpoint (`GET /audiences/contacts/{id}`) returns. **No N+1 detail fetches needed for the standard fields.** Verified 2026-04-30 by diffing both responses against the same record (id 464501906): same 17 `field_id` entries, just wrapped differently.
 - The CSV writer should pivot `entity.fields[]` from flat key/value/type rows into columns — each unique `field_id` becomes a column header. Example fields seen: `name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `country_iso`, `created_at`, `updated_at`, `origin_source_id`, `origin_source_type`, `is_draft`, `sources`, `enhanced_match_status`, `external_source_sync_status_v[123]`. Other fields visible in the UI's "All information" panel (Email, Phone, Job title, Seniority, Department, Hashed email 1-3) are NOT returned by the list endpoint when null — they're UI-side placeholders that render as `—`. So the CSV will only have columns for fields that have at least one populated row; null-only fields are omitted.
 - For Companies (ACCOUNT), drop `includeData.accountIds` — that's a contacts-specific field.
 - **Optional richer exports** for callers who want more than the default `entity.fields`: per-record signals, activities, and custom-objects each live in a separate endpoint (`GET /audiences/entities/{id}/signal-events`, `/audiences/entities/{id}/activities`, `/audiences/contacts/{id}/custom-objects`). These would be N+1 (one call per record), so expose via opt-in flags like `include_signals=False`, `include_activities=False`, `include_custom_objects=False`.

@@ -88,6 +88,7 @@ tables = clay.list_tables()
 | Workspace | `list_workspaces`, `get_workspace_permissions`, `list_workspace_contents`, `get_workbook`, `list_workbook_tables`, `find_tables`, `get_workspace_hierarchy`, `get_resource_urls` |
 | Tables | `create_table`, `list_tables`, `list_folders`, `get_table`, `get_schema`, `get_field_map`, `count_records`, `inspect_table`, `delete_table` |
 | Fields / Columns | `list_fields`, `apply_field_operations`, `create_column`, `create_action_column`, `create_formula_column`, `update_column`, `delete_column`, `delete_fields`, `move_field`, `reorder_fields`, `set_field_visibility`, `set_fields_visibility`, `set_condition` |
+| Dependency graph | `get_table_graph`, `get_field_dependents`, `get_field_dependencies` — authoritative column-dependency edges (the same graph Clay's delete-warning uses). Use these for ANY "what depends on X" question; never string-match `formulaText`. `delete_column`/`delete_fields` are guarded by this graph. |
 | Field groups | `create_field_group`, `update_field_group`, `move_field_group`, `ungroup`, `delete_field_group` |
 | Imports | `preview_csv_input`, `import_csv_to_table`, `get_import_job`, `wait_for_import_job` |
 | Sources | `list_sources`, `get_source`, `create_webhook_source`, `list_source_runs` |
@@ -176,7 +177,7 @@ Other helpers in this cluster:
 `create_sourced_table(workbook_name, inputs=..., cpj_type="people"|"companies")` is the materialization step: one call to `POST /sources/create-cpj-table` that returns `{tableId, viewId, workbookId, sourceId, isNewTable}`. This is the ClayCast path for headless Find People / Find Companies imports.
 
 Notes:
-- both `cpj_type="people"` and `cpj_type="companies"` are live-verified against a test workspace (latest pass: 2026-05-01)
+- both `cpj_type="people"` and `cpj_type="companies"` are live-verified against workspace 12345 (latest pass: 2026-05-01)
 - Companies preview follows the same hard 50-row cap as People; `limit=51` raises before any network call
 - the body contract is asymmetric — `cpjConfig.type` is `"companies"` (plural) but `clientSettings.tableType` is `"company"` (singular). ClayCast maps this internally via `_CPJ_CLIENT_TABLE_TYPE`.
 - the Companies `Size` starter column now defaults to plain `text`, not a hardcoded `select`, so ClayCast no longer depends on frontend-captured option UUIDs in the normal path. If you explicitly want the old chip-style Size column, `from clay_client import companies_basic_fields_with_select_size` and pass `basic_fields_override=companies_basic_fields_with_select_size()`.
@@ -313,11 +314,11 @@ The capability map above is an index, not a reference. For exact kwargs, return 
 
 ---
 
-## CRUD operation cheatsheet
+## Migrating from the `clay_record_writer_v2` Datagen flow
 
-ClayCast exposes a full set of record-CRUD methods. Quick reference:
+ClayCast ports every mode of the writer deployed at Datagen UUID `71197300-6fdb-4ed6-bd50-aad91eff49ef`. If you've been calling that flow, here's the equivalence:
 
-| Operation | Input shape | ClayCast method |
+| Writer mode | Writer input shape | ClayCast equivalent |
 |---|---|---|
 | `create`   | `records=[{field_name: value}]`             | `clay.create_records(t, records, field_names=True)` |
 | `update`   | `records=[{_record_id, field_name: value}]` | `clay.bulk_update_records(t, records, field_names=True)` |
@@ -327,7 +328,7 @@ ClayCast exposes a full set of record-CRUD methods. Quick reference:
 | `read_one` | `record_id`                                 | `clay.get_record_by_name(t, record_id)` |
 | `count`    | —                                           | `clay.count_records(t)` |
 
-**Running CRUD from inside Clay vs. from Python:** ClayCast is a Python SDK — it runs CRUD from your own Python process and cannot execute inside Clay's action runtime. If you need CRUD callable from *inside* Clay (e.g., an `http-api-v2` action column that writes to another Clay table), expose the operation behind your own HTTP endpoint instead; ClayCast can't run there.
+**When to keep using the Datagen flow instead of claycast:** the writer is deployed as an HTTP endpoint (sync `POST https://api.datagen.dev/apps/71197300-6fdb-4ed6-bd50-aad91eff49ef`, async variant with `/async`). If you need CRUD callable from *inside* Clay — e.g., an `http-api-v2` action column that writes to another Clay table — keep using the Datagen endpoint, because claycast is a Python SDK and can't run inside Clay's action runtime. ClayCast is for running CRUD from your own Python; the Datagen flow is for calling CRUD from inside Clay itself.
 
 ---
 
@@ -380,6 +381,7 @@ Highest-risk items only. Full list in `references/clay-api-reference.md` (see it
 - **Listing records has two working endpoints.** `GET /tables/{t}/views/{v}/records?limit=N` returns `{results: [...]}` directly and honors `limit` (verified 2026-04-23). The old view-only `GET /views/{id}/records` (no tables prefix) 404s and is unsupported. `list_records(..., strategy="auto")` uses the direct endpoint only when `limit` is set AND `field_ids` is omitted; otherwise it uses the 2-step `get_record_ids()` → `get_records()` path against `POST /tables/{t}/bulk-fetch-records`. Do not reinvent offset/cursor paging.
 - **`dataTypeSettings.type` is `text` for formula/display columns but `json` for record-returning action columns.** For a **formula or plain text** column, `{"type": "json"}` is accepted by the API but breaks the Clay UI with "Could not find properties for data type json" — use `text`. For an **action column that returns structured records** (Salesforce lookup / SOQL, enrichments, anything whose cell is an object or array), the opposite holds: `text` is *rejected at create time* with the opaque `400 BadRequest "value does not match any of the allowed types"`, and you must pass `{"type": "json"}`. The json column renders fine in the UI for these actions (verified: a `salesforce-lookup-record-v2` column has used json in production since 2026-04). `create_action_column` defaults `data_type="json"` for known record-returning action keys (see its docstring); pass `data_type` explicitly to override. Verified 2026-05-28.
 - **`actionKey` must be `"use-ai"`**, not `"ai"` — the wrong key silently drops all `inputsBinding`. `create_action_column` raises `ValueError` if you pass the wrong one.
+- **Dependency checks MUST use the graph, not `formulaText`.** "What depends on column X?" cannot be answered by string-matching `{{f_id}}` in `formulaText`: `execute-subroutine` (and other) actions bind inputs via **`formulaMap`** (a dict of named sub-inputs), `ConditionalRun` is a separate edge type, and the delete dialog warns about the **transitive** downstream. Use `get_field_dependents(table_id, field_id, transitive=…)` / `get_table_graph()`, which read Clay's own `GET /tables/{t}/graph` (the source the UI's delete-warning uses). `delete_column`/`delete_fields` now consult that graph and **raise** listing dependents unless `force=True`. (Verified 2026-06-04: a formulaText-only scan called a column orphaned while the graph showed an `execute-subroutine` taking it as a `formulaMap` input, with 28 transitive downstream columns.)
 - **`404 "App Account not found"` on column create = stale `authAccountId`.** Once the opaque 400 above is cleared (by using json), the next failure is usually a 404 because the `authAccountId` you passed no longer exists. The `authAccountId` baked into an *existing* column's `typeSettings` can be stale — we hit a workspace where existing Salesforce columns referenced an `aa_…` id that `list_auth_accounts()` no longer returned. **Always resolve auth fresh via `list_auth_accounts_by_type('<type>')`; never copy `authAccountId` out of an existing column's typeSettings.** Verified 2026-05-28.
 
 ---

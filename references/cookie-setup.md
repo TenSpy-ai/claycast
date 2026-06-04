@@ -53,9 +53,9 @@ A template lives at `references/.env.example` — copy it to `<project-root>/.en
 1. Process environment variable `CLAY_SESSION` (export in your shell if you prefer).
 2. `.env` walk-up from the current working directory — resolves symlinks first, checks `./.env`, then each parent directory for `CLAY_SESSION=`, and stops at the first ancestor containing a `.git` directory, at `$HOME`, or at the filesystem root. If a candidate `.env` exists but cannot be read, the loader raises a `RuntimeError` naming that path instead of skipping it silently.
 
-This path-walking behavior means the skill is portable: it does not look inside its own install directory, so moving the skill between `~/.claude/skills/` or any other install location does not change which `.env` is read. The cookie always belongs to the project, not the skill.
+This path-walking behavior means the skill is portable: it does not look inside its own install directory, so moving the skill between `~/.claude/skills/`, `~/.claude-work/skills/`, or any global location does not change which `.env` is read. The cookie always belongs to the project, not the skill.
 
-This skill does NOT read `clay-session.json`. The only accepted source is the `CLAY_SESSION` env var (process or `.env`).
+This skill does NOT read `clay-session.json` — that file from the upstream ClayCast repo is unsupported. The only accepted source is the `CLAY_SESSION` env var (process or `.env`).
 
 ---
 

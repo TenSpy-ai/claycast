@@ -2218,7 +2218,7 @@ class ClayClient:
 
     # ── Audience export ──────────────────────────────────────────────────────
     # `list_audience_segments`, `count_audience_segment`, and
-    # `export_audience_segment` verified live 2026-04-30 against a test workspace.
+    # `export_audience_segment` verified live 2026-04-30 against workspace 12345.
     # The Tier A smoke used CONTACT segment `audseg_0teby2faukyeXceTebK`; the
     # count/export path returned 0 rows cleanly and wrote a local JSON artifact.
 
@@ -3237,24 +3237,125 @@ class ClayClient:
 
     # ── Fields (delete) ────────────────────────────────────────────────────────
 
-    def delete_column(self, table_id: str, field_id: str) -> dict:
-        """Delete a single column from a table via the legacy single-id path.
-        For multi-column deletes, prefer `delete_fields()` (uses the bulk
-        endpoint that Clay's UI uses)."""
-        return self.delete(f"/tables/{table_id}/fields/{field_id}")
+    # ── Dependency graph (authoritative — what Clay's delete-warning uses) ────
 
-    def delete_fields(self, table_id: str, field_ids: list[str]) -> dict:
+    def get_table_graph(self, table_id: str) -> dict:
+        """Fetch Clay's column-dependency graph: `GET /tables/{t}/graph`.
+
+        Returns `{"nodes": [...], "edges": [...]}`. Each node has
+        nodeId/name/type/field/extractedFieldIds. Each edge is
+        `{"sourceNodeId", "targetNodeId", "type"}` where type is `"Input"` or
+        `"ConditionalRun"`; an edge source->target means **target DEPENDS ON
+        source**. A synthetic `"root"` node is the table's source rows.
+
+        This is the SAME graph Clay's UI reads for its delete-warning dialog —
+        use it for EVERY "what depends on X" question. Do NOT hand-roll
+        dependency detection by string-matching `formulaText`: that misses
+        `formulaMap` inputs (subroutine / dict-style bindings), `ConditionalRun`
+        edges, and transitive dependents. (Verified 2026-06-04: a
+        formulaText-only scan reported a column as orphaned while Clay's graph
+        showed an `execute-subroutine` taking it as an input via `formulaMap`,
+        with 28 transitive downstream columns.)
         """
-        Delete one or more fields (columns) from a table in a single call.
-        Table-scoped — affects all views.
+        return self.get(f"/tables/{table_id}/graph")
 
-        Endpoint: `DELETE /tables/{t}/fields` body: `{"fieldIds": [...]}`.
-        This is the bulk primitive Clay's UI uses for both single and multi-
-        column deletes. Use this for any new code; `delete_column` remains
-        for backward compatibility on the legacy single-id path.
+    def get_field_dependents(self, table_id: str, field_id: str, *,
+                             transitive: bool = False,
+                             graph: dict | None = None) -> list[dict]:
+        """Columns that DEPEND ON `field_id` (would break if it changed or was
+        deleted), per Clay's graph. `transitive=False` -> direct dependents
+        only; `True` -> full downstream closure (what the delete dialog warns
+        about). Returns `[{field_id, name, type}]` (`type` is the edge type for
+        direct edges, `""` for transitively-reached nodes). Pass `graph=` to
+        reuse a graph you already fetched."""
+        g = graph or self.get_table_graph(table_id)
+        nid2name = {n.get("nodeId"): n.get("name") for n in g.get("nodes", [])}
+        out_edges: dict[str, list] = {}
+        for e in g.get("edges", []):
+            out_edges.setdefault(e.get("sourceNodeId"), []).append(
+                (e.get("targetNodeId"), e.get("type")))
+        if not transitive:
+            return [{"field_id": t, "name": nid2name.get(t, t), "type": ty}
+                    for t, ty in out_edges.get(field_id, [])]
+        seen: set = set(); stack = [field_id]; res = []
+        while stack:
+            for t, ty in out_edges.get(stack.pop(), []):
+                if t not in seen:
+                    seen.add(t)
+                    res.append({"field_id": t, "name": nid2name.get(t, t), "type": ty})
+                    stack.append(t)
+        return res
+
+    def get_field_dependencies(self, table_id: str, field_id: str, *,
+                               transitive: bool = False,
+                               graph: dict | None = None) -> list[dict]:
+        """What `field_id` itself consumes (its `Input` / `ConditionalRun`
+        sources), per Clay's graph — the mirror of `get_field_dependents`. Same
+        return shape and `transitive` / `graph` kwargs."""
+        g = graph or self.get_table_graph(table_id)
+        nid2name = {n.get("nodeId"): n.get("name") for n in g.get("nodes", [])}
+        in_edges: dict[str, list] = {}
+        for e in g.get("edges", []):
+            in_edges.setdefault(e.get("targetNodeId"), []).append(
+                (e.get("sourceNodeId"), e.get("type")))
+        if not transitive:
+            return [{"field_id": s, "name": nid2name.get(s, s), "type": ty}
+                    for s, ty in in_edges.get(field_id, [])]
+        seen: set = set(); stack = [field_id]; res = []
+        while stack:
+            for s, ty in in_edges.get(stack.pop(), []):
+                if s not in seen:
+                    seen.add(s)
+                    res.append({"field_id": s, "name": nid2name.get(s, s), "type": ty})
+                    stack.append(s)
+        return res
+
+    # ── Delete (table-scoped; guarded by the dependency graph) ────────────────
+
+    def delete_column(self, table_id: str, field_id: str, *,
+                      force: bool = False) -> dict:
+        """Delete a single column. Delegates to `delete_fields` so the same
+        dependency-graph guard applies (raises if it has downstream dependents
+        unless `force=True`)."""
+        return self.delete_fields(table_id, [field_id], force=force)
+
+    def delete_fields(self, table_id: str, field_ids: list[str], *,
+                      force: bool = False) -> dict:
+        """
+        Delete one or more fields (columns). Table-scoped — affects all views.
+
+        GUARDED: before deleting, this consults Clay's dependency graph
+        (`get_table_graph`) and RAISES `RuntimeError` if any field being deleted
+        has direct downstream dependents that are NOT themselves in the delete
+        set — i.e. columns that would break, the same set Clay warns about in
+        its delete dialog. Repoint those first (see `get_field_dependents`), or
+        pass `force=True` to delete anyway.
+
+        Endpoint: `DELETE /tables/{t}/fields` body `{"fieldIds": [...]}` — the
+        bulk primitive Clay's UI uses for single and multi-column deletes.
         """
         if not field_ids:
             raise ValueError("delete_fields: field_ids must be a non-empty list")
+        if not force:
+            g = self.get_table_graph(table_id)
+            deleting = set(field_ids)
+            blocking = {}
+            for fid in field_ids:
+                deps = [d for d in self.get_field_dependents(table_id, fid, graph=g)
+                        if d["field_id"] not in deleting]
+                if deps:
+                    blocking[fid] = deps
+            if blocking:
+                nid2name = {n.get("nodeId"): n.get("name") for n in g.get("nodes", [])}
+                lines = []
+                for fid, deps in blocking.items():
+                    names = ", ".join(d["name"] for d in deps)
+                    lines.append(f"  {nid2name.get(fid, fid)} ({fid}): "
+                                 f"{len(deps)} dependent(s) -> {names}")
+                raise RuntimeError(
+                    "delete_fields: refusing to delete — these columns have downstream "
+                    "dependents per Clay's graph (they would break). Repoint them first "
+                    "(get_field_dependents), or pass force=True:\n" + "\n".join(lines))
         r = self.session.delete(
             self._url(f"/tables/{table_id}/fields"),
             json={"fieldIds": list(field_ids)},
@@ -4044,7 +4145,7 @@ class ClayClient:
 
     # ── Sourced tables (Find People / Find Companies) ───────────────────────
     # `preview_sourced_table` and `create_sourced_table` verified live
-    # 2026-05-01 against a test workspace for both `cpj_type="people"` and
+    # 2026-05-01 against workspace 12345 for both `cpj_type="people"` and
     # `cpj_type="companies"`. This includes Companies preview hard-cap
     # enforcement at 50 rows, `conversation_id` creation, and
     # `destination_table_id` append-mode acceptance. Unsupported `cpj_type`
@@ -4211,7 +4312,7 @@ class ClayClient:
         return res.get("subroutines", res)
 
     # ── Auth account inspection ──────────────────────────────────────────────
-    # All methods in this section verified live 2026-04-30 against a test workspace
+    # All methods in this section verified live 2026-04-30 against workspace 12345
     # (Tier A+B+C smoke; paths, unwrap shapes, query-param plumbing all confirmed).
 
     def get_auth_account(
@@ -4380,7 +4481,7 @@ class ClayClient:
         return self.post(f"/app-accounts/{account_type}/validate-auth", body)
 
     # ── Sources / runs ───────────────────────────────────────────────────────
-    # `list_source_runs` verified live 2026-04-30 against a test workspace;
+    # `list_source_runs` verified live 2026-04-30 against workspace 12345;
     # `limit` was discovered to be a Clay-required param during that test.
 
     def list_source_runs(
@@ -4411,7 +4512,7 @@ class ClayClient:
     # ── Credit usage / spend reporting ──────────────────────────────────────
     # `get_credit_usage`, `get_table_credit_usage`, and
     # `get_default_workbook_credit_limit` verified live 2026-04-30 against
-    # a test workspace. `get_table_credit_usage(..., aggregation="run")`
+    # workspace 12345. `get_table_credit_usage(..., aggregation="run")`
     # returned a raw list of run dicts on a populated table, not `{entities: ...}`.
 
     def get_credit_usage(
@@ -4499,7 +4600,7 @@ class ClayClient:
         )
 
     # ── Workspace metadata ───────────────────────────────────────────────────
-    # All methods in this section verified live 2026-04-30 against a test workspace
+    # All methods in this section verified live 2026-04-30 against workspace 12345
     # (Tier A smoke; paths + unwrap shapes confirmed). `get_workbook_overview`
     # confirmed to return both `nodes` and `edges`.
 
@@ -4585,7 +4686,7 @@ class ClayClient:
         return res.get("agentConfigs", res.get("configs", []))
 
     # ── Dynamic action fields ────────────────────────────────────────────────
-    # `get_dynamic_action_fields` verified live 2026-04-30 against a test workspace
+    # `get_dynamic_action_fields` verified live 2026-04-30 against workspace 12345
     # (Tier C smoke). Underlying action invocation cost confirmed at 0 credits;
     # `errors` array correctly populated when the upstream integration errors
     # (e.g. expired Salesforce session).
