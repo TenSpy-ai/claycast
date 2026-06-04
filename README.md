@@ -111,7 +111,50 @@ clay.create_formula_column(table["tableId"], name="Domain", formula='...')
 
 ## Contributing
 
-Issues and pull requests are welcome. **[`references/feature-gaps.md`](references/feature-gaps.md) is the roadmap** — it lists missing capabilities (tiered by impact) with proposed method signatures, so it's the best place to find something worth building. Please open an issue to discuss substantial changes before submitting a PR.
+Issues and pull requests are welcome — ClayCast wraps a moving, undocumented API, so there's always more to wrap.
+
+### Start with the roadmap
+
+**[`references/feature-gaps.md`](references/feature-gaps.md) is the best place to find something worth building.** It's a living gap list of capabilities ClayCast doesn't implement yet, **tiered by impact** (Tier 1 = actually blocks common headless workflows), and most gaps come with a **proposed method signature** so a new wrapper slots into the SDK's existing conventions. Skim the open tiers, pick a gap, and you have a scoped first PR. The "Recently closed" section at the top shows the cadence and the shape a finished contribution takes.
+
+For anything substantial, open an issue first so we can agree on the approach before you build.
+
+### Fork & PR workflow
+
+```bash
+# 1. Fork the repo on GitHub — the "Fork" button on github.com/TenSpy-ai/claycast
+
+# 2. Clone YOUR fork
+git clone https://github.com/<your-username>/claycast.git
+cd claycast
+
+# 3. Track upstream so you can stay in sync
+git remote add upstream https://github.com/TenSpy-ai/claycast.git
+
+# 4. Branch for your change
+git checkout -b feature/views-crud      # e.g. tackling feature-gaps Tier 1 #1
+
+# 5. Install deps and point CLAY_SESSION at YOUR OWN workspace (see Authentication)
+pip install -r references/requirements.txt
+cp references/.env.example .env         # then set your cookie; .env is gitignored
+
+# 6. Make the change, test it against your own Clay workspace
+
+# 7. Commit and push to your fork
+git commit -am "Add views CRUD (feature-gaps Tier 1 #1)"
+git push origin feature/views-crud
+
+# 8. Open a PR: <your-username>:feature/views-crud  ->  TenSpy-ai:main
+```
+
+Before opening (or updating) a PR, sync your fork with `git fetch upstream && git merge upstream/main`.
+
+### Ground rules for PRs
+
+- **Never commit secrets or workspace data.** Your `.env` and `CLAY_SESSION` cookie stay local (both gitignored). In any "verified live" comment, doc, or example, use a **placeholder** workspace id (e.g. `12345`) and placeholder table/field/audience ids — never your real ones.
+- **Show how you verified an endpoint.** These are internal endpoints, so note how you confirmed the request/response shape — `scripts/clay_browser.py` captures live `api.clay.com` traffic for exactly this. Date your "verified live" comments like the existing code does.
+- **Match the conventions** already in `clay_client.py` — the proposed signature in `feature-gaps.md`, the return shapes, the two-step record-write pattern, and credit-cost callouts on anything that runs.
+- **Mind the credits.** Anything that triggers a run costs real Clay credits — guard it and document the cost; don't run it implicitly.
 
 ## License
 
