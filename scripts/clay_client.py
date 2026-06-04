@@ -3248,42 +3248,105 @@ class ClayClient:
         `"ConditionalRun"`; an edge source->target means **target DEPENDS ON
         source**. A synthetic `"root"` node is the table's source rows.
 
-        This is the SAME graph Clay's UI reads for its delete-warning dialog —
-        use it for EVERY "what depends on X" question. Do NOT hand-roll
-        dependency detection by string-matching `formulaText`: that misses
-        `formulaMap` inputs (subroutine / dict-style bindings), `ConditionalRun`
-        edges, and transitive dependents. (Verified 2026-06-04: a
-        formulaText-only scan reported a column as orphaned while Clay's graph
-        showed an `execute-subroutine` taking it as an input via `formulaMap`,
-        with 28 transitive downstream columns.)
+        This is the graph Clay's UI reads for its delete-warning dialog — good
+        for downstream *structure* (incl. `formulaMap` inputs, `ConditionalRun`,
+        and transitive reach). BUT it COLLAPSES an action's extracted formula
+        columns into the action node (`node.extractedFieldIds`), so the edges
+        alone do NOT list those extractors. For the literal "what references
+        this field's id / what would break" answer — needed to remap or to fully
+        verify delete-safety — use `get_field_references` (a full `typeSettings`
+        scan). Neither view alone is complete: graph = structure, scan = literal
+        references. (Verified 2026-06-04.)
         """
         return self.get(f"/tables/{table_id}/graph")
+
+    @staticmethod
+    def _references_in(fields: list[dict], field_id: str) -> list[dict]:
+        """Scan field dicts for every literal reference to `field_id` across the
+        FULL typeSettings: formulaText, conditionalRunFormulaText, each
+        inputsBinding.formulaText, and formulaMap values (dict-style sub-inputs
+        used by execute-subroutine etc.). Returns `[{field_id, name, where}]`."""
+        out = []
+        for f in fields:
+            if f.get("id") == field_id:
+                continue
+            ts = f.get("typeSettings") or {}
+            where = []
+            if field_id in (ts.get("formulaText") or ""):
+                where.append("formula")
+            if field_id in (ts.get("conditionalRunFormulaText") or ""):
+                where.append("runCondition")
+            for b in (ts.get("inputsBinding") or []):
+                if field_id in (b.get("formulaText") or ""):
+                    where.append(f"input:{b.get('name')}")
+                fm = b.get("formulaMap")
+                if isinstance(fm, dict) and any(field_id in str(v) for v in fm.values()):
+                    where.append(f"formulaMap:{b.get('name')}")
+            if where:
+                out.append({"field_id": f["id"], "name": f.get("name"), "where": where})
+        return out
+
+    def get_field_references(self, table_id: str, field_id: str) -> list[dict]:
+        """Every column whose CONFIG literally references `field_id` — the
+        complete "what would break if I delete this / what to repoint on a
+        remap" answer. Scans every field's full `typeSettings` (formulaText,
+        conditionalRunFormulaText, inputsBinding formulaText, AND `formulaMap`).
+        Returns `[{field_id, name, where}]` (`where` = `formula` / `runCondition`
+        / `input:<name>` / `formulaMap:<name>`).
+
+        Use THIS (not `get_field_dependents`) for literal id references — a
+        remap, or to fully verify delete-safety. Clay's graph collapses an
+        action's extracted formula columns into its node, so
+        `get_field_dependents` can miss them; this never does. The
+        `delete_fields` guard uses this scan."""
+        fields = self.get_table(table_id, include_extra_data=True)["table"].get("fields", [])
+        return self._references_in(fields, field_id)
 
     def get_field_dependents(self, table_id: str, field_id: str, *,
                              transitive: bool = False,
                              graph: dict | None = None) -> list[dict]:
-        """Columns that DEPEND ON `field_id` (would break if it changed or was
-        deleted), per Clay's graph. `transitive=False` -> direct dependents
-        only; `True` -> full downstream closure (what the delete dialog warns
-        about). Returns `[{field_id, name, type}]` (`type` is the edge type for
-        direct edges, `""` for transitively-reached nodes). Pass `graph=` to
-        reuse a graph you already fetched."""
+        """Columns that DEPEND ON `field_id`, per Clay's graph, **folding in the
+        node's `extractedFieldIds`** so an action's own extractor formulas are
+        not silently missed. `transitive=False` -> direct; `True` -> full
+        downstream closure. Returns `[{field_id, name, type}]` (`type` is the
+        edge type, or `"Extracted"` for collapsed extractor columns). Pass
+        `graph=` to reuse a fetched graph.
+
+        This is the structural/graph view. For the authoritative literal "what
+        references this id" (remap targets, delete-safety) use
+        `get_field_references` — graph = structure, scan = literal references."""
         g = graph or self.get_table_graph(table_id)
-        nid2name = {n.get("nodeId"): n.get("name") for n in g.get("nodes", [])}
+        nodes = g.get("nodes", [])
+        nid2name = {n.get("nodeId"): n.get("name") for n in nodes}
+        extracted = {n.get("nodeId"): list(n.get("extractedFieldIds") or [])
+                     for n in nodes}
         out_edges: dict[str, list] = {}
         for e in g.get("edges", []):
             out_edges.setdefault(e.get("sourceNodeId"), []).append(
                 (e.get("targetNodeId"), e.get("type")))
+        _names: dict = {}
+        def name_of(fid):
+            if fid in nid2name:
+                return nid2name[fid]
+            if not _names:
+                _names.update({f["id"]: f.get("name") for f in self.get_table(
+                    table_id, include_extra_data=True)["table"].get("fields", [])})
+            return _names.get(fid, fid)
+        def direct(nid):
+            seen_l = {}
+            for t, ty in out_edges.get(nid, []):
+                seen_l.setdefault(t, {"field_id": t, "name": name_of(t), "type": ty})
+            for ext in extracted.get(nid, []):
+                seen_l.setdefault(ext, {"field_id": ext, "name": name_of(ext),
+                                        "type": "Extracted"})
+            return list(seen_l.values())
         if not transitive:
-            return [{"field_id": t, "name": nid2name.get(t, t), "type": ty}
-                    for t, ty in out_edges.get(field_id, [])]
+            return direct(field_id)
         seen: set = set(); stack = [field_id]; res = []
         while stack:
-            for t, ty in out_edges.get(stack.pop(), []):
-                if t not in seen:
-                    seen.add(t)
-                    res.append({"field_id": t, "name": nid2name.get(t, t), "type": ty})
-                    stack.append(t)
+            for d in direct(stack.pop()):
+                if d["field_id"] not in seen:
+                    seen.add(d["field_id"]); res.append(d); stack.append(d["field_id"])
         return res
 
     def get_field_dependencies(self, table_id: str, field_id: str, *,
@@ -3310,12 +3373,12 @@ class ClayClient:
                     stack.append(s)
         return res
 
-    # ── Delete (table-scoped; guarded by the dependency graph) ────────────────
+    # ── Delete (table-scoped; guarded by a full reference scan) ───────────────
 
     def delete_column(self, table_id: str, field_id: str, *,
                       force: bool = False) -> dict:
         """Delete a single column. Delegates to `delete_fields` so the same
-        dependency-graph guard applies (raises if it has downstream dependents
+        reference guard applies (raises if other columns still reference it
         unless `force=True`)."""
         return self.delete_fields(table_id, [field_id], force=force)
 
@@ -3324,12 +3387,14 @@ class ClayClient:
         """
         Delete one or more fields (columns). Table-scoped — affects all views.
 
-        GUARDED: before deleting, this consults Clay's dependency graph
-        (`get_table_graph`) and RAISES `RuntimeError` if any field being deleted
-        has direct downstream dependents that are NOT themselves in the delete
-        set — i.e. columns that would break, the same set Clay warns about in
-        its delete dialog. Repoint those first (see `get_field_dependents`), or
-        pass `force=True` to delete anyway.
+        GUARDED: before deleting, this scans every other column's full
+        `typeSettings` (`get_field_references`) and RAISES `RuntimeError` if any
+        field being deleted is still referenced — by a formula, run condition,
+        input, or `formulaMap` — from a column NOT in the delete set (those would
+        break). This literal scan is used instead of the graph alone, because
+        Clay's graph collapses an action's extractor formulas into its node and
+        can under-report. Repoint references first (`get_field_references`), or
+        pass `force=True`.
 
         Endpoint: `DELETE /tables/{t}/fields` body `{"fieldIds": [...]}` — the
         bulk primitive Clay's UI uses for single and multi-column deletes.
@@ -3337,25 +3402,27 @@ class ClayClient:
         if not field_ids:
             raise ValueError("delete_fields: field_ids must be a non-empty list")
         if not force:
-            g = self.get_table_graph(table_id)
+            fields = self.get_table(
+                table_id, include_extra_data=True)["table"].get("fields", [])
+            id2name = {f["id"]: f.get("name") for f in fields}
             deleting = set(field_ids)
             blocking = {}
             for fid in field_ids:
-                deps = [d for d in self.get_field_dependents(table_id, fid, graph=g)
-                        if d["field_id"] not in deleting]
-                if deps:
-                    blocking[fid] = deps
+                refs = [r for r in self._references_in(fields, fid)
+                        if r["field_id"] not in deleting]
+                if refs:
+                    blocking[fid] = refs
             if blocking:
-                nid2name = {n.get("nodeId"): n.get("name") for n in g.get("nodes", [])}
                 lines = []
-                for fid, deps in blocking.items():
-                    names = ", ".join(d["name"] for d in deps)
-                    lines.append(f"  {nid2name.get(fid, fid)} ({fid}): "
-                                 f"{len(deps)} dependent(s) -> {names}")
+                for fid, refs in blocking.items():
+                    names = ", ".join(r["name"] for r in refs)
+                    lines.append(f"  {id2name.get(fid, fid)} ({fid}): "
+                                 f"{len(refs)} reference(s) -> {names}")
                 raise RuntimeError(
-                    "delete_fields: refusing to delete — these columns have downstream "
-                    "dependents per Clay's graph (they would break). Repoint them first "
-                    "(get_field_dependents), or pass force=True:\n" + "\n".join(lines))
+                    "delete_fields: refusing to delete — these columns are still "
+                    "referenced by other columns (formula / run-condition / input / "
+                    "formulaMap) and would break. Repoint them first "
+                    "(get_field_references), or pass force=True:\n" + "\n".join(lines))
         r = self.session.delete(
             self._url(f"/tables/{table_id}/fields"),
             json={"fieldIds": list(field_ids)},
