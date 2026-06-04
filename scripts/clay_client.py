@@ -2219,7 +2219,7 @@ class ClayClient:
     # ── Audience export ──────────────────────────────────────────────────────
     # `list_audience_segments`, `count_audience_segment`, and
     # `export_audience_segment` verified live 2026-04-30 against workspace 12345.
-    # The Tier A smoke used CONTACT segment `audseg_0teby2faukyeXceTebK`; the
+    # The Tier A smoke used CONTACT segment `audseg_xxx`; the
     # count/export path returned 0 rows cleanly and wrote a local JSON artifact.
 
     def export_audience_segment(
