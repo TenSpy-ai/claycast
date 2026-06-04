@@ -1,6 +1,6 @@
 # ClayCast
 
-**An unofficial Python toolkit for driving Clay's internal REST API using your browser session cookie.**
+**An unofficial Python toolkit for driving Clay.com's internal REST API using your browser session cookie.**
 
 ClayCast does the schema-level work the official Clay MCP connector can't: creating and modifying tables, columns, and action columns from code; running and waiting on enrichments; exporting/importing table schemas; and discovering undocumented action-input shapes by capturing live requests against the app.
 
