@@ -1400,6 +1400,68 @@ class ClayClient:
         """Delete a table. Returns the deleted table dict."""
         return self.delete(f"/tables/{table_id}")
 
+    def set_table_description(self, table_id: str, description: str) -> dict:
+        """
+        Set a table's description. Returns the updated table dict.
+
+        Endpoint: `PATCH /v3/tables/{table_id}`. The empty `tableSettings`/
+        `fieldGroupMap`/`sourceSettings` keys mirror exactly what the Clay UI
+        sends; Clay treats an empty `{}` as no-change (merge semantics — the
+        live AUTO_RUN/dedupe settings survive a capture-verified empty `{}`),
+        so this only rewrites the description.
+        """
+        body = {
+            "description": description,
+            "tableSettings": {},
+            "fieldGroupMap": {},
+            "sourceSettings": {},
+        }
+        return self.patch(f"/tables/{table_id}", body)
+
+    def generate_table_description(
+        self,
+        table_id: str,
+        *,
+        save: bool = True,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """
+        Generate a table description with Clay's built-in AI tool — the
+        "Generate" button next to a table's Description field.
+
+        Two-step flow, mirrored from the Clay UI:
+          1. `POST /v3/ai-generation/table-description`
+             body `{"workspaceId": <int>, "tableId": "t_..."}`
+             → `{"description": "<AI summary>"}`. Read-only: the AI reads the
+             table's columns/sources and writes a prose summary; nothing saved.
+          2. If `save` (default — matches the UI), persist it via
+             `set_table_description` (`PATCH /v3/tables/{table_id}`),
+             overwriting any existing description.
+
+        Pass `save=False` to preview the generated text without writing it.
+
+        Returns:
+            {"description": <str>, "saved": <bool>, "table": <dict | None>}
+            where `table` is the updated table dict when saved, else None.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        gen = self.post(
+            "/ai-generation/table-description",
+            {
+                "workspaceId": int(ws_id) if str(ws_id).isdigit() else ws_id,
+                "tableId": table_id,
+            },
+        )
+        description = gen.get("description", "") if isinstance(gen, dict) else ""
+        table = None
+        if save and description:
+            table = self.set_table_description(table_id, description)
+        return {
+            "description": description,
+            "saved": bool(save and description),
+            "table": table,
+        }
+
     def create_table(
         self,
         name: str,

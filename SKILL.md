@@ -86,7 +86,7 @@ tables = clay.list_tables()
 | Area | Methods |
 |---|---|
 | Workspace | `list_workspaces`, `get_workspace_permissions`, `list_workspace_contents`, `get_workbook`, `list_workbook_tables`, `find_tables`, `get_workspace_hierarchy`, `get_resource_urls` |
-| Tables | `create_table`, `list_tables`, `list_folders`, `get_table`, `get_schema`, `get_field_map`, `count_records`, `inspect_table`, `delete_table` |
+| Tables | `create_table`, `list_tables`, `list_folders`, `get_table`, `get_schema`, `get_field_map`, `count_records`, `inspect_table`, `delete_table`, `set_table_description`, `generate_table_description` (built-in AI) |
 | Fields / Columns | `list_fields`, `apply_field_operations`, `create_column`, `create_action_column`, `create_formula_column`, `update_column`, `delete_column`, `delete_fields`, `move_field`, `reorder_fields`, `set_field_visibility`, `set_fields_visibility`, `set_condition` |
 | Dependency graph & references | `get_table_graph`, `get_field_dependents`, `get_field_dependencies` (structural — Clay's own graph), and `get_field_references` (literal `typeSettings` scan). Use the **graph** for downstream structure; use **`get_field_references`** to find the literal id references to remap or to verify delete-safety (the graph collapses an action's extractor columns into its node). `delete_column`/`delete_fields` are guarded by `get_field_references`. |
 | Field groups | `create_field_group`, `update_field_group`, `move_field_group`, `ungroup`, `delete_field_group` |

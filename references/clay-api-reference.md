@@ -47,6 +47,8 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
 - Fresh tables still come with Clay's auto-blank row. Count assertions must account for that.
 - `clay.list_fields(...)` returns normalized field metadata with view-aware ordering / visibility.
 - `clay.apply_field_operations(...)` ports Datagen bulk add / rename / retype without the Datagen `errors[]` envelope.
+- `clay.generate_table_description(table_id, save=True)` mirrors Clay's built-in **AI "Generate"** button next to a table's Description. Two calls (discovered via clay-spy, verified 2026-06-12): (1) `POST /ai-generation/table-description` body `{"workspaceId": <int>, "tableId": "t_..."}` → `{"description": "<AI summary>"}` (read-only — AI reads the table's columns/sources); (2) if `save` (default), persists via `set_table_description`. `save=False` previews without writing. Returns `{description, saved, table}`.
+- `clay.set_table_description(table_id, description)` → `PATCH /tables/{table_id}` with `{"description", "tableSettings": {}, "fieldGroupMap": {}, "sourceSettings": {}}`. This is the general **top-level table PATCH** endpoint; the empty setting dicts are no-op merges (live-verified that AUTO_RUN/dedupe settings survive an empty `{}`), so only the description is rewritten.
 
 ### CSV imports
 
