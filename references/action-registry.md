@@ -536,3 +536,45 @@ rows = clay.list_records_by_name(t_id, v_id)      # name-keyed + extract_cell_va
 clay.run_column(t_id, [col_id], record_ids=record_ids)
 clay.wait_for_runs(t_id, timeout_seconds=300)
 ```
+
+
+---
+
+### Route Row (send table data to another table)
+
+Push the current row's data into another Clay table (the "Send table data" column).
+
+- **key:** `route-row`
+- **package:** `b1ab3d5d-b0db-4b30-9251-3f32d8b103c1`
+- **inputs** (captured from production columns 2026-07-21; created live by POSTing the full typeSettings):
+  - `tableId`: target table id as a string-literal formula (`'"t_xxx"'`)
+  - `rowData`: **`formulaMap`** keyed by TARGET column NAMES → source-table formula refs (`{"Company Domain": "{{@Domain}}"}`)
+  - `nestedData`: **`formulaMap`** keyed by the receiving source's display name → typically `{{f_people_search}}` (the whole source payload)
+  - plus top-level typeSettings key `referencedTableId: "t_xxx"` (same target id, unquoted)
+- **output:** `{"numberOfRowsSent": 1}` (downstream booleans read `?.numberOfRowsSent == 1`)
+- **gotchas:**
+  - Creating the column **auto-creates the receiving pipeline on the target table**: a `Rows from: <sender table name>` manual routing source, a source column, and extractor formula columns for every `rowData` key. Keep those (they hold the sender binding); don't also create them yourself.
+  - `rowData` keys match target columns by NAME — a stale key silently creates a NEW column on the target at wiring time.
+
+### Trigger Find-People Source ("Update People Search" button)
+
+Per-row trigger of a Find People search source, living on the COMPANY table.
+
+- **key:** `trigger-find-people-source`
+- **package:** `4299091f-3cd3-4d68-b198-0143575f471d`
+- **inputs:**
+  - `sourceId`: string-literal source id (`'"s_xxx"'`)
+  - `companyIdentifier`: formula ref to the company's domain column (`'{{@Domain}}'`)
+  - `enableAutoUpdate`: `'true'`
+- **gotchas:** auto-created by `create-cpj-table` (named `Update People Search (<search name>) - <ISO timestamp>`) — including on FAILED create attempts, which leave orphan columns bound to nothing.
+
+### Lookup Company in Other Table
+
+Standard companion column on cpj people tables ("Company Table Data") — resolves the source row's company back to its record in the company table.
+
+- **key:** `lookup-company-in-other-table`
+- **package:** `4299091f-3cd3-4d68-b198-0143575f471d`
+- **inputs:**
+  - `companyTableId`: `'{{f_people_search}}.company_table_id'`
+  - `companyRecordId`: `'{{f_people_search}}.company_record_id'`
+- **notes:** `dataTypeSettings` json (record-returning); downstream formulas extract with `?.["Column Name"]`.

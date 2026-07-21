@@ -3605,12 +3605,209 @@ class ClayClient:
         body = {fid: {"isVisible": bool(v)} for fid, v in visibility.items()}
         return self.patch(f"/tables/{table_id}/views/{view_id}/fields", body)
 
+    # ── Session preflight ─────────────────────────────────────────────────────
+
+    def preflight(self, table_id: str | None = None, view_id: str | None = None) -> dict:
+        """Session health check — run this BEFORE long-running mutation work.
+
+        The `claysession` cookie has a known failure mode where it silently
+        becomes "write-restricted": reads keep working, but writes (and action
+        runs) enqueue and never commit, with healthy-looking 200 responses.
+        Catch that up front, not 50 calls into a build.
+
+        - Auth/read check (always): `me()` + `/my-workspaces` must succeed.
+        - Write check (only when `table_id` is given — use a scratch or dark
+          table, e.g. a replica): creates one blank record, confirms it lands
+          via the view-independent per-record endpoint, then deletes it.
+          (`view_id` is accepted for compat but unused.) Raises RuntimeError
+          with cookie-refresh guidance if the write never commits (~12s poll).
+
+        Returns {"auth": True, "write": True|None} (write None = not checked).
+        """
+        import time as _time
+        self.me()
+        self.get("/my-workspaces")
+        result = {"auth": True, "write": None}
+        if not table_id:
+            return result
+        rid = _gen_record_id()
+        self.post(f"/tables/{table_id}/records", {"records": [{"id": rid, "cells": {}}]})
+        deadline = _time.time() + 12
+        landed = False
+        while _time.time() < deadline:
+            # per-record endpoint: view-independent (a filtered view would hide a
+            # blank record and false-negative this check)
+            r = self.session.get(self._url(f"/tables/{table_id}/records/{rid}"))
+            if r.status_code == 200:
+                landed = True
+                break
+            _time.sleep(1.5)
+        if landed:
+            self.delete_records(table_id, [rid])
+            result["write"] = True
+            return result
+        raise RuntimeError(
+            "preflight: write did not commit within 12s — the claysession cookie is "
+            "likely write-restricted. Refresh it from DevTools (references/cookie-setup.md), "
+            "replace CLAY_SESSION in .env, and retry. Do NOT start bulk work on this session."
+        )
+
+    # ── Views CRUD ────────────────────────────────────────────────────────────
+    # Endpoint behavior verified live 2026-07-21: PATCH/POST on a view return 200
+    # but SILENTLY DROP `filter` and `sort` from the body — those two must go
+    # through their sub-endpoints. Column order cannot be written via order
+    # strings (server owns fractional indexing) and `reorder-fields` rejects
+    # full-view blocks (400/500), so whole-view ordering is a per-field
+    # `move_field` walk. See clay-api-reference.md → "View filter/sort write
+    # path + replication side-effects".
+
+    def list_views(self, table_id: str) -> list[dict]:
+        """List a table's views (id, name, filter, sort, fields config, ...).
+
+        Reads from `get_table(...)`; there is no dedicated list-views endpoint.
+        """
+        raw = self.get_table(table_id, include_extra_data=True)
+        table = raw.get("table", raw)
+        return table.get("views") or table.get("gridViews") or []
+
+    def create_view(
+        self,
+        table_id: str,
+        name: str,
+        *,
+        filter: dict | None = None,
+        sort: dict | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Create a view, then apply filter/sort via their sub-endpoints.
+
+        `POST /tables/{t}/views` accepts `name` but silently drops `filter` and
+        `sort` (verified live) — so this method creates first, then calls
+        `set_view_filter` / `set_view_sort` for any provided config, and returns
+        the view dict with those fields re-fetched.
+
+        `filter` shape: `{"items": [{"type": "NOT_EMPTY", "fieldId": "f_..."},
+        ...], "combinationMode": "AND"}`. `sort` shape: `{"items": [{"fieldId":
+        "f_...", "direction": "ASC"|"DESC"}]}`.
+        """
+        res = self.post(f"/tables/{table_id}/views", {"name": name})
+        view = res.get("view", res)
+        view_id = view["id"]
+        if description:
+            self.patch(f"/tables/{table_id}/views/{view_id}", {"description": description})
+        if filter is not None:
+            self.set_view_filter(table_id, view_id, filter)
+        if sort is not None:
+            self.set_view_sort(table_id, view_id, sort)
+        if filter is not None or sort is not None or description:
+            view = next((v for v in self.list_views(table_id) if v["id"] == view_id), view)
+        return view
+
+    def update_view(
+        self,
+        table_id: str,
+        view_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Rename a view / set its description via `PATCH /tables/{t}/views/{v}`.
+
+        Do NOT pass filter/sort here — the endpoint returns 200 and silently
+        drops them. Use `set_view_filter` / `set_view_sort`.
+        """
+        body = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if not body:
+            raise ValueError("update_view: pass name and/or description")
+        res = self.patch(f"/tables/{table_id}/views/{view_id}", body)
+        return res.get("view", res)
+
+    def delete_view(self, table_id: str, view_id: str) -> dict:
+        """Delete a view via `DELETE /tables/{t}/views/{v}` (verified live)."""
+        return self.delete(f"/tables/{table_id}/views/{view_id}")
+
+    def set_view_filter(self, table_id: str, view_id: str, filter: dict) -> dict:
+        """Set a view's filter via `PATCH /tables/{t}/views/{v}/filter`.
+
+        This sub-endpoint is the ONLY working write path for view filters —
+        including `filter` in a view PATCH/POST body is silently ignored.
+        Body = the filter object itself:
+        `{"items": [...], "combinationMode": "AND"}`.
+        """
+        return self.patch(f"/tables/{table_id}/views/{view_id}/filter", filter)
+
+    def set_view_sort(self, table_id: str, view_id: str, sort: dict) -> dict:
+        """Set a view's sort via `PATCH /tables/{t}/views/{v}/sort` (the only
+        working write path — sort in a view PATCH body is silently ignored).
+        Body = `{"items": [{"fieldId": ..., "direction": "ASC"|"DESC"}, ...]}`.
+        """
+        return self.patch(f"/tables/{table_id}/views/{view_id}/sort", sort)
+
+    def set_view_fields(self, table_id: str, view_id: str, fields: dict) -> dict:
+        """Bulk per-field view config via `PATCH /tables/{t}/views/{v}/fields`.
+
+        `fields` maps field_id → config dict; accepted keys verified live:
+        `isVisible` (bool) and `width` (int). Mixed hide/show/width in one call
+        is fine. (Order strings are NOT settable this way — use
+        `set_view_field_order`.)
+        """
+        if not fields:
+            raise ValueError("set_view_fields: fields dict must be non-empty")
+        return self.patch(f"/tables/{table_id}/views/{view_id}/fields", fields)
+
+    def set_view_field_order(
+        self,
+        table_id: str,
+        view_id: str,
+        ordered_field_ids: list[str],
+    ) -> dict:
+        """Impose a complete column order on a view via a per-field
+        `move_field` walk.
+
+        Why not `reorder_fields`: full-view blocks are rejected live (HTTP 400
+        on spreadsheet tables, 500 on people tables). This walk simulates the
+        order locally between calls and only moves fields that are out of
+        place (0 failures across 334 moves in the live validation run).
+
+        Fields present in the view but absent from `ordered_field_ids` keep
+        their relative order after the ordered block. Returns
+        `{"moves": N, "order_exact": bool}`.
+        """
+        if len(ordered_field_ids) < 2:
+            return {"moves": 0, "order_exact": True}
+        view = next((v for v in self.list_views(table_id) if v["id"] == view_id), None)
+        if view is None:
+            raise ValueError(f"set_view_field_order: view {view_id} not found on {table_id}")
+        fcfg = view.get("fields") or {}
+        cur = [fid for fid, cfg in sorted(fcfg.items(), key=lambda kv: str((kv[1] or {}).get("order", "")))]
+        want = [f for f in ordered_field_ids if f in set(cur)]
+        moves = 0
+        for i in range(1, len(want)):
+            a, b = want[i - 1], want[i]
+            if cur.index(b) == cur.index(a) + 1:
+                continue
+            self.move_field(table_id, view_id, b, after_field_id=a)
+            cur.remove(b)
+            cur.insert(cur.index(a) + 1, b)
+            moves += 1
+        view2 = next((v for v in self.list_views(table_id) if v["id"] == view_id), {})
+        got = [fid for fid, cfg in sorted((view2.get("fields") or {}).items(),
+                                          key=lambda kv: str((kv[1] or {}).get("order", "")))]
+        got = [g for g in got if g in set(want)]
+        return {"moves": moves, "order_exact": got == want}
+
     # ── Field groups ──────────────────────────────────────────────────────────
 
     def create_field_group(self, table_id: str, field_ids: list[str]) -> dict:
         """
         Create a field group (a collapsible cluster of columns) from existing
-        fields. Returns the new group dict with its `gr_...` id.
+        fields. Returns `{"groupId": "gr_..."}` — the key is `groupId`, NOT
+        `id` (verified live 2026-07-21). Clay defaults the LAST member as the
+        output field; set `isOutputField` flags via `update_field_group`.
 
         Endpoint: `POST /tables/{t}/fields/group` body: `{"fieldIds": [...]}`.
         Table-scoped. The returned group can then be reordered per-view via

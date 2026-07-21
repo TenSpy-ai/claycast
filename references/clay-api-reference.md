@@ -936,6 +936,7 @@ All endpoints below were captured from Clay's own UI driving the table view. Col
 
 `fieldIds` order is preserved when the group lands. To set a whole view's column order to `[A, B, C, D, E]`, one call: `reorder_fields(field_ids=[B, C, D, E], after_field_id=A)`.
 - The endpoint is a block-move, not an arbitrary bulk reorder. For non-contiguous sets, use per-field `move_field` calls.
+- **Whole-view reorder failed live (2026-07-21):** despite the one-call trick above, passing a full view's field list to `reorder-fields` returned 400 on spreadsheet tables and 500 on people tables. Reliable fallback for imposing an entire view's order: per-field `move_field` walk left→right, skipping already-placed fields (simulate the order locally between calls — 334 moves across 8 views ran with 0 failures).
 
 ### Hide / show (view-scoped)
 
@@ -966,6 +967,7 @@ Delete is table-scoped — removes the column from ALL views.
 | Delete group + members | `DELETE /v3/tables/{t}/fields/group/{gr_id}` | `{"deleteFields": true}` | `clay.delete_field_group(...)` | Table |
 
 **Group gotchas:**
+- `create_field_group`'s response is `{"groupId": "gr_..."}` — NOT `id`. Clay defaults the LAST member as the output field; set `isOutputField` flags via the update call. Verified 2026-07-21.
 - `update_field_group(fields=[...])` is an ATOMIC REPLACEMENT of the group's member list. Omitting a current field id removes it from the group. To safely tweak one member, fetch current membership (via `get_table(..., include_extra_data=True)` → `fieldGroupMap`) and send back the full list.
 - ClayCast preserves a rename-only ergonomic: if you call `update_field_group(name="...")` with no `fields=`, it pre-fetches the current `fieldGroupMap[gr_id].groupDetails.fields` array and re-sends it so Clay's `fields` requirement is still satisfied.
 - Closing the group-settings UI panel fires ZERO API calls — pure client-side state.
@@ -1295,7 +1297,7 @@ clay.patch(f"/tables/{tid}/fields/{fid}", {
 | `bulk-fetch-records` 400 error | Empty or missing `recordIds` | Always pass a non-empty `recordIds` array |
 | Enrich Company `ERROR_INVALID_INPUT` | Company name used instead of LinkedIn URL | Use LinkedIn company URL as `company_identifier` input |
 | `mappedResultPath` formula returns empty | Missing `mappedResultPath` array for nested data | Add `"mappedResultPath": ["experience", "0", "url"]` to typeSettings |
-| `POST /sources` returns "Invalid subscriptions" | Wrong endpoint for people/company sources | Use `POST /sources/create-cpj-table` instead |
+| `POST /sources` returns "Invalid subscriptions" | Wrong endpoint for people/company SEARCH sources | Use `POST /sources/create-cpj-table` instead. `POST /sources` works fine for `type: "manual"` routing sources (verified 2026-07-21). |
 
 ---
 
@@ -1365,6 +1367,8 @@ Always prefer `recordIds` when you have them:
 ## create-cpj-table
 
 This endpoint is fully documented at `## Find People / Find Companies sourced-table creation (documented, NOT yet wrapped in claycast)` later in this file (captured live 2026-04-30). **Note:** regular `POST /sources` returns 404 "Invalid subscriptions" for these source types — `create-cpj-table` is the only valid path.
+
+Additional live-verified behavior (2026-07-21): the endpoint VALIDATES the company scope at create — the company table must contain at least one row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`. Every attempt, **including failed ones**, side-creates a companion `Update People Search (...)` trigger column on the company table (clean up orphans after failures). Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` suppresses the initial search run. Full notes: `## View filter/sort write path + replication side-effects` at the end of this file.
 
 ---
 
@@ -1938,3 +1942,18 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - **Webhook source tables** need formula extractors — incoming columns are not auto-populated; PATCH each downstream column with `formulaText` + `formulaType`.
 
 ---
+
+---
+
+## View filter/sort write path + replication side-effects (discovered 2026-07-21, workbook-replica build)
+
+- **`PATCH /v3/tables/{t}/views/{v}` and `POST /v3/tables/{t}/views` both return 200 but SILENTLY DROP `filter` and `sort`** in the body. The working write paths are the sub-endpoints: `PATCH /v3/tables/{t}/views/{v}/filter` with the filter object (`{"items": [...], "combinationMode": "AND"}`) and `PATCH /v3/tables/{t}/views/{v}/sort` with `{"items": [{"fieldId", "direction"}]}`. Both verified live.
+- The view PATCH **does** accept `name` and a `fields` dict, but only `isVisible` from per-field configs applies; `order` strings are ignored (server owns fractional ordering). Bulk `PATCH /v3/tables/{t}/views/{v}/fields` accepts `{fid: {"isVisible": bool, "width": int}}` — width verified persisting.
+- `reorder-fields` rejected full-view blocks in practice (400 on spreadsheet tables, 500 on people tables). Reliable fallback: per-field `move_field` walk with an in-memory simulation of the current order (334 moves across 8 views, 0 failures).
+- **Field-group create returns `{"groupId": "gr_..."}`** — not `id`. Clay defaults the LAST member as output field; fix flags via the group update call.
+- **`POST /v3/sources/create-cpj-table` side effects & validation:** (a) validates the company scope at create — the company table must contain ≥1 row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`; a failed attempt STILL creates an orphan `Update People Search (...)` trigger column on the company table. (b) On success it auto-creates that companion trigger column too. (c) Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` prevented the initial search run on all 5 real creations (source `state` stayed `{}`), and subsequent `PATCH /v3/sources/{id}` (accepts `{"name"}` and `{"typeSettings"}`) did not trigger runs either — used to restore `inputs.limit` after a neutered create.
+- **Creating a `route-row` action column auto-creates the full receiving pipeline on the target table**: a `manual`/routing source named `Rows from: <sender table name>`, a source column, and extractor formula columns for every `rowData` key. When replicating a workbook, KEEP these auto structures (they hold the sender binding) and delete/repoint any manually created duplicates.
+- `POST /v3/sources` works fine for `type: "manual"` routing sources (`{"workspaceId", "tableId", "name", "type", "typeSettings": {"type": "routing"}}`); the "Invalid subscriptions" 404 applies to people/company search sources only.
+- `POST /v3/workbooks` accepts `parentFolderId` at create. Workbook settings PATCH path is `PATCH /v3/{ws}/workbooks/{wb}` (NOT `/v3/workbooks/{wb}`, which 404s) — used for `settings.tablePresentationSettings` (table order in the sidebar, `{table_id: index}`).
+- **Wrapped in claycast (2026-07-21):** the whole view surface above is now SDK methods — `list_views`, `create_view` (applies filter/sort via the sub-endpoints automatically), `update_view`, `delete_view`, `set_view_filter`, `set_view_sort`, `set_view_fields` (visibility+width), `set_view_field_order` (`move_field` walk) — plus `preflight(table_id=)` for the write-restricted-cookie check. All live-smoke-tested (create→configure→reorder→rename→delete).
+- (`formulaType` requirement on formula PATCH was already documented above — see "PATCH formula requires `formulaType`".) New nuance: editing a formula via PATCH does NOT recompute existing rows; only new rows or input-cell writes trigger evaluation.

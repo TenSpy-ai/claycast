@@ -38,6 +38,10 @@ ClayCast references `view_id` everywhere but has no `create_view` / `update_view
 - `delete_view(view_id)`
 - `list_views(table_id)`
 
+`CLOSED 2026-07-21:` wrapped as `clay.list_views` / `create_view` / `update_view` / `delete_view` / `set_view_filter` / `set_view_sort` / `set_view_fields` / `set_view_field_order`, live-smoke-tested end-to-end. `create_view` routes filter/sort through their sub-endpoints automatically.
+
+**Endpoint discovery notes (2026-07-21):** `POST /tables/{t}/views` creates, `DELETE /tables/{t}/views/{v}` deletes, view PATCH renames; `filter`/`sort` are ONLY settable via `PATCH /tables/{t}/views/{v}/filter` and `.../sort` (view PATCH/POST silently drop them); visibility+width via bulk `PATCH .../views/{v}/fields`; whole-view column order via per-field `move_field` walk (`reorder-fields` rejects full-view blocks). Details: clay-api-reference.md → "View filter/sort write path + replication side-effects". The gap is now "wrap it", no longer "discover it".
+
 ### 2. "Find People" / "Find Companies" sourced-table creation
 
 THE primary lead-sourcing flow in Clay. The user supplies filters (industry, headcount, geography, tech stack); Clay populates rows from a source-query action. ClayCast's `create_action_column` adds actions to EXISTING tables — creating a new table whose rows come from a source query is a different endpoint (`POST /v3/sources/create-cpj-table`) and different semantic.
