@@ -93,7 +93,7 @@ tables = clay.list_tables()
 | Field groups | `create_field_group`, `update_field_group`, `move_field_group`, `ungroup`, `delete_field_group` |
 | Imports | `preview_csv_input`, `import_csv_to_table`, `get_import_job`, `wait_for_import_job` |
 | Sources | `list_sources`, `get_source`, `create_webhook_source`, `list_source_runs` |
-| Sourced tables (Find People) | `preview_sourced_table`, `create_sourced_table` |
+| Sourced tables (Find People) | `create_sourced_table` (`preview_sourced_table` is DEAD as of 2026-07-23 — allowlist regression; use the official `clay search` for free previews) |
 | Records (raw, field-id keyed) | `create_records`, `get_record_ids`, `list_records`, `get_records`, `get_record`, `update_record`, `bulk_update_records`, `delete_records`, `upsert_records` |
 | Records (name-keyed, value-extracted) | `list_records_by_name`, `get_record_by_name` |
 | Runs / Jobs | `run_column`, `get_run_status`, `wait_for_runs`, `rerun_errored_cells`, `run_and_wait` |
@@ -173,7 +173,7 @@ Other helpers in this cluster:
 
 ### Sourced-table creation (Find People / Find Companies)
 
-`preview_sourced_table(inputs, cpj_type="people"|"companies")` runs Clay's zero-credit preview action and returns `{result, metadata, taskId}` without creating anything. Clay hard-caps preview at exactly 50 rows; omit `inputs["limit"]` or set it to `50`. The `result` payload key reflects the entity type — `result.people` for people, `result.companies` for companies.
+**`preview_sourced_table` is DEAD as of 2026-07-23** — Clay removed the `*-preview` enrichmentTypes from the `run-enrichment` server allowlist, so the call now 400s. Free-preview replacement: the official `clay` CLI search (`clay search filters-mode create/run`) or the public API `/public/v0/search/filters-mode`. Historical behavior (through 2026-05-01): ran Clay's zero-credit preview and returned `{result, metadata, taskId}` without creating anything, hard-capped at exactly 50 rows, with `result.people` / `result.companies` keyed by entity type.
 
 `create_sourced_table(workbook_name, inputs=..., cpj_type="people"|"companies")` is the materialization step: one call to `POST /sources/create-cpj-table` that returns `{tableId, viewId, workbookId, sourceId, isNewTable}`. This is the ClayCast path for headless Find People / Find Companies imports.
 
@@ -218,6 +218,8 @@ Writes against Clay's internal API follow a **two-step pattern**, not a one-shot
 2. `PATCH /tables/{t}/records` with `{"records": [{"id": <pregen>, "cells": {...}}]}` — fills values.
 
 `create_records` hides this by pre-generating IDs, doing both calls, and polling `get_records` until the values land (5-second deadline, raises `RuntimeError` on timeout). `update_record` and `bulk_update_records` use the `PATCH /records` bulk endpoint directly. Callers do not need to know about the two-step flow — the SDK handles it — but anyone reaching past the SDK to the raw HTTP layer must replicate this pattern.
+
+**Fresh-table caveat (verified 2026-07-23):** on a freshly created table the name-keyed path (`create_records(..., field_names=True)`) can silently drop — the name→field-id mapped PATCH 200s but values never land, and the method raises its 5s "values did not persist" `RuntimeError`. The IDENTICAL PATCH keyed by raw field ids commits fine. `preflight()` shows `write: True`, so this is NOT the write-restricted-cookie mode. Workaround: create blank rows, then fid-keyed `bulk_update_records`, then re-fetch to verify.
 
 ### `list_records` strategy rule
 
@@ -400,6 +402,10 @@ Things that will silently bite you if you don't know they exist. Ranked by how o
 
 - **Creating a `route-row` action column auto-creates the whole receiving pipeline on the TARGET table** — a `Rows from: <sender>` routing source, a source column, and extractor formula columns for every `rowData` key. If you script those receiving columns yourself you'll hit duplicate-name 400s; keep the auto-created structures (they hold the sender binding) and repoint/delete your duplicates. Likewise every `create-cpj-table` attempt (even a failed one) drops a companion `Update People Search` trigger column on the company table. Verified 2026-07-21.
 - **Writes are async-enqueue.** Every PATCH returns `{"records": [], "extraData": {"message": "Record updates enqueued"}}` within milliseconds; the cells actually land seconds later. `create_records` polls internally (5-second deadline) and raises `RuntimeError` on timeout — if you see this on a slow workspace, bump the deadline in code rather than assuming the write failed. `bulk_update_records` and `update_record` don't auto-verify; callers who need confirmation must re-fetch and assert.
+
+- **A webhook source without a source FIELD swallows every POST.** `create_webhook_source` returns a working URL — POSTs come back OK and `state.numSourceRecords` climbs — but NO rows appear until a source FIELD (`{"type": "source", "typeSettings": {"sourceIds": [s_id], "canCreateRecords": true}}`) registers the subscription, which then retroactively materializes the buffered records. Also: a JSON array of N objects counts as ONE source record — no fan-out; send one object per POST. Verified 2026-07-24.
+
+- **Name-keyed `create_records` silently drops on FRESH tables.** The name→field-id mapped PATCH 200s but values never land (the method raises its 5s "values did not persist" RuntimeError); the identical fid-keyed PATCH commits fine, and `preflight()` shows `write: True` (not the cookie mode). On fresh tables seed via blank rows + fid-keyed `bulk_update_records` + re-fetch. Verified 2026-07-23.
 
 - **Cell `value` is a preview, not the truth, for action cells.** An HTTP-API column cell may show `cell["value"] == "Status Code: 200"` while the real response body (and any silent data corruption from a mangled request) lives in `cell["externalContent"]["fullValue"]`. Always use `extract_cell_value()` or read `externalContent.fullValue` directly. **G3 real-world example: a `formulaText` holding the string `'{"q": hello}'` for an `http-api-v2` `queryString` input gets character-split server-side — Clay sends `?0={&1="&2=q...` instead of `?q=hello`, httpbin returns 200, preview says "Status Code: 200", and the attack only shows up in `externalContent.fullValue`.** Verify 2026-04-23.
 

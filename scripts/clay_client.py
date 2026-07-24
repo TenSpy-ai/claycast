@@ -1551,6 +1551,10 @@ class ClayClient:
             wb = self.post("/workbooks", {
                 "name": name,
                 "workspaceId": ws_id,
+                # NOTE (verified 2026-07-23): Clay does NOT persist this create-body
+                # settings value — the response echoes `settings: {}`. AUTO_RUN is
+                # effectively per-table: PATCH /v3/tables/{t}
+                # {"tableSettings": {"AUTO_RUN_ON": ...}}.
                 "settings": {"isAutoRun": True},
             })
             workbook_id = wb["id"]
@@ -3034,6 +3038,16 @@ class ClayClient:
         ClayCast mirrors that pattern because a single `POST /tables/{t}/records`
         with populated cells returns 200 but silently drops user-cell values.
 
+        WARNING — fresh tables (verified 2026-07-23): on a freshly created
+        table, the name-keyed path (`field_names=True`) can silently drop —
+        the name->field-id mapped PATCH returned 200 but the values NEVER
+        landed (rows stayed blank; this method raised its 5s "values did not
+        persist" RuntimeError). The IDENTICAL PATCH keyed by raw field ids
+        committed fine (`update_record` / `bulk_update_records` with
+        `{fid: value}`). `preflight(table_id=...)` showed `write: True` — NOT
+        the write-restricted-cookie mode. Workaround: create blank rows, then
+        fid-keyed `bulk_update_records`, then re-fetch to verify.
+
         Batching: bounded at `batch_size` (max 500 per Clay's internal cap).
         """
         if batch_size > 500:
@@ -4510,7 +4524,25 @@ class ClayClient:
     # ── Sources ────────────────────────────────────────────────────────────────
 
     def create_webhook_source(self, table_id: str, name: str = "Webhook") -> dict:
-        """Create a webhook source on a table. Returns source dict with webhook URL."""
+        """Create a webhook source on a table. Returns source dict with webhook URL.
+
+        NOT ready to ingest by itself (verified 2026-07-24): the new source has
+        `sourceSubscriptions: []` — POSTs to its webhook URL return OK and
+        increment `state.numSourceRecords`, but NO table rows appear (records
+        buffer server-side). You must also create a source FIELD to register
+        the subscription, which retroactively materializes the buffered
+        records:
+
+            clay.create_column(table_id, {
+                "type": "source",
+                "name": "Webhook",
+                "typeSettings": {"sourceIds": [source["id"]], "canCreateRecords": True},
+            })
+            # get_source(source_id) then shows sourceSubscriptions [{tableId, fieldId}]
+
+        Also: the webhook endpoint does NOT fan out JSON arrays — an array of
+        N objects counts as ONE source record and does not create N rows
+        (verified 2026-07-24). Send one object per POST."""
         res = self.post("/sources", {
             "workspaceId": int(self.workspace_id),
             "tableId": table_id,
@@ -4649,9 +4681,19 @@ class ClayClient:
         cpj_type: str = "people",
         workspace_id: int | str | None = None,
     ) -> dict:
-        """Run the zero-credit preview for a Find People / Find Companies
-        search without creating a table. Clay hard-caps this preview at exactly
-        50 rows."""
+        """DEAD as of 2026-07-23 — this call now returns HTTP 400.
+
+        Clay removed the `*-preview` enrichmentTypes from the
+        POST /v3/actions/run-enrichment server allowlist (now only
+        find-and-enrich-personal-linkedin, enrich-personal-linkedin-url,
+        enrich-company, claygent, find-employee-headcount,
+        search-companies-from-table). Free-preview workaround: the OFFICIAL
+        `clay` CLI search (`clay search filters-mode create/run`) or the
+        public API /public/v0/search/filters-mode — both free.
+
+        Historical behavior (verified 2026-05-01): ran the zero-credit preview
+        for a Find People / Find Companies search without creating a table;
+        Clay hard-capped the preview at exactly 50 rows."""
         if not isinstance(inputs, dict):
             raise ValueError("preview_sourced_table: inputs must be a dict")
         cpj_type = str(cpj_type).lower()

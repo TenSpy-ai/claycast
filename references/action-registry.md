@@ -208,11 +208,12 @@ Find a single matching row in another Clay table.
   - `fields|filterOperator`: `'"EQUAL"'`, `'"CONTAINS"'`, etc.
   - `fields|rowValue`: formula ref from current table (`'{{@Column Name}}'`)
   - `fields|limit` (optional): max results
-- **output:** display string like "1 Record Found"
+- **output:** the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`) — the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES (verified 2026-07-24)
+- **credits:** 0 per lookup execution (verified 2026-07-24 via execute + workspace balance check)
 - **gotchas:**
   - Input names use `fields|` prefix — NOT just `targetColumn`
   - Without `fields|` prefix, inputs are silently dropped
-  - The old "`?.key` extractor" guidance is **not reliable enough to treat as a contract**. Live ClayCast testing found the lookup display cell populates, but downstream extractor formulas did not resolve consistently. Treat extraction as "validate on a real table first," not "guaranteed pattern."
+  - Extractor mechanics (verified 2026-07-24 — replaces the older vague "`?.key` extractors do not resolve reliably" warning): bracket-key access WORKS in the formula engine — `{{f_lookup}}?.record?.["Target Column Name"]`. Setting `mappedResultPath` via a formula PATCH did NOT take effect (the column kept returning the whole object) — do the extraction in `formulaText` itself.
 
 ```python
 clay.create_action_column(t_id, "Find in CRM",
@@ -235,7 +236,7 @@ Same as Lookup Row but returns multiple matches.
 - **package:** `4299091f-3cd3-4d68-b198-0143575f471d`
 - **inputs:** Same as Lookup Row (all use `fields|` prefix)
 - **output:** display string like "3 Records Found"
-- **gotcha:** same extractor warning applies here — do not assume a stable `?.key` pattern without live validation.
+- **gotcha:** see the single-row entry's verified extractor mechanics (2026-07-24): payload under `?.record?.` keyed by column names, bracket-key access works, `mappedResultPath` PATCH ignored. The multi-row payload shape has not been independently re-verified — validate on a real table first.
 
 ---
 

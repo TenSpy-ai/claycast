@@ -378,6 +378,8 @@ Keep `systemPrompt` to ~500-1,000 chars max. Put the full instructions in `promp
 }
 ```
 
+Creating this source FIELD is what binds a webhook source to a table: with `typeSettings: {"sourceIds": [s_id], "canCreateRecords": true}` it registers the `sourceSubscriptions` entry. A webhook source WITHOUT one buffers POSTs (`state.numSourceRecords` increments) but never creates rows; adding the field retroactively materializes the buffered records. Verified 2026-07-24 — see "Webhook Source Tables" below.
+
 ### Text / Number / Basic column
 ```python
 {"type": "text", "name": "Company Name"}
@@ -703,7 +705,7 @@ Verified 2026-04-23: `formulaText` with `'{"q": hello}'` produced URL `https://h
 
 **Lookup Single Row** (`lookup-row-in-other-table`) uses the same pattern — same package ID, same `fields|` prefix inputs.
 
-**Response:** `value` is a display string like `"✅ 3 Records Found"`. Use formula extractors to access matched record data.
+**Response:** `value` is a display string like `"✅ 3 Records Found"` — for single-row lookup just `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect — extract in `formulaText` itself. 0 credits per lookup execution. Verified 2026-07-24.
 
 ### Instantly: Add Lead to Campaign
 
@@ -859,6 +861,8 @@ recs = clay.create_records(t_id, [{name_col: "Alice", dom_col: "a.com"}])
 pregen = [_gen_record_id(), _gen_record_id()]
 recs = clay.create_records(t_id, [...], record_ids=pregen)
 ```
+
+**FRESH-TABLE silent drop (verified 2026-07-23):** on a freshly created table, the name-keyed path (`field_names=True`) can silently fail — the blank-POST + name→field-id mapped PATCH returns 200 but the values NEVER land (rows stay blank; `create_records` raises its 5s `"values did not persist"` RuntimeError). The IDENTICAL PATCH keyed by raw field ids commits fine (`update_record` / `bulk_update_records` with `{fid: value}`). `preflight()` reports `write: True` — this is NOT the write-restricted-cookie mode. Workaround: create blank rows, then fid-keyed `bulk_update_records`, then re-fetch to verify.
 
 ### Create records — raw HTTP (for debugging only)
 
@@ -1356,6 +1360,7 @@ clay.patch(f"/tables/{tid}/fields/{fid}", {
 | formulaText not saving on any column | Missing `formulaType: "text"` in PATCH | Always include `formulaType: "text"` — it's the gatekeeper (url/number dataTypes work fine) |
 | `get_schema()` returns empty fields | Wrong viewId or schema has no typeSettings | Use `table["fields"]` from `get_table()` for full column data |
 | Record creation returns 200 but values vanish | Used populated `POST /tables/{t}/records` | Use `clay.create_records()` or Clay's 2-step UI flow: blank `POST /records` with pre-generated ids, then bulk `PATCH /records` with values |
+| Fresh table: name-keyed `create_records` raises "values did not persist" (rows stay blank) | Name→field-id mapped PATCH 200s but never commits on freshly created tables (verified 2026-07-23; NOT the write-restricted-cookie mode — `preflight()` shows `write: True`) | Blank rows + fid-keyed `bulk_update_records({fid: value})` + re-fetch to verify |
 | Column creation 400: "Missing data type settings" | Text column missing typeSettings | Always include `"typeSettings": {"dataTypeSettings": {"type": "text"}}` for text columns |
 | Run rejected: "Field runRecords - Required" | Missing runRecords | Always include `"runRecords": {"recordIds": [...]}` or `{"viewId": ...}` |
 | `ERROR_TOO_MANY_RUNS` | Column triggered too many times in short window | Wait ~3 minutes, then retry |
@@ -1443,6 +1448,27 @@ Additional live-verified behavior (2026-07-21): the endpoint VALIDATES the compa
 ---
 
 ## Webhook Source Tables — Extraction Columns
+
+### A webhook SOURCE alone does not ingest — you need a source FIELD (verified 2026-07-24)
+
+`create_webhook_source` (`POST /v3/sources` with `type: "webhook"`) creates a source with `sourceSubscriptions: []`. POSTs to its webhook URL return OK and increment `state.numSourceRecords`, but **NO table rows appear** — the records buffer server-side. Creating a source FIELD is what registers the subscription:
+
+```python
+clay.create_column(t, {
+    "type": "source",
+    "name": "Webhook",
+    "typeSettings": {"sourceIds": [s_id], "canCreateRecords": True},
+})
+# get_source(s_id) then shows sourceSubscriptions: [{tableId, fieldId}]
+```
+
+After the field exists, the previously buffered records **retroactively materialize** as rows.
+
+### Arrays do NOT fan out (verified 2026-07-24)
+
+POSTing a JSON array of N objects to the webhook URL counts as ONE source record and does NOT create N rows (verified twice — before and after the subscription existed; the array-row materialized with no matching fields). Send **one object per POST**.
+
+### Extraction columns
 
 When you create a table with a webhook source, Clay creates a source column that stores the full JSON payload. The individual data columns (name, headline, etc.) are **NOT automatically populated** — you must create formula extractors.
 
@@ -1663,7 +1689,7 @@ The Find leads UI fires this on every filter change. Body shape:
 }
 ```
 
-**Allowed `enrichmentType` values (10 total, server-allowlisted as of 2026-04-30):**
+**Allowed `enrichmentType` values (6 total, server-allowlisted — SHRANK 2026-07-23; was 10 as of 2026-04-30):**
 
 | `enrichmentType` | What it is |
 |---|---|
@@ -1672,15 +1698,15 @@ The Find leads UI fires this on every filter change. Body shape:
 | `enrich-company` | Enrich a company |
 | `claygent` | Run a Claygent |
 | `find-employee-headcount` | Get employee headcount for a company |
-| `find-lists-of-people-with-mixrank-source-preview` | **People search (preview only — hard-capped at 50 rows)** |
-| `find-lists-of-companies-with-mixrank-source-preview` | **Companies search (preview only)** |
-| `find-company-lookalikes-clustered-preview` | Company lookalikes via clustering |
-| `find-lists-of-jobs-with-mixrank-source-preview` | Jobs search (preview only) |
 | `search-companies-from-table` | Search companies seeded from a table |
+
+**ALLOWLIST REGRESSION (verified 2026-07-23):** the four `*-preview` search types in the 2026-04-30 allowlist — `find-lists-of-people-with-mixrank-source-preview`, `find-lists-of-companies-with-mixrank-source-preview`, `find-lists-of-jobs-with-mixrank-source-preview`, `find-company-lookalikes-clustered-preview` — were REMOVED server-side. Sending any of them now returns HTTP 400: `{"error":"BadRequest","message":"\"enrichmentType\" must be one of [find-and-enrich-personal-linkedin, enrich-personal-linkedin-url, enrich-company, claygent, find-employee-headcount, search-companies-from-table]"}`. Consequence: `clay_client.preview_sourced_table()` is DEAD (400s). Free-preview workaround: the OFFICIAL `clay` CLI search (`clay search filters-mode create/run`) or the public API `/public/v0/search/filters-mode` — both free.
 
 **Critical: non-preview Mixrank actions are NOT directly callable via this endpoint.** Sending `enrichmentType: "find-lists-of-people-with-mixrank-source"` (no `-preview` suffix) returns HTTP 400 with the allowlist above. The full action is only invokable via `POST /v3/sources/create-cpj-table` (which forces the save-to-table flow with `limit: 50000`).
 
 ### Preview behavior — what's free vs gated
+
+**REGRESSED 2026-07-23:** everything in this subsection is HISTORICAL — the `*-preview` enrichmentTypes were removed from the run-enrichment allowlist (see above) and now 400. Kept as a record of how the preview layer behaved while it existed; the free-preview replacement is the official `clay` CLI search / public API filters-mode.
 
 For the `*-preview` variants:
 
@@ -1698,7 +1724,7 @@ For the `*-preview` variants:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v3/actions/run-enrichment` | Runs the search action. Body: `{workspaceId, enrichmentType, options: {sync, returnTaskId, returnActionMetadata}, inputs: <full filter dict>}`. **Preview mode** (`enrichmentType: "<actionKey>-preview"`) returns `{result: {people: [...], peopleCount: N}, metadata: {...}, taskId}` with full inline rows. **Preview is 0 credits** but capped at 50 rows by UI. The non-preview variant (drop the `-preview` suffix) is used inside `create-cpj-table` with `limit: 50000`. |
+| `POST /v3/actions/run-enrichment` | Runs the search action. Body: `{workspaceId, enrichmentType, options: {sync, returnTaskId, returnActionMetadata}, inputs: <full filter dict>}`. **Preview mode** (`enrichmentType: "<actionKey>-preview"`) returns `{result: {people: [...], peopleCount: N}, metadata: {...}, taskId}` with full inline rows. **Preview is 0 credits** but capped at 50 rows by UI. **(Preview mode REMOVED from the allowlist 2026-07-23 — now 400s; see the allowlist section above.)** The non-preview variant (drop the `-preview` suffix) is used inside `create-cpj-table` with `limit: 50000`. |
 | `POST /v3/presets` | Save a search as a Preset. Body wraps the filter inputs + name + description. Returns the new preset (id format `pre__<id>` — note double underscore). |
 | `GET /v3/workspaces/{ws}/presets/{pre__id}` | Fetch one preset by id. (Different surface from the `/v3/presets/workspace/{ws}/...` listing endpoints.) |
 | `GET /v3/presets/workspace/{ws}/recent-searches?actionPackageId=<pkg>&actionKey=<key>` | Recent searches scoped to one action |
@@ -1764,14 +1790,17 @@ Mirrors what the Find leads UI does. Each filter change is server-persisted via 
    ← {<partial filter delta>}
    → 200                                         // persists state server-side
 
-3. (per filter change, fired alongside step 2)
+3. (per filter change, fired alongside step 2) — ⚠ DEAD 2026-07-23: the *-preview
+   enrichmentTypes were removed from the run-enrichment allowlist (400 BadRequest);
+   shape kept for history. Free preview today = official `clay search filters-mode`
+   or public API /public/v0/search/filters-mode.
    POST /v3/actions/run-enrichment
    ← {workspaceId: "<ws>" (string!), enrichmentType: "find-lists-of-people-with-mixrank-source-preview",
        options: {sync: true, returnTaskId: true, returnActionMetadata: true},
        inputs: <full ~50-key filter dict, limit ≤ 50>}
-   → {result: {people: [...50 max...], peopleCount: N},
+   → (historical) {result: {people: [...50 max...], peopleCount: N},
        metadata: {status, additionalCreditCost: 0, ...},
-       taskId: "at_<id>"}                        // 0 credits; capped at 50
+       taskId: "at_<id>"}                        // was: 0 credits; capped at 50
 
 4. (optional — save the in-progress search as a preset BEFORE materializing)
    POST /v3/presets
@@ -1800,6 +1829,8 @@ The chat-conversation only exists to mirror the UI's incremental-filter UX. The 
 ```
 1. (optionally) POST /v3/actions/run-enrichment with preview enrichmentType to validate filters + see count
    → {result: {peopleCount: N}, ...}             // free, capped at 50, optional
+   // DEAD 2026-07-23: preview enrichmentTypes removed from the allowlist (400). Skip straight to
+   // step 2, or validate filters for free via the official `clay` CLI search / public API filters-mode.
 
 2. POST /v3/sources/create-cpj-table
    ← {workspaceId, workbookName, workbookId: null, conversationId: null,
@@ -1830,6 +1861,7 @@ Loading a saved search creates a NEW chat-conversation seeded from the preset's 
 
 5. POST /v3/actions/run-enrichment (preview, with preset's filters)
    → {result: {people: [...], peopleCount: N}, ...}
+   // DEAD 2026-07-23: preview enrichmentTypes now 400 (allowlist regression — see run-enrichment section)
 ```
 
 Each open creates a NEW `cc_<id>` — saved searches are stateless from the chat-conversation perspective. The preset is the durable record.
@@ -1952,7 +1984,7 @@ The destination workbook is also auto-created (the user chose its name in the UI
         │ │                                    │
         ▼ │                                    │
         run-enrichment ─→ taskId at_<id> ──┐   │
-        (preview, free)                    │   │
+        (preview — DEAD 2026-07-23)        │   │
         │                                  │   │
         │                                  ▼   │
         │                     POST /presets ───┘   ◄── ?loadedPresetId=pre__<id>
@@ -2008,7 +2040,7 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - **Formula columns:** create as `text` first, then PATCH with `formulaText` + `formulaType: "text"`. Creating with the formula in one shot drops it.
 - **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded; `_metadata.modelSource` needs inner quotes: `'"user"'`.
 - **Formula string ops:** `.indexOf()` and `.includes()` are unreliable — use `/pattern/i.test(String({{f_id}}) || "")`.
-- **Lookup columns** use a `fields|` prefix on filter inputs: `fields|targetColumn`, `fields|filterOperator`, `fields|rowValue`. The extractor side is less reliable: `?.key` formulas have drifted in live testing, so validate lookup extraction against a real table before depending on it.
+- **Lookup columns** use a `fields|` prefix on filter inputs: `fields|targetColumn`, `fields|filterOperator`, `fields|rowValue`. Extractor mechanics (verified 2026-07-24): the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works in the formula engine (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect. Lookup execution is 0 credits. Details: action-registry.md → lookup-row-in-other-table.
 - **Webhook source tables** need formula extractors — incoming columns are not auto-populated; PATCH each downstream column with `formulaText` + `formulaType`.
 
 ---
@@ -2024,6 +2056,21 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - **`POST /v3/sources/create-cpj-table` side effects & validation:** (a) validates the company scope at create — the company table must contain ≥1 row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`; a failed attempt STILL creates an orphan `Update People Search (...)` trigger column on the company table. (b) On success it auto-creates that companion trigger column too. (c) Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` prevented the initial search run on all 5 real creations (source `state` stayed `{}`), and subsequent `PATCH /v3/sources/{id}` (accepts `{"name"}` and `{"typeSettings"}`) did not trigger runs either — used to restore `inputs.limit` after a neutered create.
 - **Creating a `route-row` action column auto-creates the full receiving pipeline on the target table**: a `manual`/routing source named `Rows from: <sender table name>`, a source column, and extractor formula columns for every `rowData` key. When replicating a workbook, KEEP these auto structures (they hold the sender binding) and delete/repoint any manually created duplicates.
 - `POST /v3/sources` works fine for `type: "manual"` routing sources (`{"workspaceId", "tableId", "name", "type", "typeSettings": {"type": "routing"}}`); the "Invalid subscriptions" 404 applies to people/company search sources only.
-- `POST /v3/workbooks` accepts `parentFolderId` at create. Workbook settings PATCH path is `PATCH /v3/{ws}/workbooks/{wb}` (NOT `/v3/workbooks/{wb}`, which 404s) — used for `settings.tablePresentationSettings` (table order in the sidebar, `{table_id: index}`).
+- `POST /v3/workbooks` accepts `parentFolderId` at create (honored), but `settings: {"isAutoRun": false}` in the create body is NOT persisted — the response echoes `settings: {}` (verified 2026-07-23). The effective dark control is per-table: `PATCH /v3/tables/{t}` with `{"tableSettings": {"AUTO_RUN_ON": false}}`. Workbook settings PATCH path is `PATCH /v3/{ws}/workbooks/{wb}` (NOT `/v3/workbooks/{wb}`, which 404s) — used for `settings.tablePresentationSettings` (table order in the sidebar, `{table_id: index}`). The same workspace-scoped path pattern applies to Terracotta workflows — see "Terracotta (tc-workflows) metadata endpoints" below.
 - **Wrapped in claycast (2026-07-21):** the whole view surface above is now SDK methods — `list_views`, `create_view` (applies filter/sort via the sub-endpoints automatically), `update_view`, `delete_view`, `set_view_filter`, `set_view_sort`, `set_view_fields` (visibility+width), `set_view_field_order` (`move_field` walk) — plus `preflight(table_id=)` for the write-restricted-cookie check. All live-smoke-tested (create→configure→reorder→rename→delete).
 - (`formulaType` requirement on formula PATCH was already documented above — see "PATCH formula requires `formulaType`".) New nuance: editing a formula via PATCH does NOT recompute existing rows; only new rows or input-cell writes trigger evaluation.
+
+---
+
+## Terracotta (tc-workflows) metadata endpoints (discovered 2026-07-24)
+
+Terracotta workflows follow the same workspace-scoped path pattern as the workbook-settings PATCH above — the unscoped variants (`/v3/tc-workflows/{id}`, `/v3/terracotta/workflows/{id}`, `/v3/workflows/{id}`) all 404.
+
+- `PATCH /v3/workspaces/{ws}/tc-workflows/{wf_id}` with `{"name": "..."}` → `200 {"workflow": {...}}` — renames a workflow. Verified live 2026-07-24.
+- `GET /v3/workspaces/{ws}/tc-workflows/{wf_id}` → workflow metadata only (no node graph).
+
+No SDK wrapper yet — raw recipe via the escape hatch:
+
+```python
+clay.patch(f"/workspaces/{clay.workspace_id}/tc-workflows/{wf_id}", {"name": "New name"})
+```
