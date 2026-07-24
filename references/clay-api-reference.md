@@ -595,6 +595,22 @@ Extract results with formula columns:
 
 ### HTTP API v2 column (e.g. RapidAPI GET)
 
+**`body` is `longtext`, not an object — the UI binds it as `formulaText` + `Clay.formatForJSON()`.**
+Verified 2026-07-24 by inspecting a UI-created column. `queryString` and `headers` are object-typed
+(hence the `formulaMap` rule below), but `body` per `clay workflows actions schema` is **longtext**, and
+Clay's own UI writes it as a concatenated JSON *string* with each interpolated value wrapped in the
+`Clay.formatForJSON()` formula helper (escapes quotes/newlines/control chars):
+
+```javascript
+"{\n  \"company\": \"" + Clay.formatForJSON({{f_domain}}) + "\",\n  \"record_id\": \""
+  + Clay.formatForJSON({{f_name}}) + "\"\n}"
+```
+
+A `formulaMap` body is *accepted* by the API and does send valid JSON (used in production here), but it is
+NOT the UI's canonical form — prefer `formulaText` + `Clay.formatForJSON()` so a column round-trips
+identically whether a human or claycast built it, and so values containing quotes/newlines can't break the
+payload.
+
 **CRITICAL: bind the action's FULL parameter list — see "Action columns need the action's FULL parameter list" below; a partial binding renders NO inputs in the Clay UI.**
 
 **CRITICAL: `queryString` and `headers` use `formulaMap`, NOT `formulaText`.**
