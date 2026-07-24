@@ -252,8 +252,9 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
   - `url`: API endpoint (string literal or formula)
   - `queryString`: use `formulaMap` for key-value pairs (NOT `formulaText`)
   - `body`: schema type is **longtext**. UI-canonical form = `formulaText` building a JSON string with
-    `Clay.formatForJSON({{f_id}})` around each value (escapes quotes/newlines). A `formulaMap` body also
-    works but is not what the UI writes. (verified 2026-07-24)
+    `Clay.formatForJSON({{f_id}})` around each value (escapes quotes/newlines) — use the helper
+    **`format_json_body({...})`** from `clay_client.py`. A `formulaMap` body also works but is not what the
+    UI writes. (verified 2026-07-24)
   - `headers`: use `formulaMap` for each header (NOT `formulaText`)
   - `removeNull`, `followRedirects`, `shouldRetry` (optional booleans)
   - **Bind ALL 15 params** (unset as `None`) or the Clay UI shows no inputs for the column — full list:

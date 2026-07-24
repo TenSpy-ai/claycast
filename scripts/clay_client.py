@@ -686,6 +686,67 @@ def _build_match_index(records, match_field_id):
     return idx
 
 
+
+def format_json_body(mapping: dict) -> str:
+    """Build an `http-api-v2` **body** binding the way Clay's own UI writes it.
+
+    `body` is schema type `longtext` (unlike the object-typed `queryString` /
+    `headers`), so the canonical binding is a `formulaText` expression that
+    concatenates a JSON string, wrapping every interpolated field reference in
+    the `Clay.formatForJSON()` formula helper (which escapes quotes, newlines
+    and control characters). Verified 2026-07-24 against a UI-created column.
+
+    A `formulaMap` body is also accepted by the API and does send valid JSON,
+    but it is NOT what the UI produces: a column built that way round-trips
+    differently from a human-built one, and raw values containing a quote or
+    newline can break the payload.
+
+    Values are rendered by type:
+      - `"{{f_xxx}}"` (a lone field reference) -> `Clay.formatForJSON({{f_xxx}})`, quoted
+      - `bool`                                  -> bare `true` / `false`
+      - `int` / `float`                         -> bare number
+      - anything else                           -> JSON string literal
+
+    Usage:
+        clay.create_action_column(t_id, "Call Webhook",
+            action_key="http-api-v2", package_id="4299091f-...",
+            inputs={"method": '"POST"', "url": '"https://..."',
+                    "headers": {"Content-Type": '"application/json"'},
+                    "body": format_json_body({
+                        "company":  "{{f_domain}}",   # field -> formatForJSON
+                        "segment":  "Enterprise Retail",  # string literal
+                        "allow_ai": True,             # bare boolean
+                    }),
+                    ...},   # plus every other param as None -- see create_action_column
+            data_type="json", view_id=v_id)
+    """
+    import re as _re
+
+    pieces: list[tuple[str, str]] = []
+    literal = "{\n"
+    items = list(mapping.items())
+    for idx, (key, value) in enumerate(items):
+        tail = "," if idx < len(items) - 1 else ""
+        if isinstance(value, str) and _re.fullmatch(r"\{\{[^{}]+\}\}", value.strip()):
+            literal += '  "%s": "' % key
+            pieces.append(("lit", literal))
+            pieces.append(("expr", "Clay.formatForJSON(%s)" % value.strip()))
+            literal = '"%s\n' % tail
+        elif isinstance(value, bool):
+            literal += '  "%s": %s%s\n' % (key, "true" if value else "false", tail)
+        elif isinstance(value, (int, float)):
+            literal += '  "%s": %s%s\n' % (key, value, tail)
+        else:
+            escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+            literal += '  "%s": "%s"%s\n' % (key, escaped, tail)
+    literal += "}"
+    pieces.append(("lit", literal))
+
+    def _enc(raw: str) -> str:
+        return '"' + raw.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+    return " + ".join(_enc(v) if kind == "lit" else v for kind, v in pieces if not (kind == "lit" and v == ""))
+
 class ClayClient:
     def __init__(self, workspace_id: int = None, clay_session: str | None = None):
         """

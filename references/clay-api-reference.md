@@ -606,6 +606,10 @@ Clay's own UI writes it as a concatenated JSON *string* with each interpolated v
   + Clay.formatForJSON({{f_name}}) + "\"\n}"
 ```
 
+claycast ships **`format_json_body({...})`** (module-level in `clay_client.py`) which emits exactly this form —
+field refs get `Clay.formatForJSON()`, bools/numbers stay bare, everything else becomes a JSON string literal.
+Verified byte-identical to a UI-built column.
+
 A `formulaMap` body is *accepted* by the API and does send valid JSON (used in production here), but it is
 NOT the UI's canonical form — prefer `formulaText` + `Clay.formatForJSON()` so a column round-trips
 identically whether a human or claycast built it, and so values containing quotes/newlines can't break the
