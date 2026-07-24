@@ -1296,7 +1296,7 @@ clay.patch(f"/tables/{tid}/fields/{fid}", {
 | 404 "NoMatchingURL" on `/views/{view_id}/records` | Endpoint does not exist | Use 2-step: `/views/{view_id}/records/ids` then `bulk-fetch-records` |
 | `bulk-fetch-records` 400 error | Empty or missing `recordIds` | Always pass a non-empty `recordIds` array |
 | Enrich Company `ERROR_INVALID_INPUT` | Company name used instead of LinkedIn URL | Use LinkedIn company URL as `company_identifier` input |
-| `mappedResultPath` formula returns empty | Missing `mappedResultPath` array for nested data | Add `"mappedResultPath": ["experience", "0", "url"]` to typeSettings |
+| `mappedResultPath` formula returns empty | Missing `mappedResultPath` array for nested data | Add `"mappedResultPath": ["experience", "0", "url"]` to typeSettings. **Caveat (2026-07-24): API create/PATCH silently STRIP `mappedResultPath`** — only the UI extract flow persists it. Functionally harmless when `formulaText` does the extraction itself (`?.a?.[0]?.b`); treat it as UI metadata you cannot set via API. |
 | `POST /sources` returns "Invalid subscriptions" | Wrong endpoint for people/company SEARCH sources | Use `POST /sources/create-cpj-table` instead. `POST /sources` works fine for `type: "manual"` routing sources (verified 2026-07-21). |
 
 ---
