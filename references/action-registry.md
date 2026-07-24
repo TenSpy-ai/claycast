@@ -254,6 +254,10 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
   - `body`: use `formulaMap` for structured JSON (NOT `formulaText`)
   - `headers`: use `formulaMap` for each header (NOT `formulaText`)
   - `removeNull`, `followRedirects`, `shouldRetry` (optional booleans)
+  - **Bind ALL 15 params** (unset as `None`) or the Clay UI shows no inputs for the column — full list:
+    `method, url, queryString, body, headers, fieldPaths, removeNull, returnResponseMetadata, followRedirects,`
+    `followRedirectsOptions|maxRedirects, responseTimeout, shouldRetry, retryOptions|maxRetries,`
+    `retryOptions|statusCodesToRetry, retryOptions|errorCodesToRetry` (verified 2026-07-24)
 - **output:** display string "Status Code: 200" — use `?.key` extractors for response body
 - **auth:** RapidAPI auth account ID from `clay.list_auth_accounts()` (auto-injects API key headers)
 - **gotchas:**

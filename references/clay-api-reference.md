@@ -259,6 +259,54 @@ def ref(name): return "{{" + field_map[name] + "}}"
 
 ## CRITICAL: `inputsBinding` Rules
 
+### Action columns need the action's FULL parameter list, or the UI shows NO inputs
+
+**Verified 2026-07-24.** Clay's UI renders an action column's input rows from the
+`inputsBinding` array itself — not from the action's schema. A column created with only the
+parameters you actually use is *functionally correct* (it runs, it returns data) but opens in
+the UI with **no inputs visible at all**, so nobody can see or edit its configuration.
+
+A UI-created `http-api-v2` column carries **all 15 entries**, unset ones present but empty:
+
+```json
+{"inputsBinding": [
+  {"name": "method"},                                  // set:   {"name":"method","formulaText":"\"POST\""}
+  {"name": "url", "formulaText": "\"https://...\""},
+  {"name": "queryString"}, {"name": "body"}, {"name": "headers"}, {"name": "fieldPaths"},
+  {"name": "removeNull", "formulaText": "true"},
+  {"name": "returnResponseMetadata"},
+  {"name": "followRedirects", "formulaText": "true"},
+  {"name": "followRedirectsOptions|maxRedirects"},      // pipe-nested children are listed too
+  {"name": "responseTimeout"},
+  {"name": "shouldRetry", "formulaText": "true"},
+  {"name": "retryOptions|maxRetries"},
+  {"name": "retryOptions|statusCodesToRetry"},
+  {"name": "retryOptions|errorCodesToRetry"}
+]}
+```
+
+Get the authoritative list per action from `clay workflows actions schema <packageId> <actionKey>`
+(returns `inputParameters`), then pass **every** name to `create_action_column` — unset ones as
+`None`, which the wrapper emits as bare `{"name": …}` entries:
+
+```python
+clay.create_action_column(t_id, "My HTTP Call",
+    action_key="http-api-v2", package_id="4299091f-3cd3-4d68-b198-0143575f471d",
+    inputs={"method": '"POST"', "url": '"https://example.com/hook"',
+            "headers": {"Content-Type": '"application/json"'}, "body": {"k": "{{f_xxx}}"},
+            # everything else present-but-unset so the UI renders the full form:
+            "queryString": None, "fieldPaths": None, "removeNull": "true",
+            "returnResponseMetadata": None, "followRedirects": "true",
+            "followRedirectsOptions|maxRedirects": None, "responseTimeout": None,
+            "shouldRetry": "true", "retryOptions|maxRetries": None,
+            "retryOptions|statusCodesToRetry": None, "retryOptions|errorCodesToRetry": None},
+    data_type="json", view_id=v_id)
+```
+
+Symptom to recognize: the column works when run programmatically, but a user opening it in Clay
+reports "this column has no inputs". Applies to any action column, not just `http-api-v2`.
+
+
 ### 1. `authAccountId` goes top-level, NOT in `inputsBinding`
 
 ```python
@@ -546,6 +594,8 @@ Extract results with formula columns:
 ```
 
 ### HTTP API v2 column (e.g. RapidAPI GET)
+
+**CRITICAL: bind the action's FULL parameter list — see "Action columns need the action's FULL parameter list" below; a partial binding renders NO inputs in the Clay UI.**
 
 **CRITICAL: `queryString` and `headers` use `formulaMap`, NOT `formulaText`.**
 Using `formulaText` with a JSON object `{"key": val}` causes Clay to split the string character-by-character into numbered rows — completely broken. Do not check the cell preview (`"Status Code: 200"`) to verify; that can lie when the target server returns 200 regardless. Inspect `externalContent.fullValue` via `GET /tables/{t}/records/{r}` to see the actual URL/payload Clay sent.

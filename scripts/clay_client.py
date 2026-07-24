@@ -4300,6 +4300,15 @@ class ClayClient:
         inputs: `{input_name: value}` where each value is either:
           - a formula string, sent as `formulaText`
           - a dict, sent as `formulaMap` (used by inputs like `answerSchemaType`)
+          - `None`, sent as a bare `{"name": ...}` entry (present but unset)
+          PASS EVERY PARAMETER THE ACTION DECLARES, using None for the ones you
+          don't set. Clay's UI builds an action column's input form from the
+          stored `inputsBinding` array, NOT from the action schema, so a column
+          bound with only the params you use runs fine but opens in the UI with
+          NO inputs visible. Get the authoritative names from
+          `clay workflows actions schema <packageId> <actionKey>`
+          (`inputParameters`), including pipe-nested children such as
+          `retryOptions|maxRetries`. Verified 2026-07-24 (http-api-v2 = 15 params).
           NOTE on native-query inputs (e.g. `soql_query`): the formulaText must
           be a valid formula EXPRESSION that evaluates to the query string — a
           JS string literal like `'"SELECT Id FROM User"'`, or a concatenation
