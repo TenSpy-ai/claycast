@@ -3851,23 +3851,18 @@ class ClayClient:
         return self.patch(f"/tables/{table_id}/views/{view_id}/fields", fields)
 
     def autofit_view_fields(self, table_id: str, view_id: str, *,
-                            sample_rows: int = 50, min_width: int = 80,
-                            max_width: int = 480, char_px: float = 7.2,
-                            header_pad: int = 56, cell_pad: int = 26,
+                            min_width: int = 80, max_width: int = 480,
+                            char_px: float = 7.2, header_pad: int = 56,
                             include_hidden: bool = False) -> dict:
-        """Auto-fit every column's width in a view so header and (sampled)
-        cell text are visible in the UI.
+        """Auto-fit every column's width in a view so its HEADER text is fully
+        visible in the UI. Header-only BY DESIGN (user directive 2026-08-06):
+        cell content is deliberately ignored — no row reads, no sampling.
 
-        Heuristic, not pixel-perfect: width = clamp(min_width, max_width,
-        pad + char_px * chars), where chars is the longer of the column NAME
-        (plus header_pad for the type icon / menu chrome) and the longest
-        LINE seen across up to `sample_rows` records (multi-line cells count
-        per longest line; dict/list cells are JSON-stringified). Long-text
-        columns therefore land on max_width rather than absurd widths — raise
-        max_width if you want more. Only visible fields are touched unless
-        include_hidden=True. Applies in ONE `set_view_fields` PATCH (per-field
-        `width` verified live 2026-07-21). Returns {field_id: width}.
-        Idempotent — re-running converges to the same widths.
+        width = clamp(min_width, max_width, header_pad + char_px * len(name)),
+        where header_pad covers the type icon / menu chrome. Only visible
+        fields are touched unless include_hidden=True. Applies in ONE
+        `set_view_fields` PATCH (per-field `width` verified live 2026-07-21).
+        Returns {field_id: width}. Idempotent — re-running converges.
         """
         view = next((v for v in self.list_views(table_id) if v["id"] == view_id), None)
         if view is None:
@@ -3876,23 +3871,6 @@ class ClayClient:
         raw = self.get_table(table_id)
         table = raw.get("table", raw)
         names = {f["id"]: f.get("name", "") for f in table.get("fields", [])}
-        rows = self.list_records(table_id, view_id, limit=sample_rows)
-        if isinstance(rows, dict):
-            rows = rows.get("records") or rows.get("data") or []
-        longest: dict = {}
-        for row in rows:
-            for fid, cell in (row.get("cells") or {}).items():
-                val = extract_cell_value(cell)
-                if val is None or val == "":
-                    continue
-                if not isinstance(val, str):
-                    try:
-                        val = json.dumps(val)
-                    except TypeError:
-                        val = str(val)
-                chars = max((len(line) for line in val.splitlines()), default=0)
-                if chars > longest.get(fid, 0):
-                    longest[fid] = chars
         widths: dict = {}
         for fid, cfg in fcfg.items():
             if not include_hidden and (cfg or {}).get("isVisible") is False:
@@ -3900,8 +3878,7 @@ class ClayClient:
             if fid not in names:
                 continue
             header_px = header_pad + char_px * len(names[fid])
-            cell_px = cell_pad + char_px * longest.get(fid, 0)
-            widths[fid] = int(max(min_width, min(max_width, max(header_px, cell_px))))
+            widths[fid] = int(max(min_width, min(max_width, header_px)))
         if widths:
             self.set_view_fields(table_id, view_id,
                                  {fid: {"width": w} for fid, w in widths.items()})
