@@ -1300,6 +1300,12 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
 - Optional chaining: `{{f_id}}?.key`
 - **JSON / Date globals (verified 2026-08-06):** `JSON.parse`, `JSON.stringify`,
   `Object.keys`, `new Date().toISOString()` all work.
+- **`Object.fromEntries` + array chains (verified 2026-08-06):** `Object.fromEntries`,
+  `.map()`, `.filter()`, and `String.split()` with a multiline-anchored regex
+  (`s.split(/^[ \t]*#[ \t]*/m)`) all evaluate — proven by a single expression-body IIFE
+  that parses a `# field-name` block-delimited text cell into a JSON object string
+  (markdown-ish drafts → `customFields` JSON). Pair with `.replace(/\n/g,"<br>")` on
+  values destined for sequencer email templates (returns render as HTML there).
 - **Arrow-function IIFEs with EXPRESSION bodies (verified 2026-08-06):**
   `((s) => s ? JSON.parse(s) : ({}))({{col}})` evaluates fine — the formula language is
   best understood as **expression-only JavaScript with JSON/Date available**.
