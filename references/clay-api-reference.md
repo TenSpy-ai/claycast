@@ -1300,6 +1300,12 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
 - Optional chaining: `{{f_id}}?.key`
 - **JSON / Date globals (verified 2026-08-06):** `JSON.parse`, `JSON.stringify`,
   `Object.keys`, `new Date().toISOString()` all work.
+- **Empty-cell coercion in string concat (verified 2026-08-06):** `"x" + {{empty_col}}`
+  yields `"x"`, NOT `"xnull"` — Clay coerces BOTH never-set and cleared text cells to `""`
+  inside formula string concatenation, unlike raw JS null semantics. Unguarded
+  concatenation templates are safe; `null`/`undefined` text only appears from expression
+  results (e.g. a `?.` chain over a missing object), so scrub those downstream if the
+  output feeds an external system.
 - **`Object.fromEntries` + array chains (verified 2026-08-06):** `Object.fromEntries`,
   `.map()`, `.filter()`, and `String.split()` with a multiline-anchored regex
   (`s.split(/^[ \t]*#[ \t]*/m)`) all evaluate — proven by a single expression-body IIFE
