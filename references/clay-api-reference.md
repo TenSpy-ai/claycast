@@ -75,7 +75,7 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
   - `top_n=` + `view_id=` (`viewIdTopRecords`)
   - `force_run=`
   - omitted field list = resolve all runnable fields (`action`, `enrichment`, `source`, `waterfall`, `claygent`)
-  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
+  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing (claygent-useCase; the plain `"use-ai"` useCase DOES auto-run on arriving rows — see the corrected scheduling-boundary entry in "AI Columns"; its run_column/force-run path is untested) — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
 - `clay.get_run_status(table_id)` normalizes both `GET /tables/{t}/fieldrun` and `GET /workspaces/{ws}/tables/{t}/fields/runstatus`.
 - `clay.wait_for_runs(...)` is the shared polling / stall-detection surface used to cover the Datagen job-monitor behavior.
 - `clay.rerun_errored_cells(...)` is the SDK recipe for Datagen `rerun_errors`: find the Errored Rows view, inspect which specific cells failed, then re-run only those field+record combinations.
@@ -226,8 +226,8 @@ clay.run_column(TABLE_ID, [ai_field_id], record_ids=RECORD_IDS)
 - `authAccountId` is required — without it the column never runs
 - `answerSchemaType` uses `formulaMap` not `formulaText` — `formulaText` silently fails
 - `jsonSchema` value is **double JSON-encoded**: `json.dumps(json.dumps(schema))` — single encoding produces a dict where Clay expects a string; column creates OK but never runs
-- `_metadata` with `modelSource: '"user"'` (inner quotes!) is required when using `answerSchemaType`. (BYO-API-key via `modelSource: "user"` is a use-ai COLUMN feature only — workflow agent nodes have no per-node equivalent; see "Agent-node model selection" in the Terracotta section.)
-- `dataTypeSettings` must be `{"type": "text"}` — `{"type": "json"}` breaks Clay UI rendering
+- `_metadata` with `modelSource: '"user"'` (inner quotes!) is needed ONLY for BYO-API-key columns — CORRECTED 2026-08-06: `answerSchemaType` columns run fine on the workspace key with no `_metadata` at all (verified on auto-running function columns). (BYO-API-key via `modelSource: "user"` is a use-ai COLUMN feature only — workflow agent nodes have no per-node equivalent; see "Agent-node model selection" in the Terracotta section.)
+- `dataTypeSettings`: older testing said `{"type": "text"}` (json broke UI rendering), but 2026-08-06 function-table columns with `{"type": "json"}` render and run fine — and record-returning use-ai columns REQUIRE json at create. Prefer json; if the UI misrenders, that's the older mode resurfacing.
 
 **API-triggered `use-ai` runs never executed (verified failing 2026-07-30; mechanism
 hypothesis unconfirmed).** A `use-ai` column (useCase `"claygent"`, `gpt-5-nano`,
@@ -244,18 +244,26 @@ while UI runs resolve a default account. Until resolved: **run AI columns from t
 UI Run button**, and treat a blank-cell-after-ACK on an AI column as expected, not a bug
 in your code.
 
-- **use-ai columns NEVER auto-run — not even on row ARRIVAL (verified 2026-08-06, 5-probe
-  battery on a function table):** subroutine-arrival rows with AUTO_RUN_ON true, a valid
-  model id, and a trivially-true run condition still never schedule the use-ai cell (cell
-  stays null — no status, no error), while a `lookup-row-in-other-table` column on the
-  SAME arriving rows fires normally. use-ai executes ONLY via UI runs. Consequence: no
-  autonomous pipeline (function table, webhook table, routine-fed table) can contain a
-  use-ai step — put the AI step in a Terracotta workflow and call it from the table (the
-  hybrid: in-table lookup first, http-api-v2 POST to the workflow's routines door only on
-  miss). `delaySettings` does NOT rescue it (verified 2026-08-06, 6th probe): a use-ai
-  column with a 30s delay and a true gate still never schedules on an arriving row — the
-  exclusion is at the scheduler level, not gate timing. The workflow-door POST is the ONLY
-  autonomous AI mechanism.
+- **use-ai scheduling boundary — it's the `useCase`, not the column class (CORRECTED
+  2026-08-06, supersedes an earlier claim here that use-ai never auto-runs):** the
+  arrival-scheduling exclusion applies to **`useCase: "claygent"`** (agent mode) — a
+  6-probe battery (valid models, trivially-true gates, no-op dependency tricks,
+  delaySettings) never scheduled a claygent column on an arriving row; claygent remains
+  UI-run-only in every tested path. But a use-ai column with **`useCase: "use-ai"`**
+  (plain generation) + `answerSchemaType` **SCHEDULES AND RUNS on subroutine-arrival
+  rows** — verified live twice (a UI-built sample function, then the persona classifier:
+  arrival → 30s delay → gate check → run → SUCCESS; table-hit rows cleanly refused with
+  `ERROR_RUN_CONDITION_NOT_MET`). So autonomous pipelines CAN contain an AI step — as a
+  plain use-ai column; only agent-mode (claygent, web-capable) work needs the
+  workflow-door POST fallback.
+  Working auto-run recipe (cloned from a UI-built column): `useCase '"use-ai"'`, `model`
+  (`'"gpt-4o"'` / `'"gpt-5-nano"'`), `prompt` = string literals + `Clay.formatForAIPrompt({{token}})`
+  interpolation, `answerSchemaType` formulaMap — simple variant
+  `{'type': '"json"', 'fields': '{"response":{"type":"string"}}'}` or JSONSchema variant
+  `{'type': '"json"', 'jsonType': '"JSONSchema"', 'jsonSchema': json.dumps(json.dumps(schema))}`
+  — `dataTypeSettings: json`, optional `runBudget`. Gate + `delaySettings` are BOTH
+  honored (delay defers the gate check — use it whenever the gate reads an upstream
+  action's status). Runs on the workspace key with NO `_metadata`.
 - **Action-column scheduling model (verified 2026-08-06):** action columns are scheduled
   ONCE when the row arrives; later input/dependency updates do NOT reschedule them, and a
   no-op formula dependency on another column does not help. The run condition is evaluated
@@ -270,7 +278,7 @@ in your code.
   new columns.
 - The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
-- `answerSchemaType` + `_metadata` are REQUIRED for `?.key` extractors to work — without them, Clay shows "Unable to parse output schema" even if the column was created successfully
+- `answerSchemaType` is required for `?.key` extractors to work — without it, Clay shows "Unable to parse output schema". (`_metadata` is NOT part of this requirement — see the corrected note above; 2026-08-06.)
 - `systemPrompt` must be < ~1,000 chars — put long instructions in `prompt` instead
 - For Claygent: expect 1-2 min per record (web research). For Create Content: seconds.
 
@@ -1345,6 +1353,13 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
   Complex expressions (IIFEs, method chains) lose this affordance. Design rule: when a
   template column should stay human-editable, keep it pure literal+token concatenation
   and push ALL parsing/transform logic into a separate downstream formula column.
+- **String literals REJECT `\uXXXX` escapes (verified 2026-08-06):** a formulaText containing
+  `\u2014`-style escapes fails with `INVALID_FORMULA_PARSING_FAILED` at that literal's
+  position (stored as a settingsError; the column silently never runs). Python's
+  `json.dumps` default (`ensure_ascii=True`) produces them on the first em-dash — emit
+  formula literals with `ensure_ascii=False`; raw unicode parses fine.
+- **`Clay.formatForAIPrompt(x)`** is available in formulas — the UI's own idiom for
+  interpolating values into use-ai prompt bindings (`"literal " + Clay.formatForAIPrompt({{col}}) + " more"`).
 - **Empty-cell coercion in string concat (verified 2026-08-06):** `"x" + {{empty_col}}`
   yields `"x"`, NOT `"xnull"` — Clay coerces BOTH never-set and cleared text cells to `""`
   inside formula string concatenation, unlike raw JS null semantics. Unguarded
@@ -2491,6 +2506,11 @@ Operational notes:
 - Pricing introspection: the 2026-08-05 clay-spy capture surfaced `GET /v3/workspaces/{id}/model-pricing/base-costs` (per-model credit base costs; a tc-workflow `input-schemas` GET rode the same capture). Read base-costs before estimating AI-heavy runs — raw shapes live in the capture JSONL; flesh out the entry when first used in anger.
 
 ### Creating a custom function (subroutine table) via API (verified 2026-07-31)
+
+- **UI-built function tables do NOT auto-register in the workspace tools registry**
+  (verified 2026-08-06): the routines door 404s until a `register_tool` call adds the
+  `function:t_…` record. The auto-register-on-build behavior applies to UI/Sculptor
+  WORKFLOW builds, not functions.
 
 Custom Clay FUNCTIONS (the UI's "function" tables; routine id `function:t_x`) can be
 created entirely via the internal API — closing most of feature-gaps.md § 6. A function

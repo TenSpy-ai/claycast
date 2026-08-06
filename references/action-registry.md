@@ -22,7 +22,14 @@ Generates text/JSON from data already in the table. Cheap, fast, deterministic.
 - **key:** `use-ai`
 - **package:** `67ba01e9-1898-4e7d-afe7-7ebe24819a57`
 - **inputs:**
-  - `useCase`: `'"use-ai"'` (NOT "claygent")
+  - `useCase`: `'"use-ai"'` (NOT "claygent") — this useCase also AUTO-RUNS on
+    subroutine-arrival rows (verified 2026-08-06); `"claygent"` is UI-run-only. Prompt
+    idiom: literals + `Clay.formatForAIPrompt({{token}})` (emit literals with
+    `ensure_ascii=False` — the parser rejects `\uXXXX` escapes). `answerSchemaType`
+    variants: `{'type': '"json"', 'fields': '{"response":{"type":"string"}}'}` or
+    `{'type': '"json"', 'jsonType': '"JSONSchema"', 'jsonSchema': json.dumps(json.dumps(schema))}`.
+    Prompt may read the subroutine source field directly (`{{f_subroutine_source}}?.["QA"]`).
+    `runBudget` observed on UI-built columns (semantics unconfirmed).
   - `model`: `'"gemini-2.5-flash"'` or `'"grok-4-1-fast-reasoning"'` (for JSON)
   - `prompt`: formula string with column refs
   - `systemPrompt` (optional): `'"You are a..."'` — keep under 1000 chars, no markdown
