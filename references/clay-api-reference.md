@@ -278,6 +278,13 @@ in your code.
   new columns.
 - The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
+- **Non-force `run_column` on `execute-subroutine` columns parks at `QUEUED` and never
+  dispatches (verified 2026-08-06):** the caller cell shows status `QUEUED`, no intake row
+  ever lands in the function — even on a LIVE (AUTO_RUN on) table with a passing gate.
+  `force_run=True` dispatches the identical call correctly. Scripted caller runs must use
+  force (which — see the gate note below — still honors conditionalRunFormulaText on this
+  action). Also: whole-table `run_column` with no `record_ids` 400s; always pass explicit
+  record ids.
 - `answerSchemaType` is required for `?.key` extractors to work — without it, Clay shows "Unable to parse output schema". (`_metadata` is NOT part of this requirement — see the corrected note above; 2026-08-06.)
 - `systemPrompt` must be < ~1,000 chars — put long instructions in `prompt` instead
 - For Claygent: expect 1-2 min per record (web research). For Create Content: seconds.
