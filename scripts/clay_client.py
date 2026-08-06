@@ -3842,7 +3842,9 @@ class ClayClient:
         """Bulk per-field view config via `PATCH /tables/{t}/views/{v}/fields`.
 
         `fields` maps field_id → config dict; accepted keys verified live:
-        `isVisible` (bool) and `width` (int). Mixed hide/show/width in one call
+        `isVisible` (bool), `width` (int), and `isPinned` (bool — clears/sets the UI
+        column pin; pinned columns are forced to the front of the view, which blocks
+        `set_view_field_order` from repositioning them — unpin first, verified 2026-08-06). Mixed hide/show/width in one call
         is fine. (Order strings are NOT settable this way — use
         `set_view_field_order`.)
         """
