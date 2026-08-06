@@ -108,6 +108,14 @@ workspace tools registry. Remaining sub-gap: **pass-through completion** (public
 runs linger `in_progress` even after the row lands) is still unwrapped — needs the
 managed-style `write-to-cell` send-back wiring.
 
+**Status 2026-08-06 (later): completion sub-gap CLOSED.** The send-back is wrapped:
+`create_function(..., send_back={output_name: extractor_column_name})` builds the
+`write-to-cell` column (11 origin bindings + data map) and enables AUTO_RUN; caller
+`execute-subroutine` cells then resolve `"✅ Success"` automatically. Live-function edits
+are wrapped too (`create_function_sandbox` / `publish_function_sandbox`). Recipes +
+traps: clay-api-reference.md § "Creating a custom function" step 4 and § "Editing a LIVE
+function — sandbox lifecycle".
+
 ### 7. Incremental / delta sync
 
 "Rows updated since timestamp X" or "new rows added since last sync." For external CRM syncs you need this or you push everything every time. Currently possible via `list_records` + client-side timestamp filtering, but painful for large tables.

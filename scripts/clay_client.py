@@ -4570,6 +4570,17 @@ class ClayClient:
         "date", "unknown", "person-linkedin-url", "email",
     }
 
+    # write-to-cell = the send-back action every Clay function uses to return its
+    # result to the calling cell (verified 2026-08-06). Origin coords arrive on each
+    # intake row under the function's OWN source field — bind {{<your_src_fid>}}
+    # ?.origin?.<key>, NEVER the literal `f_subroutine_source` (that's the id of
+    # Clay-managed functions' source field; cloned verbatim it shows "deleted column"
+    # errors and the column silently never runs).
+    WRITE_TO_CELL_PACKAGE = "b1ab3d5d-b0db-4b30-9251-3f32d8b103c1"
+    FUNCTION_ORIGIN_KEYS = ("recordId", "tableId", "fieldId", "asyncCallbackId",
+                            "workflowRunId", "stepId", "searchId", "entityId",
+                            "enrichmentId", "toolId", "isTestRun")
+
     def register_tool(self, tool_id: str, *, tool_type: str, name: str,
                       entity_type: str | None = None, description: str = "",
                       input_schema: dict | None = None,
@@ -4611,6 +4622,7 @@ class ClayClient:
                         entity_type: str = "contact", description: str = "",
                         extractors: dict | None = None,
                         success_field: str | None = None,
+                        send_back: dict | None = None,
                         register: bool = True) -> dict:
         """Create a Clay FUNCTION — a UI-style subroutine table (NOT a workflow) —
         entirely via the internal API (recipe verified end-to-end 2026-07-31).
@@ -4682,6 +4694,30 @@ class ClayClient:
             ts2["PASS_THROUGH_TABLE_SUCCESS_FIELD_IDS"] = [ex_ids[success_field]]
             self.patch(f"/tables/{tid}", {"tableSettings": ts2})
 
+        sendback_fid = None
+        if send_back:
+            bad = [v for v in send_back.values() if v not in ex_ids]
+            if bad:
+                raise ValueError(f"create_function: send_back values must name extractor "
+                                 f"columns; unknown: {bad}")
+            binding = [{"name": k, "formulaText": "{{%s}}?.origin?.%s" % (src_fid, k)}
+                       for k in self.FUNCTION_ORIGIN_KEYS]
+            binding.append({"name": "data", "formulaMap": {
+                out: "{{%s}}" % ex_ids[col] for out, col in send_back.items()}})
+            r = self.post(f"/tables/{tid}/fields", {
+                "name": "Send data back", "type": "action",
+                "typeSettings": {"actionKey": "write-to-cell",
+                                 "actionPackageId": self.WRITE_TO_CELL_PACKAGE,
+                                 "actionVersion": 1,
+                                 "dataTypeSettings": {"type": "json"},
+                                 "inputsBinding": binding}})
+            sendback_fid = (r.get("field") or r).get("id")
+            # completion requires the pipeline to run per intake row
+            cur3 = self.get_table(tid).get("table", {})
+            ts3 = cur3.get("tableSettings") or {}
+            ts3["AUTO_RUN_ON"] = True
+            self.patch(f"/tables/{tid}", {"tableSettings": ts3})
+
         routine_id = f"function:{tid}"
         registered = False
         if register:
@@ -4694,7 +4730,31 @@ class ClayClient:
             registered = True
         return {"table_id": tid, "routine_id": routine_id, "source_id": sid,
                 "source_field_id": src_fid, "extractor_ids": ex_ids,
-                "registered": registered}
+                "send_back_field_id": sendback_fid, "registered": registered}
+
+    def create_function_sandbox(self, fn_table_id: str, view_id: str | None = None) -> dict:
+        """Open (or reuse) the edit sandbox for a LIVE function table.
+
+        Once a function gains a caller (execute-subroutine subscription), the parent
+        table locks: abilities.canUpdate=false, direct field/settings/run writes 403
+        ("You do not have the proper access for this table") — but
+        canUpdateFromSandbox=true. Edit path (verified 2026-08-06): create sandbox →
+        mutate the SANDBOX table id with normal field/settings calls (fids match the
+        parent) → publish. POSTing again returns the existing open sandbox."""
+        if view_id is None:
+            view_id = self.get_table(fn_table_id).get("table", {}).get("firstViewId")
+        r = self.post(f"/workspaces/{self.workspace_id}/subroutines/{fn_table_id}/sandbox",
+                      {"viewId": view_id})
+        return r.get("sandboxTable") or r
+
+    def publish_function_sandbox(self, fn_table_id: str, sandbox_table_id: str,
+                                 run_changes: bool = False) -> dict:
+        """Publish sandbox edits onto the live function. Body {"runChanges": bool} is
+        REQUIRED — publishing without it 400s. Returns {"fieldIds": [changed]}.
+        Discard instead with DELETE /workspaces/{ws}/tables/{fn}/sandbox/{sb}."""
+        return self.post(
+            f"/workspaces/{self.workspace_id}/tables/{fn_table_id}/sandbox/"
+            f"{sandbox_table_id}/publish", {"runChanges": run_changes})
 
     def list_sources(self, table_id: str) -> list[dict]:
         """

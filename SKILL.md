@@ -103,7 +103,7 @@ tables = clay.list_tables()
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
 | Registry | `list_actions`, `list_subroutines`, `get_dynamic_action_fields` |
-| Functions & tools registry | `create_function(name, inputs, entity_type, extractors, success_field, register)` — UI-style subroutine function table end-to-end (dark, registered, publicly runnable); `register_tool(tool_id, tool_type, name, entity_type, ...)` — register workflows/functions in the workspace tools registry for public Routines execution |
+| Functions & tools registry | `create_function(name, inputs, entity_type, extractors, success_field, register, send_back)` — UI-style subroutine function table end-to-end (registered, publicly runnable; `send_back={output: extractor_col}` wires the write-to-cell return path + AUTO_RUN so caller cells resolve "✅ Success"); `register_tool(tool_id, tool_type, name, entity_type, ...)` — register workflows/functions in the workspace tools registry for public Routines execution; `create_function_sandbox` / `publish_function_sandbox` — edit a LIVE (caller-locked) function via Clay's sandbox flow |
 | Presets / catalog | `list_preset_categories`, `list_presets_filtered`, `list_presets_by_category`, `list_disabled_actions`, `list_starred_resources`, `get_resource_star`, `apply_preset` |
 | Auth / Account | `me`, `list_auth_accounts`, `get_auth_account`, `list_auth_accounts_by_type`, `list_auth_account_types`, `get_auth_account_type`, `validate_auth_credentials` |
 | Workspace metadata | `list_workspace_users`, `get_workbook_overview`, `list_trigger_definitions`, `list_agent_configs` |

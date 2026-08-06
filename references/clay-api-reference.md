@@ -2355,7 +2355,8 @@ extractor computed → cleanup. Two facts from that cleanup:
 `POST /sources` with `{type: "manual", typeSettings: {type: "subroutine"}}`, then a
 `source`-type field on the table with `sourceIds: [s_id]`. Run inputs land in that field
 as an object; formula extractors (`{{src_field}}?.input_name`) compute on arrival.
-Managed functions reference it via a reserved `{{f_subroutine_source}}` token in bindings.
+(Managed functions' bindings show `{{f_subroutine_source}}` — that is the literal field
+id of THEIR own source field, NOT a reserved token; see the send-back trap in step 4.)
 
 **3. Registration is NOT automatic** — same tools registry as workflows (section above):
 `POST /v3/workspaces/{ws}/tools` with
@@ -2363,11 +2364,27 @@ Managed functions reference it via a reserved `{{f_subroutine_source}}` token in
 validation names it)`, name, access: {integrations: ["api"]}, inputSchema}`. After that,
 `POST /public/v0/routines/function:t_x/run` returns 202 and the item lands as a row.
 
-**4. Return path (managed pattern)** — a `write-to-cell` action column (package
-`b1ab3d5d-b0db-4b30-9251-3f32d8b103c1`) bound to
-`{{f_subroutine_source}}?.origin?.recordId/tableId/fieldId/asyncCallbackId` writes results
-back to the ORIGIN cell for table-column invocations; the pass-through success fields
-drive API results.
+**4. Return path — the send-back column (SOLVED 2026-08-06; this closes the completion
+gap).** A `write-to-cell` action column (package `b1ab3d5d-b0db-4b30-9251-3f32d8b103c1`)
+with **11 bindings** of the form `{{<YOUR source field id>}}?.origin?.<key>` for keys
+`recordId, tableId, fieldId, asyncCallbackId, workflowRunId, stepId, searchId, entityId,
+enrichmentId, toolId, isTestRun`, plus a `data` formulaMap
+`{output_name: {{extractor_fid}}}` carrying the return values.
+
+- **⚠ CRITICAL TRAP:** Clay-managed functions bind `{{f_subroutine_source}}` — the
+  literal FIELD ID of *their own* source field, NOT a magic token. Cloned verbatim it
+  renders "Settings contains deleted column for X input" (red dot in the UI) and the
+  column NEVER runs — this masqueraded as an auto-run mystery for a full day. Always
+  substitute your function's own source fid.
+- **`AUTO_RUN_ON: true` is required on the function table** for the intake pipeline
+  (including the send-back) to execute per arriving row.
+- With a valid send-back the FULL caller round-trip is automatic: the caller's
+  `execute-subroutine` cell shows `"✅ Sent"`/`AWAITING_CALLBACK` → the function's
+  send-back fires → the cell resolves `"✅ Success"` with the `data` map returned.
+  Verified two ways: retrofit on a live function, and end-to-end via
+  `create_function(send_back=...)` + a fresh caller (zero UI).
+- **Wrapped:** `create_function(..., send_back={output_name: extractor_column_name})`
+  builds all of it and enables AUTO_RUN.
 
 **Gotchas (the valuable part):**
 
@@ -2385,15 +2402,42 @@ drive API results.
 - **Extra undeclared inputs are tolerated** (202) — callers can send a rich flat input
   set while each function declares only the subset it consumes; contracts can grow
   without breaking existing functions.
-- **Pass-through completion unresolved (needs verification):** on a minimal probe
-  (formula-only success field, dark table) the routine run stayed `in_progress`
-  indefinitely even though the row landed and extractors computed. Completion plumbing
-  likely requires the managed-style send-back/async-callback wiring or a non-dark run
-  path.
+- **Pass-through completion — SOLVED (2026-08-06; historical context):** the 2026-07-31
+  probe saw routine runs stay `in_progress` indefinitely (row landed, extractors
+  computed, dark table). Root cause: completion requires the `write-to-cell` send-back
+  wiring AND `AUTO_RUN_ON: true` — see step 4. With both in place the caller round-trip
+  completes automatically.
 - The registry `inputSchema` is documentation-only **for FUNCTION tools** — their runtime
   validation comes from the table's `SUBROUTINE_INPUTS`. (WORKFLOW tools are the
   opposite: the registry record IS the runtime item validator — refined 2026-08-05, see
   the tools-registry section above.)
+
+### Editing a LIVE function — sandbox lifecycle (verified 2026-08-06)
+
+Once a function gains a caller subscription, the parent table LOCKS:
+`abilities.canUpdate: false`, `canUpdateFromSandbox: true` — direct field/settings/run
+writes return `403 "You do not have the proper access for this table"`. The edit path is
+Clay's sandbox flow:
+
+1. `POST /workspaces/{ws}/subroutines/{fn}/sandbox` with `{"viewId": ...}` → returns
+   `sandboxTable`. REUSED if one is already open for the function; **its field ids MATCH
+   the parent's**, so scripts written against parent fids work unchanged.
+2. Mutate the **sandbox table id** with normal claycast calls (columns, settings,
+   bindings).
+3. Publish: `POST /workspaces/{ws}/tables/{fn}/sandbox/{sb}/publish` with
+   `{"runChanges": bool}` — the body is REQUIRED (omitting it 400s). Response:
+   `{"fieldIds": [<changed field ids>]}`.
+   Or discard: `DELETE /workspaces/{ws}/tables/{fn}/sandbox/{sb}`.
+
+Related:
+
+- `POST /workspaces/{ws}/subroutines/{fn}/ensure-incomplete-rows-view` with `{}` →
+  `{"viewId", "incompleteRowCount"}`.
+- The UI's run route is workspace-scoped: `PATCH /workspaces/{ws}/tables/{t}/run` — the
+  non-scoped `/v3/tables/{t}/run` 403s on locked tables. Running a LOCKED table via the
+  workspace-scoped route is plausible but untested.
+- **Wrapped:** `clay.create_function_sandbox(fn_table_id, view_id)` /
+  `clay.publish_function_sandbox(fn_table_id, sandbox_id, run_changes=...)`.
 
 **Aside — official CLI structured query (needs verification, observed 2026-07-30):**
 `clay tables query` requires `tables: [{"id": ...}]` (not `tableId` — validation error names
