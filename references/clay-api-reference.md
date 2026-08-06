@@ -1300,6 +1300,14 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
 - Optional chaining: `{{f_id}}?.key`
 - **JSON / Date globals (verified 2026-08-06):** `JSON.parse`, `JSON.stringify`,
   `Object.keys`, `new Date().toISOString()` all work.
+- **Concat templates stay UI-editable (user-verified 2026-08-06):** a formula built as
+  plain string literals joined to column tokens with `+` on both sides of each token
+  (`"# custom1\n" + {{col}} + "\n# custom2\n" + {{col2}} + ...`) renders in Clay's
+  formula editor as a cleanly editable text field — the static text is editable inline
+  around the token chips, so non-technical users can rework template copy in the UI.
+  Complex expressions (IIFEs, method chains) lose this affordance. Design rule: when a
+  template column should stay human-editable, keep it pure literal+token concatenation
+  and push ALL parsing/transform logic into a separate downstream formula column.
 - **Empty-cell coercion in string concat (verified 2026-08-06):** `"x" + {{empty_col}}`
   yields `"x"`, NOT `"xnull"` — Clay coerces BOTH never-set and cleared text cells to `""`
   inside formula string concatenation, unlike raw JS null semantics. Unguarded
