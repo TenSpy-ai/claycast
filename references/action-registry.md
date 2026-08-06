@@ -366,6 +366,39 @@ Enroll a prospect into a HeyReach LinkedIn outreach campaign.
   - Campaign ID is hardcoded per workflow (not dynamic like Instantly)
   - Custom fields map to HeyReach campaign field definitions
 
+### Outreach.io: Lookup / Add-to-Sequence / Update Prospect (verified 2026-08-06)
+
+Data shapes and safety patterns from a real-prospect pilot of an enrollment function.
+
+**`lookup-prospect` result shape — `data[0]` is JSON:API:**
+`{id, link, type, attributes: {...45 fields...}, relationships: {...}}`
+
+- Identity lives under `attributes`: `firstName`/`lastName`/`title`/`company`/`name`/
+  `emails[]`.
+- **Opt-out flags live there too**: `emailOptedOut`, `optedOut`, `callOptedOut`,
+  `smsOptedOut` — GATE enrollment/update actions on these; an enrollment pipeline that
+  ignores them will sequence opted-out prospects.
+- The prospect's own page URL is top-level `data[0].link`.
+- Live custom field values (`custom1..custom150`) are readable in `attributes` — useful
+  for pre-write inspection.
+- **Active sequence membership is NOT in `attributes`** — it's
+  `relationships.activeSequenceStates.data[]` (each entry:
+  `{id, link, sequence: {name, enabled, ...}}`). `stageName` in attributes is just the
+  stage, not sequences; `relationships.sequenceStates` holds only an API link, no data.
+
+**`add-to-sequence` on an already-active prospect → HTTP 400 → cell status
+`ERROR_BAD_REQUEST`** — confirmed live at the action level as the reliable
+"already in a sequence" signal. Enrollment pipelines should read
+`relationships.activeSequenceStates` BEFORE attempting, and treat the 400 as verdict
+`already_in_sequence`, not as a failure.
+
+**`update-prospect` write-safety pattern** (updating a real prospect from an enrichment
+pipeline): echo the CURRENT values read from the lookup's `attributes` for any field you
+don't intend to change; pass `{}` for `customFields` (an empty map sets nothing /
+preserves existing customs — verified live); keep `replaceEmails`/`replacePhones` false —
+the append-only semantics protect contact info. (For run-time-dynamic `customFields`
+keys, see clay-api-reference.md § "Dynamic-object params via formulaText".)
+
 ### Google Sheets: Add Row
 
 Append a row to a Google Sheet for reporting/tracking.

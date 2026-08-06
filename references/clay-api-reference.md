@@ -647,7 +647,10 @@ formulaText-returning-object = arbitrary keys per row. (This is distinct from th
 character-split trap above, which is about formulaText holding a JSON *string* for
 string-typed map params; here the expression yields a real object for an object-typed
 param.) Verified in a live function build — dry-run pilot green, full verdict round-trip
-through the send-back on the first run.
+through the send-back on the first run. (Sequencer-specific data shapes and write-safety
+for the same pipeline — lookup-prospect JSON:API result, opt-out gating, the
+add-to-sequence 400 "already enrolled" signal, update-prospect echo-current pattern —
+live in action-registry.md § "Outreach.io: Lookup / Add-to-Sequence / Update Prospect".)
 
 Verified 2026-04-23: `formulaText` with `'{"q": hello}'` produced URL `https://httpbin.org/get?0={&1="&2=q&3="&4=%3A&5= &6=h&7=e&8=l&9=l&10=o&11=}` — one query param per input char. `formulaMap` with `{"q": "hello"}` produced the correct `?q=hello`.
 
