@@ -75,7 +75,7 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
   - `top_n=` + `view_id=` (`viewIdTopRecords`)
   - `force_run=`
   - omitted field list = resolve all runnable fields (`action`, `enrichment`, `source`, `waterfall`, `claygent`)
-  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
+  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
 - `clay.get_run_status(table_id)` normalizes both `GET /tables/{t}/fieldrun` and `GET /workspaces/{ws}/tables/{t}/fields/runstatus`.
 - `clay.wait_for_runs(...)` is the shared polling / stall-detection surface used to cover the Datagen job-monitor behavior.
 - `clay.rerun_errored_cells(...)` is the SDK recipe for Datagen `rerun_errors`: find the Errored Rows view, inspect which specific cells failed, then re-run only those field+record combinations.
@@ -226,7 +226,7 @@ clay.run_column(TABLE_ID, [ai_field_id], record_ids=RECORD_IDS)
 - `authAccountId` is required — without it the column never runs
 - `answerSchemaType` uses `formulaMap` not `formulaText` — `formulaText` silently fails
 - `jsonSchema` value is **double JSON-encoded**: `json.dumps(json.dumps(schema))` — single encoding produces a dict where Clay expects a string; column creates OK but never runs
-- `_metadata` with `modelSource: '"user"'` (inner quotes!) is required when using `answerSchemaType`
+- `_metadata` with `modelSource: '"user"'` (inner quotes!) is required when using `answerSchemaType`. (BYO-API-key via `modelSource: "user"` is a use-ai COLUMN feature only — workflow agent nodes have no per-node equivalent; see "Agent-node model selection" in the Terracotta section.)
 - `dataTypeSettings` must be `{"type": "text"}` — `{"type": "json"}` breaks Clay UI rendering
 
 **API-triggered `use-ai` runs never executed (verified failing 2026-07-30; mechanism
@@ -243,6 +243,9 @@ run-enrichment allowlist shrink); (b) the missing/`null` `authAccountId` blocks 
 while UI runs resolve a default account. Until resolved: **run AI columns from the Clay
 UI Run button**, and treat a blank-cell-after-ACK on an AI column as expected, not a bug
 in your code.
+
+- The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
+- Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
 - `answerSchemaType` + `_metadata` are REQUIRED for `?.key` extractors to work — without them, Clay shows "Unable to parse output schema" even if the column was created successfully
 - `systemPrompt` must be < ~1,000 chars — put long instructions in `prompt` instead
 - For Claygent: expect 1-2 min per record (web research). For Create Content: seconds.
@@ -737,6 +740,8 @@ Verified 2026-04-23: `formulaText` with `'{"q": hello}'` produced URL `https://h
 
 **Response:** `value` is a display string like `"✅ 3 Records Found"` — for single-row lookup just `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect — extract in `formulaText` itself. 0 credits per lookup execution. Verified 2026-07-24.
 
+**Live-read semantics (verified 2026-07-24):** workflow table-lookup nodes read the looked-up table LIVE at run time — adding a row to the looked-up table changes routing on the very next run, no workflow edit, no redeploy. Combined with lookups costing 0 credits (also confirmed via `upfrontCreditUsage.totalCost = 0` on `execute_clay_action`, in addition to the execute + workspace-balance check), this is the basis of the zero-credit table-match-before-AI-fallback router: maintain the mapping table by hand or by write-back, and the paid AI fallback fires only for genuinely unseen values.
+
 ### Instantly: Add Lead to Campaign
 
 ```python
@@ -875,6 +880,8 @@ GET  https://api.clay.com/v3/tables/{TABLE_ID}/views/{VIEW_ID}/records/ids
 
 All record writes go through **two endpoints** that behave asynchronously — Clay returns `200 OK` with `{"records": [], "extraData": {"message": "Record updates enqueued"}}` and the values land shortly after. The SDK (`clay_client.ClayClient`) handles the async + verification automatically; code that hits raw HTTP must follow the patterns below.
 
+- Dependent-formula recomputation after `clay.update_record` is asynchronous with material lag: the input-cell write lands immediately, but the downstream formula cell recomputes later. Verification must poll the FORMULA cell (not just the written cell) until non-empty — ~3s intervals, observed budget up to ~36s. Re-fetch-and-assert on the written cell alone passes while the formula is still stale.
+
 ### Create records — use the SDK helper
 
 ```python
@@ -1004,6 +1011,10 @@ Different endpoints populate cells differently. `extract_cell_value(cell)` (modu
 | Auto-timestamps | `{"value": "2026-04-24T...", "metadata": {"isCoerced": true}}` | any |
 
 The action-column gotcha: `cell["value"]` can say `"Status Code: 200"` while the actual HTTP response body is in `cell["externalContent"]["fullValue"]`. Always use `extract_cell_value()` or explicitly reach into `externalContent.fullValue` for action cells — don't trust the preview.
+
+### Response envelopes are polymorphic — unwrap defensively
+
+- Response shapes vary per endpoint AND over time — never index a raw response without an envelope-tolerant unwrap (verified 2026-08-06). Known variants: `create_column` → `{"field": {…}}` OR a bare field dict (unwrap `res.get("field", res)`); `get_table` → `{"table": …, "extraData": …}` OR a bare table (unwrap `raw.get("table", raw)` — the SDK already does this internally); `list_records` raw endpoints → `{"results": […]}`, `{"records": […]}`, `{"data": […]}`, or a bare list. Cell values have their own 4-shape resolution order (see `extract_cell_value`). If you write a new consumer against raw endpoints, copy these unwrap idioms — the envelopes are not stable contracts.
 
 ---
 
@@ -1153,7 +1164,7 @@ ts["inputsBinding"][0]["formulaText"] = '"new-model"'
 result = clay.update_column(table_id, fid, {"typeSettings": ts})
 ```
 
-Always deep-copy typeSettings before modifying. Patching replaces the full typeSettings object.
+Always deep-copy typeSettings before modifying. Patching replaces the full typeSettings object. The same full-replacement rule governs `inputsBinding` `formulaMap` sub-inputs — e.g. adding one input to an `execute-subroutine` caller column means re-sending the ENTIRE `inputs` formulaMap (see action-registry.md § "Execute Subroutine (function caller column)").
 
 ---
 
@@ -1285,6 +1296,8 @@ clay.session.patch(
 # Column type auto-promotes from "text" to "formula" after successful PATCH
 ```
 
+- Retyping a formula column to `text` in one PATCH is DESTRUCTIVE (verified 2026-08-06): it clears `formulaText` AND wipes the previously computed values from ALL rows. No undo — export first if the computed values matter. This applies to `apply_field_operations`' `retype` op too (docstring updated to match). (Related: editing a formula via PATCH does NOT recompute existing rows — see the replication side-effects section.)
+
 ### Formula Syntax — What Clay Actually Supports
 
 Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key rules:
@@ -1323,6 +1336,13 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
 - **Arrow-function IIFEs with EXPRESSION bodies (verified 2026-08-06):**
   `((s) => s ? JSON.parse(s) : ({}))({{col}})` evaluates fine — the formula language is
   best understood as **expression-only JavaScript with JSON/Date available**.
+- **`Clay.getCellStatus(<field ref>)` reads an action column's cell status inside a
+  formula (verified 2026-08-06).** Status vocabulary: `SUCCESS`, `SUCCESS_NO_DATA`,
+  `PENDING`, `AWAITING_CALLBACK`, `ERROR`, `ERROR_BAD_REQUEST`, `ERROR_MISSING_INPUT`,
+  `ERROR_RUN_CONDITION_NOT_MET`, `ERROR_USER_OUT_OF_API_CREDITS`. This turns statuses
+  from passive metadata into orchestration primitives — e.g. a gate column that only
+  fires step B where `Clay.getCellStatus(step_A) === "SUCCESS"`, or a flag column
+  surfacing already-in-sequence rows via `ERROR_BAD_REQUEST`.
 
 **Does NOT work:**
 - **Statement bodies fail SILENTLY (verified 2026-08-06):** any braces-with-statements
@@ -1493,6 +1513,12 @@ columns strictly upstream of the gated column; when a helper formula aggregates 
 multiple lookups, gate on the specific upstream lookup's raw path instead of the
 aggregate.
 
+**Delayed execution — `delaySettings` (verified 2026-08-06):** action columns accept
+`delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` in `typeSettings`.
+Recipe upgrade: put it on the results-GET column of the workflow-as-routine pattern to
+absorb the run-completion race (poll after 60s) instead of the manual re-run /
+AUTO_RUN-cascade workarounds documented there.
+
 ---
 
 ## AI Columns — API Read Behavior
@@ -1523,6 +1549,9 @@ Always prefer `recordIds` when you have them:
 This endpoint is fully documented at `## Find People / Find Companies sourced-table creation (documented, NOT yet wrapped in claycast)` later in this file (captured live 2026-04-30). **Note:** regular `POST /sources` returns 404 "Invalid subscriptions" for these source types — `create-cpj-table` is the only valid path.
 
 Additional live-verified behavior (2026-07-21): the endpoint VALIDATES the company scope at create — the company table must contain at least one row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`. Every attempt, **including failed ones**, side-creates a companion `Update People Search (...)` trigger column on the company table (clean up orphans after failures). Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` suppresses the initial search run. Full notes: `## View filter/sort write path + replication side-effects` at the end of this file.
+
+- create-cpj validates its search inputs against EXISTING field ids on the company table at CREATE time — inputs referencing not-yet-created field ids 404 (verified 2026-08-06). Build-ordering rule for replicas: import the company table's columns FIRST, create find-people sources SECOND (one build had to flip its phases for exactly this).
+- Every FAILED create-cpj attempt leaves TWO orphans, not one: the known `Update People Search (…)` trigger column on the company table AND an empty `Find people Table (N)` shell with no `tablePresentationSettings` position — invisible in the UI AND to per-table verify sweeps (4 shells were found only via a full workbook-tables listing). Verify rule: after any create-cpj work, assert the EXACT workbook table set via a full workbook-tables listing; per-table checks cannot see these.
 
 ---
 
@@ -1748,6 +1777,12 @@ Captured during the Find leads UI walkthrough on 2026-04-30. **This is the endpo
 
 `{{source}}` references the current row's data from the action's response. `isDedupeField: true` marks the field claycast will dedupe on.
 
+**Starter-column semantics (verified 2026-08-06):**
+
+- The initial import RUNS on create at 0 credits (verified 2026-08-06) — the `disableTriggerOnCreate`/`OnUpdate` flags control WHETHER it runs, not what it costs. Don't budget credits for the seed import.
+- Replication accounting: create-cpj auto-creates the 7 People basicFields + the `Company Table Data` companion BY NAME — a replica script must add only the delta beyond them (one live replica's per-raw-table delta was just 2 actions + 3 formulas). Note the token mismatch: MATERIALIZED starter columns bind as `{{f_people_search}}.<path>` (a probe with limit=1 showed 8 starter extractors on that field id), while the request-payload docs use the `{{source}}` alias — same paths, different token.
+- ⚠️ The stock `Company Name` extractor coalesces `matched_experience.company_name || latest_experience_company`. On past-experience-match rows this returns the MATCHED (customer) company, NOT the person's current employer. Alumni/champion logic needs separate current-employer vs matched-company extractors — same trap class as the Job Title coalesce documented above, but with worse consequences (silently wrong company in outreach data).
+
 #### Full `inputs` schema (~50 keys, mostly empty when unset)
 
 Same shape as the filter UI exposes. Key fields:
@@ -1805,6 +1840,12 @@ The Find leads UI fires this on every filter change. Body shape:
 
 **Critical: non-preview Mixrank actions are NOT directly callable via this endpoint.** Sending `enrichmentType: "find-lists-of-people-with-mixrank-source"` (no `-preview` suffix) returns HTTP 400 with the allowlist above. The full action is only invokable via `POST /v3/sources/create-cpj-table` (which forces the save-to-table flow with `limit: 50000`).
 
+### Public search filters-mode contract (verified 2026-08-06)
+
+- `POST /public/v0/search/filters-mode` creates a search → `{searchId}`; `POST …/{searchId}/run` pages results at 500 records/pull. The iterator is FORWARD-ONLY with no cursor replay — a lost page means recreate the search and re-pull from the top. Plan-quota exhaustion surfaces as a `validation_error`; invalid filter keys 400 with `Unrecognized key(s)` — discover valid keys via `GET /search/filters-mode/fields`.
+- Response records carry exactly 10 keys, there is no output-field selection, and no `matched_experience.end_date`. ⚠️ `domain` is the SEEDED company's domain, NOT the person's current employer — current-employer logic needs its own downstream enrichment. (Same matched-vs-current trap as the internal cpj `Company Name` extractor.)
+- Past-role gotcha: search-level `job_title_keywords` + `include_past_experiences` filters the role AT the matched company — current-title ICP checks must run post-search, not in the filter.
+
 ### Preview behavior — what's free vs gated
 
 **REGRESSED 2026-07-23:** everything in this subsection is HISTORICAL — the `*-preview` enrichmentTypes were removed from the run-enrichment allowlist (see above) and now 400. Kept as a record of how the preview layer behaved while it existed; the free-preview replacement is the official `clay` CLI search / public API filters-mode.
@@ -1820,6 +1861,8 @@ For the `*-preview` variants:
 | `limit = 51` | Same `ERROR_INVALID_INPUT` — boundary is exactly at 50 |
 
 **Practical implication:** Clay deliberately gates Mixrank's full search results behind table creation. You can iterate filter combinations forever at zero cost to learn the count + sample 50 rows, but rows 51-N require committing to a `create-cpj-table` import.
+
+**Cost cross-ref (2026-08-06):** the native Find People TABLE SOURCE imports rows at 0 credits, while pulling the same contacts through workflow `http-api-v2` calls bills (observed: 22 contacts ≈ 102 credits vs 200 free source rows) — see "Measured workflow credit economics" in the Terracotta section.
 
 ### Companion endpoints in the Find People flow
 
@@ -2154,12 +2197,23 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - The view PATCH **does** accept `name` and a `fields` dict, but only `isVisible` from per-field configs applies; `order` strings are ignored (server owns fractional ordering). Bulk `PATCH /v3/tables/{t}/views/{v}/fields` accepts `{fid: {"isVisible": bool, "width": int}}` — width verified persisting.
 - `reorder-fields` rejected full-view blocks in practice (400 on spreadsheet tables, 500 on people tables). Reliable fallback: per-field `move_field` walk with an in-memory simulation of the current order (334 moves across 8 views, 0 failures).
 - **Field-group create returns `{"groupId": "gr_..."}`** — not `id`. Clay defaults the LAST member as output field; fix flags via the group update call.
-- **`POST /v3/sources/create-cpj-table` side effects & validation:** (a) validates the company scope at create — the company table must contain ≥1 row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`; a failed attempt STILL creates an orphan `Update People Search (...)` trigger column on the company table. (b) On success it auto-creates that companion trigger column too. (c) Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` prevented the initial search run on all 5 real creations (source `state` stayed `{}`), and subsequent `PATCH /v3/sources/{id}` (accepts `{"name"}` and `{"typeSettings"}`) did not trigger runs either — used to restore `inputs.limit` after a neutered create.
+- **`POST /v3/sources/create-cpj-table` side effects & validation:** (a) validates the company scope at create — the company table must contain ≥1 row whose bound column resolves to a real Clay company, else `400 "None of the company table rows resolved"`; a failed attempt STILL creates an orphan `Update People Search (...)` trigger column on the company table — and (verified 2026-08-06) an invisible empty `Find people Table (N)` shell with no `tablePresentationSettings` position; sweep via a full workbook-tables listing, per-table checks cannot see these. Also verified 2026-08-06: search inputs are validated against EXISTING field ids at create (not-yet-created field ids 404) — import company-table columns before creating sources. (b) On success it auto-creates that companion trigger column too. (c) Passing `disableTriggerOnCreate: true` + `disableTriggerOnUpdate: true` inside `cpjConfig.typeSettings` prevented the initial search run on all 5 real creations (source `state` stayed `{}`), and subsequent `PATCH /v3/sources/{id}` (accepts `{"name"}` and `{"typeSettings"}`) did not trigger runs either — used to restore `inputs.limit` after a neutered create.
 - **Creating a `route-row` action column auto-creates the full receiving pipeline on the target table**: a `manual`/routing source named `Rows from: <sender table name>`, a source column, and extractor formula columns for every `rowData` key. When replicating a workbook, KEEP these auto structures (they hold the sender binding) and delete/repoint any manually created duplicates.
 - `POST /v3/sources` works fine for `type: "manual"` routing sources (`{"workspaceId", "tableId", "name", "type", "typeSettings": {"type": "routing"}}`); the "Invalid subscriptions" 404 applies to people/company search sources only.
 - `POST /v3/workbooks` accepts `parentFolderId` at create (honored), but `settings: {"isAutoRun": false}` in the create body is NOT persisted — the response echoes `settings: {}` (verified 2026-07-23). The effective dark control is per-table: `PATCH /v3/tables/{t}` with `{"tableSettings": {"AUTO_RUN_ON": false}}`. Workbook settings PATCH path is `PATCH /v3/{ws}/workbooks/{wb}` (NOT `/v3/workbooks/{wb}`, which 404s) — used for `settings.tablePresentationSettings` (table order in the sidebar, `{table_id: index}`). The same workspace-scoped path pattern applies to Terracotta workflows — see "Terracotta (tc-workflows) metadata endpoints" below.
+- **Flipping `AUTO_RUN_ON` back to true BACKFILLS (verified 2026-08-06):** every stale/empty auto-run cell across the whole table fires immediately — credit spend at full-table scale, not just new rows. Activation sequence for dark builds: load data → sample-QA a few rows (UI Run) → THEN flip AUTO_RUN. Keep it off during imports.
+  - Re-add any conditional-run gates you removed while debugging BEFORE the flip — gateless action columns backfill unconditionally.
+  - Stale-marker cells are not real values: they re-run on the flip. Spend at flip time is the backfill, not a runaway (false burn alarm); conversely, "values" visible pre-flip don't mean the work ran.
 - **Wrapped in claycast (2026-07-21):** the whole view surface above is now SDK methods — `list_views`, `create_view` (applies filter/sort via the sub-endpoints automatically), `update_view`, `delete_view`, `set_view_filter`, `set_view_sort`, `set_view_fields` (visibility+width), `set_view_field_order` (`move_field` walk) — plus `preflight(table_id=)` for the write-restricted-cookie check. All live-smoke-tested (create→configure→reorder→rename→delete).
 - (`formulaType` requirement on formula PATCH was already documented above — see "PATCH formula requires `formulaType`".) New nuance: editing a formula via PATCH does NOT recompute existing rows; only new rows or input-cell writes trigger evaluation.
+
+**Replication addendum — seed rows, dangling refs, brakes, bitmaps (verified 2026-08-06):**
+
+- Seed-row choreography for replicating find-people sources against an EMPTY company table (create-cpj needs ≥1 resolving row, verified 2026-08-06): (1) temp-swap the company-identifier formula to a literal (e.g. a domain-waterfall formula → `"clay.com"`), (2) insert one seed row, (3) create the sources scoped to that row with `disableTriggerOnCreate`/`disableTriggerOnUpdate` set (suppresses real runs), (4) restore the formula, (5) delete the seed. Create/observe/delete a throwaway probe table before each risky creation.
+- After seed deletion the replicated sources hold DANGLING company-scope refs: `company_record_id`/`company_identifier` still point at the deleted seed record. Before any real run: re-select companies in the search editor UI, or PATCH the source `inputs` per segment. A source that "looks configured" resolves zero companies.
+- `disableTriggerOnUpdate: true` doubles as the runaway brake: with it set, a runaway search can be PAUSED from the source UI without deleting anything. Keep it in every rollback plan.
+- Replicated exclusion configs are created with `bitmap_name: null` — their dedupe bitmaps must regenerate on first run. Verify dedupe on a deliberately small first run before opening the taps.
+- WHY replication is structure-only by necessity: formula/action columns RECOMPUTE — pasted historical values cannot survive — and source-fed tables receive rows only from their sources. Snapshots capture schema only; for state-bearing tables, pair the clone with `export_rows` to `_ATTACHMENTS` as the row-preservation companion.
 
 ---
 
@@ -2244,6 +2298,32 @@ trigger inputs by NAME from the spread (no pins) — never pin to trigger nodes.
 So optional pins are safe for "may be absent" wiring (not-found branches); reserve
 `required` for inputs whose absence should abort the run.
 
+**edit_node schema/pin addendum (verified 2026-08-06):**
+
+- Flat `inputSchema` shorthand auto-requires EVERYTHING (verified 2026-08-06): passing edit_node a flat property map makes the normalizer emit `required: [<every property>]` server-side — a title-only design came back `required: [title, segment, record_id]`. Runs omitting any field fail instantly (<1s, pre-LLM, 0 credits): `Node "Persona Classifier" is missing required inputs: segment`. To keep optionals optional, always pass the full `{type: "object", properties: {…}, required: […]}` form. Reported upstream: clay-run/agent-plugins#22.
+- Delete-and-recreate is the only full schema reset (pins/required can NEVER be removed via edit_node — empty `{properties:{}, required:[]}` is a noop), and it is also the fix for the tool-node `Invalid node config` failure when ADDING a new input variable. The trap: recreation mints a NEW node id, and downstream nodes stay pinned to the OLD id via `sourceNodeId` — wiring breaks silently. After any recreate, sweep every downstream node and repoint its `sourceNodeId`/`sourcePath` pins. Reported upstream (validate_workflow should flag dangling pins): clay-run/agent-plugins#21.
+- Dual-trigger input sharing cannot be CREATED via API: binding a node input to two triggers is rejected with `incompatible trigger type(s)`. UI-built workflows can carry it; API-built ones cannot. Repair recipe for inherited/broken pin state: set `automapInputs: true` and clear ALL `sourceNodeId`/`sourcePath` pins on trigger-adjacent nodes — they read trigger inputs by NAME from the spread; pin only to non-trigger upstream nodes.
+
+### Workflow triggers — webhook stream URLs, rotation, kill-switch (verified 2026-08-06)
+
+- Webhook trigger URLs have the shape `…/streams/wfrs_<id>/webhook` (verified 2026-08-06). A trigger created as draft returns its URL immediately, but POSTs fail until the trigger is flipped draft→live — flip BEFORE any HTTP-column probe or activation step.
+- The stream URL ROTATES on ANY trigger edit — draft↔live status flips AND `inputSchema` changes via `surfaces_edit_trigger` both mint a new `wfrs_` id (bit one build 3×). After every trigger edit: re-read `webhookUrl` and update every hardcoded reference — self-retrigger code nodes, and table http-api-v2 activation columns (repoint by swapping the `wfrs_` URL inside the column's formulaMap body).
+- Draft is a deterministic kill switch for self-retriggering loops: once the trigger is draft, in-flight self-retrigger POSTs to the old stream URL return 400, so the loop dies within one cycle. Reviving mints a NEW URL — update all hardcoded references on revival or the "fixed" loop silently never fires again.
+- Workflow webhook POSTs are ACK-only: `202 {success, workflowRunId}`. Leaf output is NEVER returned to the caller — capture `workflowRunId` from the ACK and read the run via `GET /v3/workspaces/{ws}/tc-workflows/{wf}/runs/{run}` (cookie-only, see auth verdict above).
+- Manual triggers report status `live` even when created with a draft request (verified 2026-08-06) — they are inherently on-demand; no functional difference. Harmless but confusing during trigger-state audits — don't chase it. Reported upstream: clay-run/agent-plugins#23.
+
+### Agent-node model selection (verified 2026-08-06)
+
+- `agentModel: claude-haiku-4-5` (Anthropic models generally) on agent nodes with structured output is BROKEN (reproduced twice, 2026-08-06): the run fails with `Invalid returnData shape in AI action task callback` — and each FAILED attempt still bills 0.1 data credits. Use OpenAI models until Clay fixes the callback shape (gpt-5.4-nano baseline runs clean at 1.0 data + 1 action credit — see credit economics). Reported upstream: clay-run/agent-plugins#18.
+- There is NO per-node BYO-API-key binding in edit_node. "Use your own key" exists ONLY for in-table use-ai COLUMNS via `_metadata.modelSource: "user"` (key registered in workspace settings) — workflow agent nodes always bill the workspace key. Don't design workflow economics around user-key models.
+
+### Tool instances and data flow between nodes (verified 2026-08-06)
+
+- ONE configured tool instance per action per workspace (verified 2026-08-06): every node in every workflow that uses an action shares the SAME tool config, and `inputMappingConfig` lives on the TOOL, not the node. A static mapping saved while editing workflow A silently clobbers workflow B — last edit wins (observed on a shared `tct_` config; no error, downstream workflow just breaks). Safe pattern: make every mapping `{type: "reference"}` with `{{vars}}` so each workflow supplies its own values; never bake static values into a shared tool config. Reported upstream: clay-run/agent-plugins#20.
+- edit_node can only ATTACH already-configured tools: binding an action the workspace has never configured returns `Tool does not belong to this workspace`. Configure the action once in the UI before any API workflow build that needs it.
+- Conditional (gate) nodes forward NO data — their only output is `conditionalEvaluation`; the upstream spread STOPS at them. Any node downstream of a conditional must pin to PRE-conditional nodes for its data. Symptoms of getting this wrong: `missing required inputs` failures, or worse, Claygent silently guessing parameter values.
+- Spread values are stringly (verified 2026-08-06): booleans arrive as STRINGS (`"true"`/`"false"`) through workflow spread context — code nodes must parse them; `if (x)` on `"false"` is truthy. And tool-node output lives at `$.result` in actual runs, NOT the `$.toolResult.result` path Clay's docs describe — pins built from the official docs resolve undefined. ($.result mismatch reported upstream: clay-run/agent-plugins#19.)
+
 ### Workspace tools registry — registering a workflow as a public routine (verified 2026-07-30)
 
 The "why do only some workflows appear in `clay routines list`" mystery is solved: routine
@@ -2310,6 +2390,12 @@ below); for FUNCTION tools it's documentation-only (their validator is the table
 `SUBROUTINE_INPUTS`), and a function's record can be recycled via delete-table +
 `create_function(register=True)`.
 
+**CLI introspection & test runs (verified 2026-08-06):**
+
+- Even a COMPLETED successful run does not register the workflow (verified 2026-08-06: `wf_xxx` stayed absent from `clay routines list` after validation AND a completed run; HTTP/webhook invocation works regardless). Only a registry record at `GET /v3/workspaces/{ws}/tools` governs routine availability — no amount of running earns registration.
+- CLI introspection for unregistered workflows (no internal API needed): `clay workflows snapshots get` (node code at `nodes[].currentScriptVersion.code`), `clay workflows runs steps` (structuredOutputs + spread per step), `clay workflows runs get` (`dataCreditsUsed`/`actionCreditsUsed` per run — the CLI twin of the internal run-GET fields).
+- Test runs accept JSON on stdin: `clay workflows runs test <wf_id> --input -`. Prerequisite: a MANUAL trigger must exist alongside the webhook trigger or test runs won't fire.
+
 ### Pattern: calling a workflow-as-routine from a table (POST run → poll results)
 
 Live-verified 2026-07-30. The full table-side setup for getting a registered workflow's
@@ -2350,16 +2436,34 @@ Operational notes:
 1. **RACE:** the results GET can catch `status: "in_progress"` with empty `data` — re-run
    the Results column after the routine completes. On dark tables sequence manually (run
    Call → wait → run Results); with AUTO_RUN the dependency cascade fires automatically
-   but the race remains.
+   but the race remains. Better (verified 2026-08-06): put
+   `delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` on the Results
+   column's typeSettings — delayed execution absorbs the race without manual sequencing
+   (see "Conditional Execution" § delayed execution).
 2. **Cost:** one run of a two-node router (table lookup + nano-LLM fallback) + the two
    `http-api-v2` executions ≈ **2 credits/row** — cost scales with the workflow being
-   called; estimate before bulk runs.
+   called; estimate before bulk runs. The table-lookup half is free AND live — lookup
+   nodes read the looked-up table at run time (see "Lookup Multiple Rows in Other
+   Table"), which is what makes the zero-credit table-match-before-AI-fallback router
+   work. Measured baselines: next subsection.
 3. `items` supports 1–100 per POST; the per-row column pattern sends 1.
 4. **Items-layer input semantics (verified 2026-08-05):** empty-string input values are
    STRIPPED before the workflow spread — they vanish from the trigger payload entirely, so
    pins / `$.key` refs resolve undefined. JSON `null`s are REJECTED by the registered tool
    schema's types (`"phone: must be string"`). Whitespace-only strings (`" "`) survive
    both filters — use them (or a sentinel like `"NONE"`) when a field must arrive.
+
+**Input-boundary semantics — extensions (verified 2026-08-06):**
+
+- The empty-string strip is not items-layer-only (verified 2026-08-06): the in-table execute-subroutine caller path strips `""` inputs before they reach the function too — and here it can be a FEATURE, not just a hazard: a stripped empty input lets the function-side default apply (e.g. `{}` for `custom_fields_json`), preserving existing downstream values instead of blanking them. Send `""` when you want the default; send a whitespace/`"NONE"` sentinel when you need "explicitly blank".
+- `""` also fails required-input resolution MID-workflow — values feeding required node/tool schemas and rules inside a running workflow are treated as MISSING, exactly like at the trigger boundary. The sentinel convention applies end-to-end, not just to trigger payloads.
+- A bad `function_id` in a dispatch fails LOUDLY: 400 at the routines validation layer and the loop halts on that item. This is desirable fail-fast — don't wrap dispatches in retries that would mask a wiring bug. (Distinct from the 404 `Tool … not found` tool-existence gotcha documented above.)
+
+### Measured workflow credit economics (reconciled 2026-08-06)
+
+- Measured baselines, balances reconciled to the decimal (2026-08-06): gpt-5.4-nano agent-node run = 1.0 data + 1 action credit (e.g. `wfr_xxx`, 14s, confirmed across multiple runs). FAILED claude attempts = 0.1 data each (yes, failures bill). Two-node router run (nano LLM + 3 HTTP action executions) ≈ 2.2 credits. A multi-step per-contact loop ≈ 3 action executions/contact at ~0.8 data each ≈ 2.4/contact. Webhook ingestion and table lookups: free.
+- http-api-v2 is a BILLABLE workflow action: a post-loop cost ~1.6 data credits + 3 action executions per contact even though the public search API call it made is itself free — the HTTP plumbing bills, not the API. Contrast: the native Find People TABLE SOURCE imports rows at 0 credits (observed: 22 contacts via workflow HTTP ≈ 102 credits vs 200 free source rows). When a native source covers the job, use it; reserve http-api-v2 workflow calls for what sources can't do.
+- Pricing introspection: the 2026-08-05 clay-spy capture surfaced `GET /v3/workspaces/{id}/model-pricing/base-costs` (per-model credit base costs; a tc-workflow `input-schemas` GET rode the same capture). Read base-costs before estimating AI-heavy runs — raw shapes live in the capture JSONL; flesh out the entry when first used in anger.
 
 ### Creating a custom function (subroutine table) via API (verified 2026-07-31)
 
@@ -2415,6 +2519,7 @@ with **11 bindings** of the form `{{<YOUR source field id>}}?.origin?.<key>` for
 enrichmentId, toolId, isTestRun`, plus a `data` formulaMap
 `{output_name: {{extractor_fid}}}` carrying the return values.
 
+- The write-to-cell column MUST carry `actionVersion: 1` and `dataTypeSettings: {"type": "json"}` (verified 2026-07-31; both were implementation-only in `create_function` until now). This matters because this recipe directs manual builds for verdict-column send-backs, and a manual build through `create_action_column` defaults to data_type `text` (write-to-cell matches none of `_JSON_RESULT_ACTION_HINTS`) — the send-back then silently misdelivers. Pass `data_type="json"` explicitly and pin `actionVersion: 1`.
 - **⚠ CRITICAL TRAP:** Clay-managed functions bind `{{f_subroutine_source}}` — the
   literal FIELD ID of *their own* source field, NOT a magic token. Cloned verbatim it
   renders "Settings contains deleted column for X input" (red dot in the UI) and the

@@ -1411,6 +1411,11 @@ class ClayClient:
         populated with the full column list; `table.firstViewId` is usable as
         the default view (Clay's `defaultViewId` is typically null — the
         `firstViewId` field is what the UI uses).
+
+        Envelope note: the raw response may be {"table": ..., "extraData": ...}
+        OR a bare table dict — envelopes are polymorphic. Consumers should
+        unwrap with `raw.get("table", raw)` (the SDK's own callers already do;
+        see clay-api-reference "Response envelopes are polymorphic").
         """
         params = {}
         if include_extra_data:
@@ -2051,6 +2056,12 @@ class ClayClient:
         Add a column to a table.
         column_def matches the Clay JSON schema format from clay-api-reference.md.
 
+        Envelope note: the raw endpoint returns either {"field": {...}} or a
+        bare field dict — response envelopes are polymorphic across endpoints
+        and over time. This method unwraps both (`res.get("field", res)`); new
+        consumers of raw endpoints must copy that idiom (see clay-api-reference
+        "Response envelopes are polymorphic").
+
         Examples:
             # Text column
             {"type": "text", "name": "Company Name"}
@@ -2094,6 +2105,11 @@ class ClayClient:
         """
         Apply mixed field operations in order. Supported actions:
         `add`, `rename`, `retype`.
+
+        WARNING (verified 2026-08-06): a `retype` op on a FORMULA column that
+        retypes it to `text` is DESTRUCTIVE — the single PATCH clears
+        `formulaText` AND wipes the previously computed values from ALL rows.
+        No undo; export first if the computed values matter.
         """
         if not isinstance(operations, list):
             raise ValueError("operations must be a list")
@@ -4405,6 +4421,11 @@ class ClayClient:
             is rejected with 400 "value does not match any of the allowed
             types", while a formula/text column created with "json" breaks the
             Clay UI. Pass explicitly only to override the heuristic.
+            ⚠ write-to-cell (function send-back) columns match none of the
+            hints, so a manual build here defaults to "text" and the send-back
+            silently misdelivers — pass data_type="json" explicitly and keep
+            actionVersion 1 (both required; verified 2026-07-31, see
+            clay-api-reference "Creating a custom function" step 4).
         auth_account_id: resolve this FRESH via
             `list_auth_accounts_by_type('<type>')`. Do NOT copy it out of an
             existing column's typeSettings — stale ids cause a 404
@@ -4601,6 +4622,11 @@ class ClayClient:
           (empty-string values are stripped pre-spread; nulls are type-rejected;
           whitespace survives). For FUNCTION tools, runtime validation comes from the
           table's SUBROUTINE_INPUTS instead — the registry schema is documentation.
+        - The empty-string strip also applies on the in-table execute-subroutine
+          caller path (verified 2026-08-06) — a stripped "" lets function-side
+          defaults apply (preserving downstream values instead of blanking them);
+          "" also fails required-input resolution MID-workflow, not just at the
+          items boundary. Sentinel convention (" "/"NONE") applies end-to-end.
         After registering: POST /public/v0/routines/{tool_id}/run (clay-api-key) with
         {"items": [{"id": ..., "inputs": {...}}]} → 202 {routine_run_id}; results at
         GET /public/v0/routines/run/{routine_run_id}/results.
@@ -4645,7 +4671,11 @@ class ClayClient:
         runs deliver their row but linger "in_progress" for pollers; wire the
         managed-style `write-to-cell` send-back (package
         b1ab3d5d-b0db-4b30-9251-3f32d8b103c1, `{{f_subroutine_source}}?.origin?.*`
-        bindings) if callers must await results.
+        bindings) if callers must await results. The send-back column MUST carry
+        actionVersion 1 + dataTypeSettings {"type": "json"} (verified 2026-07-31)
+        — this method sets both; a MANUAL build via create_action_column defaults
+        to text (write-to-cell matches no _JSON_RESULT_ACTION_HINTS) and the
+        send-back silently misdelivers.
 
         Returns {"table_id", "routine_id", "source_id", "source_field_id",
         "extractor_ids", "registered"}. The function is created dark (AUTO_RUN off).

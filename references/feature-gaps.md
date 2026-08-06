@@ -71,6 +71,8 @@ ClayCast has `run_column` for on-demand runs. Clay has **scheduled triggers** ("
 - `list_schedules(table_id)`
 - `pause_schedule(schedule_id)` / `resume_schedule(schedule_id)` / `delete_schedule(schedule_id)`
 
+Re-verify: last probed 2026-04-30; no write-side endpoint captured since. Only hint remains `scheduleConfig: {"runSettings": "once"}` in the create-cpj body — flag for a clay-spy pass on the scheduling UI.
+
 ---
 
 ## Tier 2 — High value, workaround-able with existing primitives
@@ -78,6 +80,8 @@ ClayCast has `run_column` for on-demand runs. Clay has **scheduled triggers** ("
 ### 4. Waterfall column helper
 
 Clay's "waterfall" pattern (try Source A → fallback B → fallback C, stop on first hit) is heavily used for enrichment cost control. ClayCast can build it via `create_action_column` manually, but there's no `create_waterfall_column(sources=[a, b, c], stop_on_first_hit=True)` convenience method. Users must know the waterfall-binding payload shape.
+
+Status 2026-08-06: still open; no waterfall inputsBinding shape captured yet — capture-first (clay-spy on a UI waterfall build) before writing the helper.
 
 ### 5. Integration "finisher" methods
 
@@ -88,6 +92,8 @@ ClayCast can wire Instantly / Apollo / HubSpot / HeyReach action columns via `cr
 - `export_to_apollo(table_id, *, ...)`
 
 The "enrich then export to CRM" flow is where most real pipelines end. Users have to hand-assemble bindings + know the action's `inputsBinding` schema.
+
+Status 2026-08-06: raw material largely exists — action-registry now carries verified shapes for Outreach lookup/add-to-sequence/update-prospect (2026-08-06) plus HeyReach/Instantly. Remaining work is only the convenience wrappers.
 
 ### 6. Subroutine execution
 
@@ -122,6 +128,8 @@ function — sandbox lifecycle".
 
 **Proposed surface:**
 - `list_records_since(table_id, view_id, since_timestamp, *, limit=...)` — backed by `updatedAt >= since_timestamp` filter or Clay's diff API if one exists.
+
+Closability note 2026-08-06: since gap #1 closed (`set_view_filter`, 2026-07-21), an `updatedAt`-filtered view + `list_records` could implement `list_records_since` — needs one probe on `updatedAt` filter support.
 
 ### 8. Credit-usage / spend reporting + workbook credit limits
 
@@ -333,7 +341,7 @@ def _encode_filters(*, owner_ids, integration_ids, is_recurring_only, has_credit
 
 `requests` will URL-encode the `[`/`]` characters but generate the right index sequence when given a list-of-tuples.
 
-**What's NOT yet captured (would need a follow-up walkthrough):**
+**What's NOT yet captured (would need a follow-up walkthrough — not re-verified since the 2026-04-30 walkthrough):**
 
 - The Manage Default Limit write endpoint (PUT/PATCH on `default-credit-limits`?)
 - The Export button on the Workbooks tab (currently disabled in our captures)
@@ -346,7 +354,7 @@ def _encode_filters(*, owner_ids, integration_ids, is_recurring_only, has_credit
 
 **Tier:** 2 (high value, workaround-able). Workaround is hand-rolling the URL with bracket-array params, which is doable but undiscoverable from claycast's capability map and easy to get wrong (the workspaceId-must-be-string gotcha from `validate_auth_credentials` doesn't apply here, but bracket-array encoding is its own footgun).
 
-**Walkthrough notes:** detailed UI walkthrough at `/tmp/credit-usage-walkthrough-notes.md` (workspace 12345, captured 2026-04-30) — has the verified filter-param schema, the radio-toggle / Download-CSV client-side findings, and the URL-state observations.
+**Walkthrough notes:** a detailed UI walkthrough was captured 2026-04-30 (verified filter-param schema, radio-toggle / Download-CSV client-side findings, URL-state observations), but the notes lived at a volatile `/tmp` path and are no longer available — the verified schema documented above is the durable record.
 
 ### 9. Audience-segment export (the only path to >50K rows)
 
@@ -440,9 +448,9 @@ while True:
 
 ## Tier 3 — Nice-to-have
 
-- **Snapshot / point-in-time clone WITH DATA.** ClayCast's `create_table(source_table_id=)` is schema-only. A data-preserving clone would support A/B testing different enrichment strategies or "freeze this list before we mutate it."
+- **Snapshot / point-in-time clone WITH DATA.** ClayCast's `create_table(source_table_id=)` is schema-only. A data-preserving clone would support A/B testing different enrichment strategies or "freeze this list before we mutate it." Note 2026-08-06: existing primitives may now compose (schema clone + `fetch_all_records_full`/`export_rows` + `create_records` with pre-generated ids) — needs one verified round-trip. Formula/action cells still cannot be restored (they recompute; see api-reference replication section).
 - **Archive / unarchive** for tables and workbooks (not just `delete_table`).
-- **Collaborator / workspace-permission management** via the API.
+- **Collaborator / workspace-permission management** via the API — write-side only: the READ side is CLOSED (`list_workspace_users`, `get_workspace_permissions`, 2026-04-30; see the closed-helper list at the top of this file); only write-side permission management remains.
 - **Comment / annotation APIs** on records.
 - **Column-failure alerting / webhook hooks** (but really: that belongs to external monitoring infra, not claycast).
 - **Data validation on action-column inputs.** Clay silently accepts unknown `inputsBinding` names; a claycast-side schema validator that cross-references `action-registry.md` and raises would prevent silent credit burns.
@@ -455,7 +463,7 @@ while True:
 
 `CLAY_SESSION` rotates every few weeks. A long-running unattended script will silently start getting 401s. ClayCast has no refresh mechanism — browser-session auth can't self-renew. Headless deployments need one of:
 - Periodic manual re-auth + .env swap (current reality)
-- Migration to a proper API token if Clay ever exposes one
+- A proper API token — partially materialized but NOT a fix: Clay now issues public API keys (`clay api-keys create`), but they are unscoped, `public/v0`-only, and 403 on `/v3` (see api-reference auth verdict), so they CANNOT replace the cookie for internal endpoints. The gap stands.
 - Cookie auto-harvest from a persistent Chrome profile (possible via `clay_browser.py` but not implemented as a refresh loop)
 
 ### Rate limiting / 429 retries
@@ -469,6 +477,8 @@ ClayCast uses raw `requests.Session()` with no backoff. Production pipelines tha
 ### No durable job state
 
 Long-running jobs (CSV import, bulk enrichment) survive in Clay's backend but claycast has no persistence layer for the user's local job-tracking. If the user's Python process dies mid-wait, they lose their place. Adding a minimal `~/.claycast/state.json` with job-id + status + last-polled timestamp would let users resume.
+
+Status 2026-08-06: the proposed pattern already ships ad hoc in the author's private build tooling (a build_state.json with save(k,v) + skip-already-done-on-rerun semantics). Closing this gap = lifting that pattern into a claycast helper.
 
 ---
 

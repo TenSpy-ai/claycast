@@ -158,6 +158,8 @@ Creates a new table populated with people matching filters (job title, geography
   - Regular `POST /sources` returns 404 "Invalid subscriptions"
   - Requires Clay plan with source subscriptions (not all workspaces have this)
   - `company_table_id` references must point to a table with actual data (empty table = 400)
+  - The initial import RUNS on create at 0 credits (verified 2026-08-06) — `disableTriggerOnCreate`/`OnUpdate` control WHETHER it runs, not cost. Materialized starter columns bind as `{{f_people_search}}.<path>`, not the `{{source}}` alias the request-payload docs use (same paths, different token).
+  - ⚠️ The stock `Company Name` extractor coalesces `matched_experience.company_name || latest_experience_company` — on past-experience-match rows it returns the MATCHED (customer) company, NOT the person's current employer (verified 2026-08-06). Alumni/champion logic needs separate current-employer vs matched-company extractors. Full starter-column semantics: clay-api-reference.md § "Default basicFields for People".
 
 ```python
 r = clay.session.post("https://api.clay.com/v3/sources/create-cpj-table", json={
@@ -194,7 +196,7 @@ Receives JSON payloads via HTTP POST. Creates a source column with full payload.
 
 ---
 
-## 4. Lookups (Cross-Table)
+## 4. Cross-Table (Lookups & Subroutines)
 
 ### Lookup Row in Other Table
 
@@ -209,7 +211,7 @@ Find a single matching row in another Clay table.
   - `fields|rowValue`: formula ref from current table (`'{{@Column Name}}'`)
   - `fields|limit` (optional): max results
 - **output:** the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`) — the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES (verified 2026-07-24)
-- **credits:** 0 per lookup execution (verified 2026-07-24 via execute + workspace balance check)
+- **credits:** 0 per lookup execution (verified 2026-07-24 via execute + workspace balance check; also confirmed via `upfrontCreditUsage.totalCost = 0` on `execute_clay_action`)
 - **gotchas:**
   - Input names use `fields|` prefix — NOT just `targetColumn`
   - Without `fields|` prefix, inputs are silently dropped
@@ -238,6 +240,10 @@ Same as Lookup Row but returns multiple matches.
 - **output:** display string like "3 Records Found"
 - **gotcha:** see the single-row entry's verified extractor mechanics (2026-07-24): payload under `?.record?.` keyed by column names, bracket-key access works, `mappedResultPath` PATCH ignored. The multi-row payload shape has not been independently re-verified — validate on a real table first.
 
+### Execute Subroutine (function caller column)
+- Bindings live in ONE `inputsBinding` entry named `inputs`, whose value is a formulaMap of `input_name → "{{field_id}}"` tokens (dict-style sub-inputs) — verified 2026-08-06.
+- Updates are FULL REPLACEMENT: to add one input, read the column, `copy.deepcopy(typeSettings)`, extend the `inputs` formulaMap, and PATCH the ENTIRE typeSettings back — e.g. re-send all 14 existing mappings to add the 15th. PATCHing only the new key silently drops the other 13 (standard typeSettings replace semantics; see the deep-copy pattern in clay-api-reference).
+
 ---
 
 ## 5. HTTP API
@@ -264,6 +270,7 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
     `retryOptions|statusCodesToRetry, retryOptions|errorCodesToRetry` (verified 2026-07-24)
 - **output:** display string "Status Code: 200" — use `?.key` extractors for response body
 - **worked recipe:** calling a registered workflow-as-routine from a table (POST run → poll results → structuredOutputs extractors) — see clay-api-reference.md § "Pattern: calling a workflow-as-routine from a table" (verified 2026-07-30)
+- **delayed execution:** action columns accept `delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` in typeSettings (verified 2026-08-06) — e.g. a delayed results-GET that absorbs the workflow-run race; see clay-api-reference.md § "Conditional Execution"
 - **auth:** RapidAPI auth account ID from `clay.list_auth_accounts()` (auto-injects API key headers)
 - **gotchas:**
   - `queryString`, `headers`, `body` MUST use `formulaMap` — `formulaText` with JSON splits chars into numbered rows. Verified 2026-04-23: formulaText `'{"q": hello}'` produced `?0={&1="&2=q...` per char. Don't trust the cell's `"Status Code: 200"` preview — inspect `externalContent.fullValue` to see what Clay actually sent.
