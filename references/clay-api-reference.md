@@ -638,6 +638,17 @@ payload.
 **CRITICAL: `queryString` and `headers` use `formulaMap`, NOT `formulaText`.**
 Using `formulaText` with a JSON object `{"key": val}` causes Clay to split the string character-by-character into numbered rows — completely broken. Do not check the cell preview (`"Status Code: 200"`) to verify; that can lie when the target server returns 200 regardless. Inspect `externalContent.fullValue` via `GET /tables/{t}/records/{r}` to see the actual URL/payload Clay sent.
 
+**Dynamic-object params via formulaText (verified 2026-08-06):** an action binding's
+object-typed param (e.g. an update-prospect action's `customFields`) CAN be bound with
+`formulaText` whose expression **returns an object** — e.g. the JSON.parse IIFE over a
+JSON-string input (`((s) => s ? JSON.parse(s) : ({}))({{col}})`) — making both keys AND
+values fully dynamic at run time. Contrast: `formulaMap` = keys fixed at config time;
+formulaText-returning-object = arbitrary keys per row. (This is distinct from the
+character-split trap above, which is about formulaText holding a JSON *string* for
+string-typed map params; here the expression yields a real object for an object-typed
+param.) Verified in a live function build — dry-run pilot green, full verdict round-trip
+through the send-back on the first run.
+
 Verified 2026-04-23: `formulaText` with `'{"q": hello}'` produced URL `https://httpbin.org/get?0={&1="&2=q&3="&4=%3A&5= &6=h&7=e&8=l&9=l&10=o&11=}` — one query param per input char. `formulaMap` with `{"q": "hello"}` produced the correct `?q=hello`.
 
 ```python
@@ -1284,10 +1295,20 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
 - `let` declarations (but only the LAST expression returns — variables from earlier `let` lines are NOT accessible)
 - Null coalescing: `({{f_id}} || "")`
 - Optional chaining: `{{f_id}}?.key`
+- **JSON / Date globals (verified 2026-08-06):** `JSON.parse`, `JSON.stringify`,
+  `Object.keys`, `new Date().toISOString()` all work.
+- **Arrow-function IIFEs with EXPRESSION bodies (verified 2026-08-06):**
+  `((s) => s ? JSON.parse(s) : ({}))({{col}})` evaluates fine — the formula language is
+  best understood as **expression-only JavaScript with JSON/Date available**.
 
 **Does NOT work:**
-- IIFE: `(function() { ... })()` — parses but doesn't execute correctly
-- Arrow functions with block bodies: `(x => { return x; })(val)` — block body ignored
+- **Statement bodies fail SILENTLY (verified 2026-08-06):** any braces-with-statements
+  form — `try{...}catch(e){...}`, arrow/function block bodies with statements — produces
+  **NO cell at all**: no error status, the column just never evaluates, indistinguishable
+  from a never-run column. Guard with ternaries/optional-chaining instead of try/catch.
+  (Evidence: side-by-side columns — statement forms produced no cells, expression forms
+  returned SUCCESS.) This refines the older entries: IIFEs as such are fine; it's the
+  statement BODY that kills them.
 - `.includes()`, `.indexOf()` — may cause "Error evaluating formula" on some Clay versions
 - `.some()`, `.filter()`, `.map()`, `.find()` — parse error
 - `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
@@ -2384,7 +2405,10 @@ enrichmentId, toolId, isTestRun`, plus a `data` formulaMap
   Verified two ways: retrofit on a live function, and end-to-end via
   `create_function(send_back=...)` + a fresh caller (zero UI).
 - **Wrapped:** `create_function(..., send_back={output_name: extractor_column_name})`
-  builds all of it and enables AUTO_RUN.
+  builds all of it and enables AUTO_RUN. **Wrapper limitation (2026-08-06):** the
+  `send_back` param maps outputs to EXTRACTOR columns only — for verdict columns
+  computed later in the pipeline, build the send-back column manually with the recipe
+  above.
 
 **Gotchas (the valuable part):**
 
@@ -2397,8 +2421,11 @@ enrichmentId, toolId, isTestRun`, plus a `data` formulaMap
   they 500 the ENTIRE workspace tools registry endpoint** (`GET /workspaces/{ws}/tools`)
   until reverted, degrading routines infrastructure workspace-wide. Never guess enum
   values on a live workspace. (verified 2026-07-31)
-- Stringified-JSON inputs are accepted and land, but Clay formulas can NOT parse JSON
-  strings (`?.` access returns nothing) — a JSON-string input is archival only.
+- Stringified-JSON inputs are accepted and land — and (corrected 2026-08-06) they ARE
+  usable, not archival-only: direct property ACCESS on a string returns nothing
+  (`{{col}}?.key` — the older claim's kernel of truth), but
+  `((s) => s ? JSON.parse(s) : ({}))({{col}})?.key` parses and extracts fine (see
+  "Formula Syntax — What Clay Actually Supports").
 - **Extra undeclared inputs are tolerated** (202) — callers can send a rich flat input
   set while each function declares only the subset it consumes; contracts can grow
   without breaking existing functions.

@@ -4630,8 +4630,10 @@ class ClayClient:
         inputs: [{"name": str, "optional": bool = True, "semantic_type": str|None}].
         semantic_type is validated against SUBROUTINE_SEMANTIC_TYPES (unknown values
         500 the workspace tools registry — see class attr). Inputs are SCALAR-ONLY:
-        there is no json/object type; objects are rejected at run validation, and
-        JSON-string inputs land but Clay formulas cannot parse them (archival only).
+        there is no json/object type; objects are rejected at run validation.
+        JSON-string inputs land and ARE parseable in formulas via an expression IIFE
+        (((s) => s ? JSON.parse(s) : ({}))({{col}})) — direct ?.key access on the
+        string returns nothing (corrected 2026-08-06).
         Callers may send undeclared extra inputs (tolerated) — declare only what the
         function consumes.
 
