@@ -278,6 +278,11 @@ in your code.
   new columns.
 - The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
+- **`typeSettings.runAsButton: true` = the UI's "Click to run" mode (verified 2026-08-06):**
+  the column never auto-runs regardless of table AUTO_RUN or gates — a third blocking layer
+  beyond table-level AUTO_RUN_ON and conditionalRunFormulaText. Columns cloned from
+  manually-operated tables carry it silently; audit for it when activating a pipeline
+  (`ts.get('runAsButton')`), and PATCH it false for autonomous columns.
 - **Non-force `run_column` on `execute-subroutine` columns parks at `QUEUED` and never
   dispatches (verified 2026-08-06):** the caller cell shows status `QUEUED`, no intake row
   ever lands in the function — even on a LIVE (AUTO_RUN on) table with a passing gate.
