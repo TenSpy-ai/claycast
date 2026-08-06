@@ -4035,6 +4035,14 @@ class ClayClient:
         - `record_ids` targets explicit rows.
         - `view_id` scopes the run to a view.
         - `top_n` requires `view_id` and sends Clay's `viewIdTopRecords`.
+
+        The ACK ({"runMode": "INDIVIDUAL"}) does NOT guarantee execution
+        (verified 2026-07-30):
+        - a column whose `conditionalRunFormulaText` doesn't pass is skipped
+          SILENTLY (blank cell, no status); `force_run=True` bypasses the gate.
+        - `use-ai` columns never executed via this API in testing (0 credits,
+          blank cell even with force_run) while lookup columns ran fine — run
+          AI columns from the Clay UI. See clay-api-reference.md "AI Columns".
         """
         resolved_field_ids = self._resolve_runnable_field_ids(
             table_id,
@@ -4552,6 +4560,141 @@ class ClayClient:
         })
         source = res.get("source", res)
         return source
+
+    # Known-good SUBROUTINE input semantic types, observed across Clay-managed
+    # functions (verified 2026-08-05). ⚠ UNKNOWN values don't just fail — they 500
+    # the ENTIRE workspace tools registry (GET /workspaces/{ws}/tools) until the
+    # offending SUBROUTINE_INPUTS entry is reverted. Never guess new values.
+    SUBROUTINE_SEMANTIC_TYPES = {
+        "company-domain", "company-linkedin-url", "company-name",
+        "date", "unknown", "person-linkedin-url", "email",
+    }
+
+    def register_tool(self, tool_id: str, *, tool_type: str, name: str,
+                      entity_type: str | None = None, description: str = "",
+                      input_schema: dict | None = None,
+                      integrations: tuple = ("api",)) -> dict:
+        """Register a workspace TOOL so the public Routines API can run it
+        (verified 2026-07-31 for workflows, 2026-08-05 for functions).
+
+        tool_id: "workflow:wf_..." or "function:t_...". tool_type: "workflow"|"function".
+        entity_type: REQUIRED for functions ("contact"|"company" — the API names the
+        field in its 400 if omitted); ignored for workflows.
+
+        Registry facts (all live-verified):
+        - UI/Sculptor-built workflows auto-register; CLI/MCP/claycast-built resources
+          do NOT — call this yourself.
+        - Records are effectively immutable: no PATCH route (404), POST on an existing
+          id → 409. To change one, DELETE (if supported) and re-POST.
+        - For WORKFLOW tools the registry input_schema IS the runtime item validator
+          (empty-string values are stripped pre-spread; nulls are type-rejected;
+          whitespace survives). For FUNCTION tools, runtime validation comes from the
+          table's SUBROUTINE_INPUTS instead — the registry schema is documentation.
+        After registering: POST /public/v0/routines/{tool_id}/run (clay-api-key) with
+        {"items": [{"id": ..., "inputs": {...}}]} → 202 {routine_run_id}; results at
+        GET /public/v0/routines/run/{routine_run_id}/results.
+        """
+        if tool_type not in ("workflow", "function"):
+            raise ValueError(f"register_tool: tool_type must be workflow|function, got {tool_type!r}")
+        if tool_type == "function" and entity_type not in ("contact", "company"):
+            raise ValueError("register_tool: functions require entity_type 'contact' or 'company'")
+        body = {
+            "id": tool_id, "type": tool_type, "name": name, "description": description,
+            "access": {"integrations": list(integrations)},
+            "inputSchema": input_schema or {"type": "object", "properties": {}, "required": []},
+        }
+        if tool_type == "function":
+            body["entityType"] = entity_type
+        return self.post(f"/workspaces/{self.workspace_id}/tools", body)
+
+    def create_function(self, name: str, inputs: list[dict], *,
+                        entity_type: str = "contact", description: str = "",
+                        extractors: dict | None = None,
+                        success_field: str | None = None,
+                        register: bool = True) -> dict:
+        """Create a Clay FUNCTION — a UI-style subroutine table (NOT a workflow) —
+        entirely via the internal API (recipe verified end-to-end 2026-07-31).
+
+        inputs: [{"name": str, "optional": bool = True, "semantic_type": str|None}].
+        semantic_type is validated against SUBROUTINE_SEMANTIC_TYPES (unknown values
+        500 the workspace tools registry — see class attr). Inputs are SCALAR-ONLY:
+        there is no json/object type; objects are rejected at run validation, and
+        JSON-string inputs land but Clay formulas cannot parse them (archival only).
+        Callers may send undeclared extra inputs (tolerated) — declare only what the
+        function consumes.
+
+        extractors: {column_name: input_name} → creates formula columns
+        `{{source_field}}?.input_name` (these compute on row arrival even with
+        AUTO_RUN off). success_field: extractor column name to mark as the
+        pass-through output (IS_PASS_THROUGH_TABLE). KNOWN GAP (2026-07-31):
+        pass-through completion does not fire for API-created functions — routine
+        runs deliver their row but linger "in_progress" for pollers; wire the
+        managed-style `write-to-cell` send-back (package
+        b1ab3d5d-b0db-4b30-9251-3f32d8b103c1, `{{f_subroutine_source}}?.origin?.*`
+        bindings) if callers must await results.
+
+        Returns {"table_id", "routine_id", "source_id", "source_field_id",
+        "extractor_ids", "registered"}. The function is created dark (AUTO_RUN off).
+        """
+        subs = []
+        for i in inputs:
+            st = i.get("semantic_type")
+            if st is not None and st not in self.SUBROUTINE_SEMANTIC_TYPES:
+                raise ValueError(
+                    f"create_function: unknown semantic_type {st!r} for input "
+                    f"{i.get('name')!r} — unknown values 500 the workspace tools "
+                    f"registry. Known-good: {sorted(self.SUBROUTINE_SEMANTIC_TYPES)}")
+            entry = {"inputName": i["name"], "optional": bool(i.get("optional", True))}
+            if st:
+                entry["semanticTypeEnum"] = st
+            subs.append(entry)
+
+        table = self.create_table(name).get("table") or {}
+        tid = table.get("id") or self.create_table(name)["id"]
+        cur = self.get_table(tid).get("table", {})
+        ts = cur.get("tableSettings") or {}
+        ts.update({"BLOCK_TYPE": "SUBROUTINE",
+                   "BLOCK_SETTINGS": {"blockType": "SUBROUTINE"},
+                   "SUBROUTINE_INPUTS": subs, "AUTO_RUN_ON": False})
+        self.patch(f"/tables/{tid}", {"tableSettings": ts})
+
+        src = self.post("/sources", {"workspaceId": int(self.workspace_id),
+                                     "name": "Function inputs", "type": "manual",
+                                     "typeSettings": {"type": "subroutine"}})
+        sid = (src.get("source") or src).get("id")
+        fld = self.post(f"/tables/{tid}/fields", {
+            "name": "Function inputs", "type": "source",
+            "typeSettings": {"sourceIds": [sid], "canCreateRecords": True}})
+        src_fid = (fld.get("field") or fld).get("id")
+
+        ex_ids = {}
+        for col, inp in (extractors or {}).items():
+            r = self.create_formula_column(tid, col, "{{%s}}?.%s" % (src_fid, inp),
+                                           data_type="text")
+            ex_ids[col] = (r.get("field", r)).get("id")
+        if success_field:
+            if success_field not in ex_ids:
+                raise ValueError(f"create_function: success_field {success_field!r} "
+                                 "must name one of the extractors")
+            cur2 = self.get_table(tid).get("table", {})
+            ts2 = cur2.get("tableSettings") or {}
+            ts2["IS_PASS_THROUGH_TABLE"] = True
+            ts2["PASS_THROUGH_TABLE_SUCCESS_FIELD_IDS"] = [ex_ids[success_field]]
+            self.patch(f"/tables/{tid}", {"tableSettings": ts2})
+
+        routine_id = f"function:{tid}"
+        registered = False
+        if register:
+            props = {i["name"]: {"type": "string"} for i in inputs}
+            req = [i["name"] for i in inputs if not i.get("optional", True)]
+            self.register_tool(routine_id, tool_type="function", name=name,
+                               entity_type=entity_type, description=description,
+                               input_schema={"type": "object", "properties": props,
+                                             "required": req})
+            registered = True
+        return {"table_id": tid, "routine_id": routine_id, "source_id": sid,
+                "source_field_id": src_fid, "extractor_ids": ex_ids,
+                "registered": registered}
 
     def list_sources(self, table_id: str) -> list[dict]:
         """

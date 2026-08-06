@@ -93,6 +93,21 @@ The "enrich then export to CRM" flow is where most real pipelines end. Users hav
 
 ClayCast has `list_subroutines` but no `run_subroutine(subroutine_id, inputs=...)`. Subroutines are Clay's pre-built multi-step flows — big productivity unlock when someone's shared a good one.
 
+**Status 2026-07-31: DISCOVERED-not-wrapped (creation + execution).** Custom functions can
+now be CREATED via the internal API (spreadsheet table + `BLOCK_TYPE: "SUBROUTINE"`
+tableSettings + subroutine source + tools-registry `POST`) and EXECUTED via the public
+Routines API (`POST /public/v0/routines/function:t_x/run`, api-key auth) once registered.
+Full recipe + gotchas: clay-api-reference.md § "Creating a custom function (subroutine
+table) via API". Caveat: pass-through run completion unresolved on a minimal dark-table
+probe (runs stay `in_progress`). No SDK wrappers yet.
+
+**Status 2026-08-06: WRAPPED.** `clay.create_function(...)` builds the whole thing
+end-to-end (dark table + subroutine settings + input source/extractors + optional
+registration) and `clay.register_tool(...)` covers workflow/function registration in the
+workspace tools registry. Remaining sub-gap: **pass-through completion** (public routine
+runs linger `in_progress` even after the row lands) is still unwrapped — needs the
+managed-style `write-to-cell` send-back wiring.
+
 ### 7. Incremental / delta sync
 
 "Rows updated since timestamp X" or "new rows added since last sync." For external CRM syncs you need this or you push everything every time. Currently possible via `list_records` + client-side timestamp filtering, but painful for large tables.

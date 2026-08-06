@@ -75,6 +75,7 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
   - `top_n=` + `view_id=` (`viewIdTopRecords`)
   - `force_run=`
   - omitted field list = resolve all runnable fields (`action`, `enrichment`, `source`, `waterfall`, `claygent`)
+  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
 - `clay.get_run_status(table_id)` normalizes both `GET /tables/{t}/fieldrun` and `GET /workspaces/{ws}/tables/{t}/fields/runstatus`.
 - `clay.wait_for_runs(...)` is the shared polling / stall-detection surface used to cover the Datagen job-monitor behavior.
 - `clay.rerun_errored_cells(...)` is the SDK recipe for Datagen `rerun_errors`: find the Errored Rows view, inspect which specific cells failed, then re-run only those field+record combinations.
@@ -227,6 +228,21 @@ clay.run_column(TABLE_ID, [ai_field_id], record_ids=RECORD_IDS)
 - `jsonSchema` value is **double JSON-encoded**: `json.dumps(json.dumps(schema))` — single encoding produces a dict where Clay expects a string; column creates OK but never runs
 - `_metadata` with `modelSource: '"user"'` (inner quotes!) is required when using `answerSchemaType`
 - `dataTypeSettings` must be `{"type": "text"}` — `{"type": "json"}` breaks Clay UI rendering
+
+**API-triggered `use-ai` runs never executed (verified failing 2026-07-30; mechanism
+hypothesis unconfirmed).** A `use-ai` column (useCase `"claygent"`, `gpt-5-nano`,
+`dataTypeSettings: json`, **no `authAccountId`** — cloned from a working UI-built column
+that also shows `authAccountId: null`) ACK'd every `run_column` call
+(`{"runMode": "INDIVIDUAL"}`, incl. `force_run=True`) but **never executed**: 0 credits
+moved, cell stayed blank; with caller_name variants (`table-page`/`table`/`clay-web`) the
+cell recorded `{"metadata": {"trigger": "FORCE-RUN"}}` and sat queued 4+ minutes without
+running. A `lookup-row-in-other-table` column ran fine via the identical call in the same
+minutes (so NOT the global write-restricted-cookie mode above). Candidate explanations:
+(a) AI-action execution is gated to UI-originated runs (same family as the 2026-07-23
+run-enrichment allowlist shrink); (b) the missing/`null` `authAccountId` blocks API runs
+while UI runs resolve a default account. Until resolved: **run AI columns from the Clay
+UI Run button**, and treat a blank-cell-after-ACK on an AI column as expected, not a bug
+in your code.
 - `answerSchemaType` + `_metadata` are REQUIRED for `?.key` extractors to work — without them, Clay shows "Unable to parse output schema" even if the column was created successfully
 - `systemPrompt` must be < ~1,000 chars — put long instructions in `prompt` instead
 - For Claygent: expect 1-2 min per record (web research). For Create Content: seconds.
@@ -1414,6 +1430,25 @@ Add `conditionalRunFormulaText` to `typeSettings` to gate column execution:
 # When condition not met, cell status is ERROR_RUN_CONDITION_NOT_MET
 ```
 
+**API-run skip is SILENT (verified 2026-07-30):** triggering a gated column via
+`run_column` when the condition doesn't pass leaves the cell **completely blank** (`{}` —
+no value, no metadata status; the `ERROR_RUN_CONDITION_NOT_MET` status above was observed
+in other contexts, not on API-triggered runs). Worse, a `!!{{boolean_field}}`-style gate
+was observed skipping even when the referenced gate cell read `true` — evaluation
+semantics are unclear (possibly stale-dependency related). `force_run: true` bypasses the
+conditional and is the reliable manual-activation path; treat `conditionalRunFormulaText`
+as a spend-guard for auto-run mode, not as logic you can depend on during API-driven runs.
+
+**Gate references are dependency-DAG edges (verified 2026-08-06):** PATCHing an action
+column whose `conditionalRunFormulaText` references a formula column that — transitively,
+via another column's GATE — depends back on the gated column returns
+`400 {"type": "BadRequest", "message": "Dag is cyclical",
+"details": {"inputFieldIdsWithErrors": [...]}}`. Cycles through GATES are rejected the
+same as cycles through formula values. Practical rule: a spend-gate must only reference
+columns strictly upstream of the gated column; when a helper formula aggregates from
+multiple lookups, gate on the specific upstream lookup's raw path instead of the
+aggregate.
+
 ---
 
 ## AI Columns — API Read Behavior
@@ -1467,6 +1502,28 @@ After the field exists, the previously buffered records **retroactively material
 ### Arrays do NOT fan out (verified 2026-07-24)
 
 POSTing a JSON array of N objects to the webhook URL counts as ONE source record and does NOT create N rows (verified twice — before and after the subscription existed; the array-row materialized with no matching fields). Send **one object per POST**.
+
+### Dedupe semantics — SKIP-mode, URL-shaped keys only (verified 2026-07-24/30)
+
+Webhook source tables dedupe on the payload's `url` key (stored as `dedupeValue` on the
+record), with three sharp edges:
+
+- **`dedupeValue` registers ONLY for URL-shaped values.** A synthetic key like
+  `sf-contact:003...` stores `dedupeValue: null` = NO dedupe protection (duplicates land as
+  separate rows). A URL-shaped sentinel (`https://anything.invalid/{id}`) registers fine —
+  use that form when contacts lack a real URL.
+- **Dedupe is SKIP-mode, not update-mode.** Re-posting a payload whose key already exists
+  neither creates a row nor updates the existing one — and **new payload keys are never
+  merged retroactively** into existing rows. Adding a field to your POST body only reaches
+  rows created after the change; backfill needs delete + re-post or a table-side enrichment.
+- **Received ≠ written.** The source's `state.numSourceRecords` still increments on every
+  accepted POST, including dedupe-skipped ones — don't use it as a row count.
+
+Related: the records API (`list_records` / bulk-fetch) shows the webhook source field's cell
+as a **preview string** (e.g. `"Received July 24th, 2026"`) — the raw payload object is NOT
+readable through the records API. Formula columns referencing the source field DO see the
+full object: `{{source_field}}?.any_key` works for any payload key (no source-side mapping
+needed) and computes on row arrival even with table `AUTO_RUN_ON: false`. Verified 2026-07-30.
 
 ### Extraction columns
 
@@ -2062,15 +2119,285 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 
 ---
 
-## Terracotta (tc-workflows) metadata endpoints (discovered 2026-07-24)
+## Terracotta (tc-workflows) metadata endpoints (discovered 2026-07-24, extended 2026-07-30)
 
-Terracotta workflows follow the same workspace-scoped path pattern as the workbook-settings PATCH above — the unscoped variants (`/v3/tc-workflows/{id}`, `/v3/terracotta/workflows/{id}`, `/v3/workflows/{id}`) all 404.
+Terracotta workflows follow the same workspace-scoped path pattern as the workbook-settings PATCH above — the unscoped variants (`/v3/tc-workflows/{id}`, `/v3/tc-workflows/runs/{id}`, `/v3/terracotta/workflows/{id}`, `/v3/workflows/{id}`) all 404 (`NoMatchingURL`).
 
 - `PATCH /v3/workspaces/{ws}/tc-workflows/{wf_id}` with `{"name": "..."}` → `200 {"workflow": {...}}` — renames a workflow. Verified live 2026-07-24.
-- `GET /v3/workspaces/{ws}/tc-workflows/{wf_id}` → workflow metadata only (no node graph).
+- `GET /v3/workspaces/{ws}/tc-workflows/{wf_id}` → thin metadata object only (`id`, `name`, `workspaceId`, `creatorUserId`, `lastRunAt`, `liveWorkflowSnapshotId`, `createdAt`/`updatedAt` — no node graph). Verified 2026-07-30.
+- `GET /v3/workspaces/{ws}/tc-workflows/{wf_id}/runs/{run_id}` → full run object: `runState`, `runStatus`, `trigger`, `dataCreditsUsed`/`actionCreditsUsed`, and per-node outputs (a leaf node's JSON verdict is findable inside it). Verified 2026-07-30.
+
+**Auth verdict (verified 2026-07-30) — these routes are session-cookie/OAuth ONLY.** A Clay
+public API key gets `403 Forbidden ("Insufficient permissions")` — keys are unscoped
+(`clay api-keys create` takes only `--name`) and only valid for `public/v0`, and the public
+API has **zero direct workflow endpoints** (its surface is me/routines/search/tables only).
+Consequence: an `http-api-v2` **table column can never read tc-workflow RUN objects**
+(cookie-only) — the tempting write-back pattern "capture `workflowRunId` from the webhook
+ACK, then GET the run from a column" is impossible, not merely miswired. Never embed the
+`CLAY_SESSION` cookie in a column to force it. **BUT a REGISTERED workflow tool can be
+run + polled via the public Routines API with an api key** — that's the supported,
+column-friendly path (registration recipe below).
 
 No SDK wrapper yet — raw recipe via the escape hatch:
 
 ```python
 clay.patch(f"/workspaces/{clay.workspace_id}/tc-workflows/{wf_id}", {"name": "New name"})
+clay.get(f"/workspaces/{clay.workspace_id}/tc-workflows/{wf_id}/runs/{run_id}")
 ```
+
+### Node updates — `PATCH .../tc-workflows/{wf}/nodes/{node}` is FULL REPLACEMENT (verified 2026-08-05)
+
+The workflow-node write gap is closed: clay-spy captured the UI's own node-update route
+(Sentry headers in the capture confirm it's the app's route; the non-workspace-scoped
+guess `/tc-workflows/{wf}/nodes/{id}` 404s):
+
+`PATCH /v3/workspaces/{ws}/tc-workflows/{wf}/nodes/{node}` — body (200 on capture):
+
+```json
+{"name": "...", "description": null, "nodeType": "code",
+ "scriptVersionId": "...", "inlineScript": {"code": "..."},
+ "nodeConfig": {"nodeType": "code", "inputSchema": {...}, "automap_inputs": true,
+                "listMode": null, "listEntriesRef": null, "inputRefs": [...],
+                "inputMappingConfig": {...}},
+ "retryConfig": null, "subroutineIds": [], "toolIds": []}
+```
+
+- **`nodeConfig.inputSchema` + `inputRefs` are REPLACED wholesale.** This is the escape
+  hatch for the plugin MCP's `edit_node` on CODE nodes, whose inputSchema edits merge
+  per-property and can NEVER remove pins or required flags (an explicit
+  `{properties: {}, required: []}` returns "noop"). PATCH here with the pin-free schema
+  to actually remove wiring.
+- **`edit_node` schema semantics differ by node type (refined 2026-08-05):** side by side —
+  **code nodes** = merge-and-sticky (per-property merge; pins unremovable, as above).
+  **Tool nodes** = replace-on-update for EXISTING inputs: redefining a declared input
+  (e.g. repointing a pin's `sourceNodeId`/`sourcePath`) succeeds AND drops the other
+  previously-declared schema properties, while the tool's `inputMappingConfig` (the
+  actual param bindings) survives untouched. The 2026-07 "Invalid node config" failure
+  applies specifically to ADDING new input variables to a tool node. So: pin repoints on
+  tool nodes ARE possible via MCP; re-declare the full schema you want in one update.
+- Workflow tool-RESULT delivery is string-only for `extract-field-from-object`-style
+  extractors — numeric extractions crash the run; see action-registry.md § "extract-json /
+  extract-field-from-object extractor tools" (verified 2026-08-05).
+- **Caution: full replacement cuts both ways** — send the COMPLETE node (fetch first,
+  mutate, PATCH); omitting sections likely clears them. Response echoes the full node
+  with a new `scriptVersionId`.
+
+**Multi-trigger workflows: REQUIRED pins to a trigger that didn't fire are FATAL**
+(verified 2026-08-05; refined 2026-08-08): `"Input ref resolution failed: no completed
+step found for source node"`. A node whose REQUIRED inputs pin to BOTH triggers of a
+dual-trigger workflow can never run from either door. Trigger-adjacent nodes must read
+trigger inputs by NAME from the spread (no pins) — never pin to trigger nodes.
+
+**Refinement — fatality is scoped to the `required` array (verified 2026-08-05/08):**
+- **required + pinned** = hard failure when the pin can't resolve — both flavors:
+  `"no completed step found for source node"` (source never executed) and
+  `"resolved to undefined"` (source completed but the path is empty).
+- **optional + pinned** (input not listed in `required`, or no required list) = the pin
+  resolves to missing and the node RUNS. Live proof: a conditional's optional pin to a
+  lookup's `$.result.data[0].id` on a lookup-miss run (completed source, undefined path)
+  still completed and routed correctly, while REQUIRED pins hard-failed with the errors
+  above in the same workflow.
+So optional pins are safe for "may be absent" wiring (not-found branches); reserve
+`required` for inputs whose absence should abort the run.
+
+### Workspace tools registry — registering a workflow as a public routine (verified 2026-07-30)
+
+The "why do only some workflows appear in `clay routines list`" mystery is solved: routine
+visibility = having a record in the **workspace tools registry**. UI/Sculptor-built
+workflows get one automatically; CLI/MCP-created workflows do NOT.
+
+- `GET /v3/workspaces/{ws}/tools` → list of tool records:
+  `{id, type, name, description, access: {integrations: [...]}, inputSchema}`. Workflow
+  tools have `id: "workflow:wf_..."`, `type: "workflow"`; `access.integrations: ["api"]`
+  = publicly executable via the Routines API. (Observed: 7 of 11 workspace workflows had
+  entries — exactly the UI-built ones.)
+- The same registry also holds FUNCTION tools (`id: "function:t_x"`, `type: "function"`)
+  — see "Creating a custom function (subroutine table) via API" below for the
+  function-side registration nuances (`entityType` required). (verified 2026-07-31)
+- `POST /v3/workspaces/{ws}/tools` with a full record body **registers** a workflow:
+
+```python
+clay.post(f"/workspaces/{clay.workspace_id}/tools", {
+    "id": "workflow:wf_xxx",
+    "type": "workflow",
+    "name": "My Workflow",
+    "description": "What it does",
+    "access": {"integrations": ["api"]},
+    "inputSchema": {"type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"]},
+})
+```
+
+Verified end-to-end: a CLI-built workflow registered this way became executable through the
+public Routines API (api-key auth — the credential a table HTTP column CAN carry):
+
+- `POST https://api.clay.com/public/v0/routines/workflow:wf_xxx/run`
+  (header `clay-api-key`), body
+  `{"items": [{"id": "<caller-chosen id>", "inputs": {<trigger input fields>}}]}`
+  (1–100 items) → `202 {"routine_run_id": "run_...", "status": "in_progress"}`.
+- `GET https://api.clay.com/public/v0/routines/run/{routine_run_id}/results`
+  (header `clay-api-key`) →
+  `{routine_run_id, status: in_progress|complete, total, finished, data: [{id, status,
+  result: {...ALL leaf-node outputs incl. structuredOutputs...}}]}`.
+  Full leaf output returned; the whole probe cost 0.2 credits.
+  **Results-shape nuance (verified 2026-07-30 on both leaf types of one workflow):** the
+  per-item `result`'s TOP-LEVEL fields are only reliably populated for **code-node**
+  leaves; with an **agent-node** leaf they can come back empty (`reasoning: ""`) while the
+  real verdict lives ONLY under `result.structuredOutputs.*` (agent leaves also add a
+  `stepsTaken` array). `structuredOutputs` is present on BOTH leaf types, so consumers —
+  e.g. table formula extractors — should always read
+  `?.data?.[0]?.result?.structuredOutputs?.<field>`, never top-level `result.<field>`.
+
+**Gotcha:** request-body validation runs BEFORE the tool-existence check — an unregistered
+tool id returns 400 schema errors when the body is invalid, and only 404
+`"Tool workflow:wf_xxx not found"` once the body is valid. Don't read a 400 as "the tool
+exists".
+
+**Registry records are effectively immutable (verified 2026-08-05; refined 2026-08-06):**
+there is no update route (`PATCH /workspaces/{ws}/tools/{id}` 404s; `POST` on an existing
+id 409s) and **no DELETE route either** (`DELETE /workspaces/{ws}/tools/{id}` → 404).
+Removal paths: FUNCTION tool records are **cascade-removed when their table is deleted**
+(verified 2026-08-06) — for workflow tool records no removal path is known short of
+deleting the workflow itself (untested). Consequence: changing a WORKFLOW tool's schema
+has no clean route — and it matters, because for WORKFLOW tools the registry
+`inputSchema` is the RUNTIME item validator (see the items-layer note in the pattern
+below); for FUNCTION tools it's documentation-only (their validator is the table's
+`SUBROUTINE_INPUTS`), and a function's record can be recycled via delete-table +
+`create_function(register=True)`.
+
+### Pattern: calling a workflow-as-routine from a table (POST run → poll results)
+
+Live-verified 2026-07-30. The full table-side setup for getting a registered workflow's
+verdict back into row cells — the supported replacement for the impossible
+"GET the tc-workflow run from a column" pattern above. Prereq: workflow registered as a
+workspace tool with `access.integrations: ["api"]` (previous section).
+
+**Column 1 — `Call <routine>`** (`http-api-v2` action column, `dataTypeSettings: json`,
+and the action's FULL 15-param `inputsBinding` — see "Action columns need the action's
+FULL parameter list" above; a partial binding renders NO inputs in the UI):
+
+- `method` `"POST"`, `url` `"https://api.clay.com/public/v0/routines/workflow:wf_xxx/run"`
+- `headers` formulaMap:
+  `{"Content-Type": '"application/json"', "clay-api-key": '"<clay-public-api-key>"'}` —
+  ⚠ this **embeds the public key in column config**, same exposure class as a key pasted
+  into workflow node code; acceptable for workspace-internal keys, but know it's there.
+- `body` via string-concat + `Clay.formatForJSON` (or `format_json_body({...})`), items
+  shape: `{"items": [{"id": <stable per-row id, e.g. the LinkedIn URL>,
+  "inputs": {<the workflow's trigger input fields>}}]}`
+- optional `conditionalRunFormulaText` gate — with the caveat documented under
+  "Conditional Execution": scripted runs skip silently; `force_run` bypasses.
+- Response lands as json `{routine_run_id, status: "in_progress"}` (cell preview shows
+  `"Status Code: 202"` — read the json via `?.` extractors, not the preview).
+
+**Column 2 — `Run Id`** (formula, text): `{{call_col}}?.routine_run_id`
+
+**Column 3 — `Results`** (`http-api-v2`, `dataTypeSettings: json`): `method` `"GET"`,
+`url` `"https://api.clay.com/public/v0/routines/run/" + {{run_id_col}} + "/results"`,
+`headers` `{"clay-api-key": ...}` (same full-binding rule).
+
+**Columns 4+ — verdict extractors** (formula):
+`{{results_col}}?.data?.[0]?.result?.structuredOutputs?.<field>` — never top-level
+`result.<field>` (agent-leaf nuance above: top-level fields can be empty while the
+verdict lives only under `structuredOutputs`).
+
+Operational notes:
+
+1. **RACE:** the results GET can catch `status: "in_progress"` with empty `data` — re-run
+   the Results column after the routine completes. On dark tables sequence manually (run
+   Call → wait → run Results); with AUTO_RUN the dependency cascade fires automatically
+   but the race remains.
+2. **Cost:** one run of a two-node router (table lookup + nano-LLM fallback) + the two
+   `http-api-v2` executions ≈ **2 credits/row** — cost scales with the workflow being
+   called; estimate before bulk runs.
+3. `items` supports 1–100 per POST; the per-row column pattern sends 1.
+4. **Items-layer input semantics (verified 2026-08-05):** empty-string input values are
+   STRIPPED before the workflow spread — they vanish from the trigger payload entirely, so
+   pins / `$.key` refs resolve undefined. JSON `null`s are REJECTED by the registered tool
+   schema's types (`"phone: must be string"`). Whitespace-only strings (`" "`) survive
+   both filters — use them (or a sentinel like `"NONE"`) when a field must arrive.
+
+### Creating a custom function (subroutine table) via API (verified 2026-07-31)
+
+Custom Clay FUNCTIONS (the UI's "function" tables; routine id `function:t_x`) can be
+created entirely via the internal API — closing most of feature-gaps.md § 6. A function
+is not a special object; it's a **plain `spreadsheet` table with subroutine
+tableSettings** plus a subroutine input source and a tools-registry entry.
+
+**Wrapped (2026-08-06):** `clay.create_function(...)` performs the whole recipe below
+end-to-end and `clay.register_tool(...)` handles step 3 for both workflows and functions.
+Smoke-tested live: created → registered → public routine run 202 → row landed →
+extractor computed → cleanup. Two facts from that cleanup:
+
+- There is **NO registry DELETE route** — `DELETE /workspaces/{ws}/tools/{id}` → 404.
+- **Deleting a function's table cascade-removes its tools-registry entry** — function
+  tools are cleanly removable via table deletion. (Whether workflow deletion cascades
+  the same way is untested.)
+
+**1. The table** — create normally (`POST /tables` / claycast `create_table`), then PATCH
+`/tables/{id}` with:
+
+```python
+{"tableSettings": {
+    "BLOCK_TYPE": "SUBROUTINE",
+    "BLOCK_SETTINGS": {"blockType": "SUBROUTINE"},   # managed ones add isClayManaged: true
+    "SUBROUTINE_INPUTS": [
+        {"inputName": "domain", "optional": False, "semanticTypeEnum": "company-domain"},
+        {"inputName": "note",   "optional": True},
+    ],
+    # output mapping (which field(s) the function "returns"):
+    "IS_PASS_THROUGH_TABLE": True,
+    "PASS_THROUGH_TABLE_SUCCESS_FIELD_IDS": ["f_result_col"],
+}}
+```
+
+**2. Input delivery** — a subroutine source + source field:
+`POST /sources` with `{type: "manual", typeSettings: {type: "subroutine"}}`, then a
+`source`-type field on the table with `sourceIds: [s_id]`. Run inputs land in that field
+as an object; formula extractors (`{{src_field}}?.input_name`) compute on arrival.
+Managed functions reference it via a reserved `{{f_subroutine_source}}` token in bindings.
+
+**3. Registration is NOT automatic** — same tools registry as workflows (section above):
+`POST /v3/workspaces/{ws}/tools` with
+`{id: "function:t_x", type: "function", entityType: "contact"|"company"` (**REQUIRED** —
+validation names it)`, name, access: {integrations: ["api"]}, inputSchema}`. After that,
+`POST /public/v0/routines/function:t_x/run` returns 202 and the item lands as a row.
+
+**4. Return path (managed pattern)** — a `write-to-cell` action column (package
+`b1ab3d5d-b0db-4b30-9251-3f32d8b103c1`) bound to
+`{{f_subroutine_source}}?.origin?.recordId/tableId/fieldId/asyncCallbackId` writes results
+back to the ORIGIN cell for table-column invocations; the pass-through success fields
+drive API results.
+
+**Gotchas (the valuable part):**
+
+- **Input types are SCALAR-ONLY** (verified 2026-07-31). Runtime validation derives from
+  `SUBROUTINE_INPUTS`, defaulting to string; sending an object → `400 "Expected type
+  string"`. Observed `semanticTypeEnum` vocabulary from managed functions:
+  `company-domain, company-linkedin-url, company-name, date, unknown,
+  person-linkedin-url, email`. There is NO json/object type.
+- **⚠ Invalid `semanticTypeEnum` values (e.g. `"json"`, `"object"`) don't just fail —
+  they 500 the ENTIRE workspace tools registry endpoint** (`GET /workspaces/{ws}/tools`)
+  until reverted, degrading routines infrastructure workspace-wide. Never guess enum
+  values on a live workspace. (verified 2026-07-31)
+- Stringified-JSON inputs are accepted and land, but Clay formulas can NOT parse JSON
+  strings (`?.` access returns nothing) — a JSON-string input is archival only.
+- **Extra undeclared inputs are tolerated** (202) — callers can send a rich flat input
+  set while each function declares only the subset it consumes; contracts can grow
+  without breaking existing functions.
+- **Pass-through completion unresolved (needs verification):** on a minimal probe
+  (formula-only success field, dark table) the routine run stayed `in_progress`
+  indefinitely even though the row landed and extractors computed. Completion plumbing
+  likely requires the managed-style send-back/async-callback wiring or a non-dark run
+  path.
+- The registry `inputSchema` is documentation-only **for FUNCTION tools** — their runtime
+  validation comes from the table's `SUBROUTINE_INPUTS`. (WORKFLOW tools are the
+  opposite: the registry record IS the runtime item validator — refined 2026-08-05, see
+  the tools-registry section above.)
+
+**Aside — official CLI structured query (needs verification, observed 2026-07-30):**
+`clay tables query` requires `tables: [{"id": ...}]` (not `tableId` — validation error names
+`query.tables.0.id`). One session saw filters `{fieldName, operator: "CONTAIN", value}`
+return apparently-unfiltered records once, then 0 on retry — the filter syntax is unverified;
+for ad-hoc searches over big tables, paging `list_records` and filtering client-side was the
+reliable path.

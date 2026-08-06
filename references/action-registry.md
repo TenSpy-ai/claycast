@@ -263,6 +263,7 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
     `followRedirectsOptions|maxRedirects, responseTimeout, shouldRetry, retryOptions|maxRetries,`
     `retryOptions|statusCodesToRetry, retryOptions|errorCodesToRetry` (verified 2026-07-24)
 - **output:** display string "Status Code: 200" — use `?.key` extractors for response body
+- **worked recipe:** calling a registered workflow-as-routine from a table (POST run → poll results → structuredOutputs extractors) — see clay-api-reference.md § "Pattern: calling a workflow-as-routine from a table" (verified 2026-07-30)
 - **auth:** RapidAPI auth account ID from `clay.list_auth_accounts()` (auto-injects API key headers)
 - **gotchas:**
   - `queryString`, `headers`, `body` MUST use `formulaMap` — `formulaText` with JSON splits chars into numbered rows. Verified 2026-04-23: formulaText `'{"q": hello}'` produced `?0={&1="&2=q...` per char. Don't trust the cell's `"Status Code: 200"` preview — inspect `externalContent.fullValue` to see what Clay actually sent.
@@ -463,6 +464,33 @@ clay.create_column(t_id, {
 }, view_id=v_id)
 ```
 
+- **conditional-gate gotcha (verified 2026-07-30):** on API-triggered `run_column`, a
+  failing `conditionalRunFormulaText` skips SILENTLY — blank cell, no status — and `!!`
+  gates were observed skipping even when the referenced cell read true. `force_run=True`
+  bypasses the gate; treat it as an auto-run spend-guard, not run-time logic.
+- **gate refs are DAG edges (verified 2026-08-06):** a gate referencing a column that
+  transitively depends back on the gated column (even only via another column's gate)
+  is rejected with `400 "Dag is cyclical"` — gate only on strictly-upstream columns.
+
+---
+
+### extract-json / extract-field-from-object extractor tools — two workflow crash modes
+
+- **gotcha — empty object is a CRASH, not a miss (verified 2026-08-05):** handing an
+  `extract-json`-style tool an empty object fails with `ERROR_MISSING_INPUT` ("Check that
+  your JSON object has keys") — a lookup-miss upstream CRASHES the extractor instead of
+  flowing to a not-found branch. Put the emptiness conditional BEFORE the extractor,
+  not after.
+- **gotcha — `extract-field-from-object` cannot deliver NON-STRING extractions in
+  workflows (verified 2026-08-05):** the tool-result delivery envelope requires a string.
+  Evidence ladder: extracting the number `0` → run fails `"Failed to deliver tool result
+  to workflow: actionInvocationOutput.metadata.textPreview — expected string"`; extracting
+  `-1` (number) → SAME `textPreview` invalid_type error (so it's the envelope, not a falsy
+  bug); extracting `"-1"` (string) → delivers fine. Consequence: extracting numeric ids
+  (e.g. sequencer prospect ids) via this action in a WORKFLOW is broken generally — use a
+  code node for numeric field extraction, or ensure upstream data carries string values.
+  (Number-typed conditional inputs downstream coerce string `"-1"` fine for comparisons.)
+
 ---
 
 ## 8. Discovery (Finding New Actions)
@@ -528,6 +556,8 @@ clay.create_action_column(t_id, "Deep Qualify",
     auth_account_id="<gemini-auth-account-id>",
     view_id=v_id)
 # Status when skipped: ERROR_RUN_CONDITION_NOT_MET (normal, 0 credits spent)
+# ⚠ On API-triggered run_column the skip is SILENT instead — blank cell, no status
+#   (verified 2026-07-30); force_run=True bypasses the condition.
 ```
 
 ### Records (CRUD)
