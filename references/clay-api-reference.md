@@ -244,6 +244,27 @@ while UI runs resolve a default account. Until resolved: **run AI columns from t
 UI Run button**, and treat a blank-cell-after-ACK on an AI column as expected, not a bug
 in your code.
 
+- **use-ai columns NEVER auto-run — not even on row ARRIVAL (verified 2026-08-06, 5-probe
+  battery on a function table):** subroutine-arrival rows with AUTO_RUN_ON true, a valid
+  model id, and a trivially-true run condition still never schedule the use-ai cell (cell
+  stays null — no status, no error), while a `lookup-row-in-other-table` column on the
+  SAME arriving rows fires normally. use-ai executes ONLY via UI runs. Consequence: no
+  autonomous pipeline (function table, webhook table, routine-fed table) can contain a
+  use-ai step — put the AI step in a Terracotta workflow and call it from the table (the
+  hybrid: in-table lookup first, http-api-v2 POST to the workflow's routines door only on
+  miss).
+- **Action-column scheduling model (verified 2026-08-06):** action columns are scheduled
+  ONCE when the row arrives; later input/dependency updates do NOT reschedule them, and a
+  no-op formula dependency on another column does not help. The run condition is evaluated
+  at execution time — so **`delaySettings` defers gate evaluation**: a column whose gate is
+  false at arrival (upstream lookup pending) but true 20s later FIRES if it carries
+  `delaySettings: {"type": "delay-seconds", "delayFormulaText": "20"}` (proven live). This
+  makes the delay the standard sequencer for gate-on-upstream-action patterns; without it,
+  the column silently never runs.
+- **Table column cap:** creating a field on a ~100-column table 400s with
+  `"cannot create new field due to table size limit"` / "column limit". Plan retrofits as
+  repoint-in-place (PATCH existing formulas, keep fids so readers stay wired) instead of
+  new columns.
 - The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
 - `answerSchemaType` + `_metadata` are REQUIRED for `?.key` extractors to work — without them, Clay shows "Unable to parse output schema" even if the column was created successfully

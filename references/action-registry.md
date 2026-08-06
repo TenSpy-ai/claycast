@@ -250,6 +250,16 @@ Same as Lookup Row but returns multiple matches.
 
 ### HTTP API v2 (Generic)
 
+- **`actionVersion` MUST be 1** (verified 2026-08-06): despite the `-v2` action key,
+  `actionVersion: 2` does not exist — the column is created 200 but carries
+  `settingsError: [{"type": "INVALID_ACTION", "message": "Action does not exist"}]`, has
+  no `actionDefinition`, and silently never schedules. Habit: after creating any action
+  column, check `field.settingsError` — it is the difference between "gated off" and
+  "structurally dead". Also: PATCHing typeSettings on a settings-broken column can WIPE
+  its inputsBinding — repair by cloning a proven column's full typeSettings and
+  substituting values.
+
+
 Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, custom endpoints.
 
 - **key:** `http-api-v2`
