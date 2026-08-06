@@ -2438,7 +2438,7 @@ FULL parameter list" above; a partial binding renders NO inputs in the UI):
   shape: `{"items": [{"id": <stable per-row id, e.g. the LinkedIn URL>,
   "inputs": {<the workflow's trigger input fields>}}]}`
 - optional `conditionalRunFormulaText` gate — with the caveat documented under
-  "Conditional Execution": scripted runs skip silently; `force_run` bypasses.
+  "Conditional Execution": scripted runs skip silently; `force_run` bypasses — BUT NOT UNIVERSALLY (verified 2026-08-06): on an `execute-subroutine` column, `run_column(..., force_run=True)` still honored `conditionalRunFormulaText` (gate-failing rows returned `ERROR_RUN_CONDITION_NOT_MET`; gate-passing rows ran). Treat the bypass as action-dependent — verify per action, and pre-filter record_ids to gate-passing rows when you need deterministic behavior.
 - Response lands as json `{routine_run_id, status: "in_progress"}` (cell preview shows
   `"Status Code: 202"` — read the json via `?.` extractors, not the preview).
 
