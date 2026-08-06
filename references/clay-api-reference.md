@@ -2374,6 +2374,18 @@ So optional pins are safe for "may be absent" wiring (not-found branches); reser
 - ONE configured tool instance per action per workspace (verified 2026-08-06): every node in every workflow that uses an action shares the SAME tool config, and `inputMappingConfig` lives on the TOOL, not the node. A static mapping saved while editing workflow A silently clobbers workflow B — last edit wins (observed on a shared `tct_` config; no error, downstream workflow just breaks). Safe pattern: make every mapping `{type: "reference"}` with `{{vars}}` so each workflow supplies its own values; never bake static values into a shared tool config. Reported upstream: clay-run/agent-plugins#20.
 - edit_node can only ATTACH already-configured tools: binding an action the workspace has never configured returns `Tool does not belong to this workspace`. Configure the action once in the UI before any API workflow build that needs it.
 - Conditional (gate) nodes forward NO data — their only output is `conditionalEvaluation`; the upstream spread STOPS at them. Any node downstream of a conditional must pin to PRE-conditional nodes for its data. Symptoms of getting this wrong: `missing required inputs` failures, or worse, Claygent silently guessing parameter values.
+- **Code-node date/time — import INSIDE the handler, not at module level (verified 2026-08-06):**
+  `datetime` AND `time` ARE available in the workflow code sandbox, BUT a MODULE-LEVEL
+  `import datetime` (top of the file) fails at runtime with `ModuleNotFoundError: No module
+  named 'datetime'` (traceback at `<string>` line 2, `<module>`); the SAME import placed
+  inside `handler()` works. Proven in the `run_code` tester AND a deployed node
+  (`datetime.datetime.utcnow() - timedelta(days=90)` → correct date). So a code node can grab
+  the current timestamp itself — no external time source, 1-step timestamp workflow, or
+  trigger-formula date needed. Keep a function-level `time.gmtime(time.time()-days*86400)`
+  fallback for robustness. Passing a pre-computed date from a Clay formula
+  (`new Date(Date.now()-d*86400000).toISOString().slice(0,10)`) also works as an override.
+  This likely generalizes: module-level imports of some stdlib modules are stripped —
+  import at function scope when a top-level import raises ModuleNotFoundError.
 - Spread values are stringly (verified 2026-08-06): booleans arrive as STRINGS (`"true"`/`"false"`) through workflow spread context — code nodes must parse them; `if (x)` on `"false"` is truthy. And tool-node output lives at `$.result` in actual runs, NOT the `$.toolResult.result` path Clay's docs describe — pins built from the official docs resolve undefined. ($.result mismatch reported upstream: clay-run/agent-plugins#19.)
 
 ### Workspace tools registry — registering a workflow as a public routine (verified 2026-07-30)
