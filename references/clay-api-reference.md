@@ -252,7 +252,10 @@ in your code.
   autonomous pipeline (function table, webhook table, routine-fed table) can contain a
   use-ai step — put the AI step in a Terracotta workflow and call it from the table (the
   hybrid: in-table lookup first, http-api-v2 POST to the workflow's routines door only on
-  miss).
+  miss). `delaySettings` does NOT rescue it (verified 2026-08-06, 6th probe): a use-ai
+  column with a 30s delay and a true gate still never schedules on an arriving row — the
+  exclusion is at the scheduler level, not gate timing. The workflow-door POST is the ONLY
+  autonomous AI mechanism.
 - **Action-column scheduling model (verified 2026-08-06):** action columns are scheduled
   ONCE when the row arrives; later input/dependency updates do NOT reschedule them, and a
   no-op formula dependency on another column does not help. The run condition is evaluated
