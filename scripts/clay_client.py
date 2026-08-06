@@ -3851,8 +3851,8 @@ class ClayClient:
         return self.patch(f"/tables/{table_id}/views/{view_id}/fields", fields)
 
     def autofit_view_fields(self, table_id: str, view_id: str, *,
-                            min_width: int = 80, max_width: int = 480,
-                            char_px: float = 7.2, header_pad: int = 56,
+                            min_width: int = 100, max_width: int = 480,
+                            char_px: float = 8.0, header_pad: int = 70,
                             include_hidden: bool = False) -> dict:
         """Auto-fit every column's width in a view so its HEADER text is fully
         visible in the UI. Header-only BY DESIGN (user directive 2026-08-06):
