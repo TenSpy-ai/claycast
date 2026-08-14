@@ -462,6 +462,34 @@ clay.create_action_column(rep_table, "SFDC Role (SOQL)",
 
 2. **Sandbox orgs munge emails → exact match returns zero rows.** If the auth-account name contains `test` / `sandbox` / `--` (e.g. `API_Read_Only_spstest`), it's a sandbox, and Salesforce appends a suffix like `.invalid` or `.<sandboxname>` to every User's `Email`. So `WHERE Email = 'x@co.com'` silently returns "no records found" (a clean run, not an error). Use `WHERE Email LIKE 'x@co.com%'` plus a `Name IN (...)` fallback instead of equality.
 
+### Salesforce: Create Object / Update Object — payload shapes + duplicate rules (verified 2026-08-13)
+
+Write actions against the connected Salesforce org (keys discoverable via
+`search_enrichments("salesforce")`; same package family as the lookup actions above —
+resolve auth fresh via `list_auth_accounts_by_type('salesforce')`).
+
+**Success payload shapes — read via `externalContent.fullValue`, per-record GET only:**
+
+- **create-object** success: `{"CRMLink": ..., "recordId": ..., "createdSuccess": true}` —
+  there is **NO `.id` / `.Id` key**; downstream extractors must use `?.recordId`.
+- **update-object** success: `{"CRMLink": ..., "updateSuccess": true}`.
+- **Bulk row fetches return display strings for these cells** (e.g. `'✅ Record created'`),
+  not the payload — `bulk-fetch-records` carries no `externalContent`, so reading the
+  real payload requires the per-record endpoint (`GET /tables/{t}/records/{r}` /
+  `get_action_cell_values`). Same preview-vs-truth rule as the general action-cell
+  gotcha, but here even the "value" is decorative.
+
+**`duplicate_rule_override` (create-object optional boolean input):**
+
+- Unbound by default — a bare create-object column does NOT bypass org duplicate rules.
+- Honored when the org's duplicate rules are **alert-type with `allowSave: true`**
+  (block-type rules still block).
+- Bind it CONDITIONALLY with a formula (e.g. `"!!{{f_flag_id}}"`) so only the rows you
+  intend bypass the rule — a static `true` bypasses for every row.
+- A `DUPLICATES_DETECTED` error is **refunded**: the cell metadata shows
+  `isRefunded: true` and the run costs 0 credits — duplicate-blocked rows are free,
+  not silent spend.
+
 ---
 
 ## 7. Social
@@ -528,6 +556,12 @@ clay.create_column(t_id, {
 - **gate refs are DAG edges (verified 2026-08-06):** a gate referencing a column that
   transitively depends back on the gated column (even only via another column's gate)
   is rejected with `400 "Dag is cyclical"` — gate only on strictly-upstream columns.
+- **type-mismatch dead gates (verified 2026-08-13):** (a) a TEXT formula gate feeder
+  stringifies booleans — the stored `'false'` is truthy, so `{{gate}}` / `!{{gate}}`
+  never block; the feeder must emit `"true"`/`""` via ternary. (b) a BOOLEAN column
+  compared to a string literal (`{{bool}} != "true"`) is ALWAYS true — use `!{{bool}}`.
+  Audit: resolve each referenced field's `dataTypeSettings.type` before trusting any
+  gate comparison. Full write-up: clay-api-reference.md § Conditional Execution.
 
 ---
 

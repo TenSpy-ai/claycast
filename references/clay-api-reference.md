@@ -271,7 +271,10 @@ in your code.
   false at arrival (upstream lookup pending) but true 20s later FIRES if it carries
   `delaySettings: {"type": "delay-seconds", "delayFormulaText": "20"}` (proven live). This
   makes the delay the standard sequencer for gate-on-upstream-action patterns; without it,
-  the column silently never runs.
+  the column silently never runs. (Re-verified 2026-08-13: this is the arrival-race fix —
+  under `AUTO_RUN_MODE: keep_existing` the gate is evaluated ONCE per row and never
+  re-evaluated, so a gate that reads still-empty upstream cells at arrival skips forever;
+  `delaySettings` defers that one-time evaluation past the upstream fill.)
 - **Table column cap:** creating a field on a ~100-column table 400s with
   `"cannot create new field due to table size limit"` / "column limit". Plan retrofits as
   repoint-in-place (PATCH existing formulas, keep fids so readers stay wired) instead of
@@ -280,9 +283,12 @@ in your code.
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
 - **`typeSettings.runAsButton: true` = the UI's "Click to run" mode (verified 2026-08-06):**
   the column never auto-runs regardless of table AUTO_RUN or gates — a third blocking layer
-  beyond table-level AUTO_RUN_ON and conditionalRunFormulaText. Columns cloned from
+  beyond table-level AUTO_RUN_ON and conditionalRunFormulaText, and therefore THE
+  per-column mechanism for shipping action columns dark. Columns cloned from
   manually-operated tables carry it silently; audit for it when activating a pipeline
-  (`ts.get('runAsButton')`), and PATCH it false for autonomous columns.
+  (`ts.get('runAsButton')`). To arm, REMOVE the key from `typeSettings` entirely
+  (verified 2026-08-13: removal — not setting `false` — byte-matches auto-armed sibling
+  columns; PATCHing it `false` also disarms but leaves a nonstandard key).
 - **Non-force `run_column` on `execute-subroutine` columns parks at `QUEUED` and never
   dispatches (verified 2026-08-06):** the caller cell shows status `QUEUED`, no intake row
   ever lands in the function — even on a LIVE (AUTO_RUN on) table with a passing gate.
@@ -1340,7 +1346,8 @@ clay.session.patch(
 # Column type auto-promotes from "text" to "formula" after successful PATCH
 ```
 
-- Retyping a formula column to `text` in one PATCH is DESTRUCTIVE (verified 2026-08-06): it clears `formulaText` AND wipes the previously computed values from ALL rows. No undo — export first if the computed values matter. This applies to `apply_field_operations`' `retype` op too (docstring updated to match). (Related: editing a formula via PATCH does NOT recompute existing rows — see the replication side-effects section.)
+- Retyping a formula column to `text` in one PATCH is DESTRUCTIVE (verified 2026-08-06): it clears `formulaText` AND wipes the previously computed values from ALL rows. No undo — export first if the computed values matter. This applies to `apply_field_operations`' `retype` op too (docstring updated to match). (CORRECTED 2026-08-13: editing a formula via PATCH DOES recompute the edited column immediately across existing rows; what it does NOT do is retro-fire armed downstream ACTION columns — see the replication side-effects section.)
+- **TEXT formula columns stringify boolean results (verified 2026-08-13):** a formula on a `text`-typed column that evaluates to `false` stores the STRING `'false'`, which is truthy downstream — any consumer doing `!!{{col}}`, `!{{col}}`, or bare-reference truthiness sees it as true. When a formula column's output feeds gates or boolean checks, emit `"true"` / `""` via ternary (`cond ? "true" : ""`) instead of returning the boolean. See "Type-mismatch dead gates" under Conditional Execution for the gate-side twin of this bug.
 
 ### Formula Syntax — What Clay Actually Supports
 
@@ -1563,6 +1570,25 @@ same as cycles through formula values. Practical rule: a spend-gate must only re
 columns strictly upstream of the gated column; when a helper formula aggregates from
 multiple lookups, gate on the specific upstream lookup's raw path instead of the
 aggregate.
+
+**Type-mismatch dead gates — a bug class in BOTH directions (verified 2026-08-13):**
+gate comparisons silently die when the referenced field's data type doesn't match the
+comparison's assumption. Both directions found live the same day (a sequencer-readiness
+gate that never blocked; two always-true conjuncts in an approval gate):
+
+- **(a) TEXT-typed formula gate feeders:** a `text` formula column stringifies boolean
+  results — the cell holds the STRING `'false'`, which is truthy, so a gate written as
+  `{{gate_col}}` or `!{{gate_col}}` NEVER blocks. Fix at the feeder: the gate formula
+  must emit `"true"` / `""` via ternary so emptiness carries the false case.
+- **(b) BOOLEAN-typed columns vs string literals:** `{{bool_col}} != "true"` is ALWAYS
+  true (the boolean coerces numerically, `"true"` → `NaN`, and `1 != NaN`) — the
+  conjunct is dead weight that blocks nothing. Compare booleans as booleans:
+  `!{{bool_col}}` / `{{bool_col}}`.
+
+Auditing rule: before trusting ANY gate comparison, resolve each referenced field's
+`dataTypeSettings.type` and check the comparison's literals against it — a gate that
+"reads fine" in prose can be provably dead by type. A dead gate = unconditional spend
+under AUTO_RUN.
 
 **Delayed execution — `delaySettings` (verified 2026-08-06):** action columns accept
 `delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` in `typeSettings`.
@@ -2254,10 +2280,10 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - `POST /v3/workbooks` accepts `parentFolderId` at create (honored), but `settings: {"isAutoRun": false}` in the create body is NOT persisted — the response echoes `settings: {}` (verified 2026-07-23). The effective dark control is per-table: `PATCH /v3/tables/{t}` with `{"tableSettings": {"AUTO_RUN_ON": false}}`. Workbook settings PATCH path is `PATCH /v3/{ws}/workbooks/{wb}` (NOT `/v3/workbooks/{wb}`, which 404s) — used for `settings.tablePresentationSettings` (table order in the sidebar, `{table_id: index}`). The same workspace-scoped path pattern applies to Terracotta workflows — see "Terracotta (tc-workflows) metadata endpoints" below.
 - **Flipping `AUTO_RUN_ON` back to true BACKFILLS (verified 2026-08-06):** every stale/empty auto-run cell across the whole table fires immediately — credit spend at full-table scale, not just new rows. Activation sequence for dark builds: load data → sample-QA a few rows (UI Run) → THEN flip AUTO_RUN. Keep it off during imports.
   - Re-add any conditional-run gates you removed while debugging BEFORE the flip — gateless action columns backfill unconditionally.
-  - Stale-marker cells are not real values: they re-run on the flip. Spend at flip time is the backfill, not a runaway (false burn alarm); conversely, "values" visible pre-flip don't mean the work ran.
+  - Stale-marker cells are not real values: they re-run on the flip. Spend at flip time is the backfill, not a runaway (false burn alarm); conversely, "values" visible pre-flip don't mean the work ran. (2026-08-13: the markers live in cell metadata as `isStale: true` + `staleReason` — observed values `TABLE_AUTO_RUN_KEEP_EXISTING_RERUN` and `FIELD_AUTO_RUN_OFF`; formula edits that recompute upstream cells produce exactly these markers on armed action columns without firing them.)
 - **Auto-fit column widths (added 2026-08-06, header-only by design):** `autofit_view_fields(table_id, view_id, min_width=100, max_width=480)` sizes every VISIBLE column so its HEADER text is fully readable with breathing room: width = clamp(header_pad(70) + 8px/char × column-name length) — defaults loosened 2026-08-06 after the first pass ran tight. Cell content is deliberately ignored — no row reads, no sampling (user directive: headers only). One `set_view_fields` PATCH, idempotent. Live run: 85 columns in one call, widths verified persisted, math exact.
 - **Wrapped in claycast (2026-07-21):** the whole view surface above is now SDK methods — `list_views`, `create_view` (applies filter/sort via the sub-endpoints automatically), `update_view`, `delete_view`, `set_view_filter`, `set_view_sort`, `set_view_fields` (visibility+width), `set_view_field_order` (`move_field` walk) — plus `preflight(table_id=)` for the write-restricted-cookie check. All live-smoke-tested (create→configure→reorder→rename→delete).
-- (`formulaType` requirement on formula PATCH was already documented above — see "PATCH formula requires `formulaType`".) New nuance: editing a formula via PATCH does NOT recompute existing rows; only new rows or input-cell writes trigger evaluation.
+- (`formulaType` requirement on formula PATCH was already documented above — see "PATCH formula requires `formulaType`".) CORRECTED 2026-08-13 (supersedes the 2026-07-21 claim that formula edits don't recompute existing rows): **editing a formula via PATCH DOES recompute the edited formula column immediately across existing rows.** What a formula edit does NOT do is retro-fire armed downstream ACTION columns under `AUTO_RUN_MODE: keep_existing` — the affected action cells only gain `isStale` metadata markers (`staleReason: TABLE_AUTO_RUN_KEEP_EXISTING_RERUN` / `FIELD_AUTO_RUN_OFF`), the false-burn-alarm pattern: they re-run at the next AUTO_RUN flip/backfill, not at edit time.
 
 **Replication addendum — seed rows, dangling refs, brakes, bitmaps (verified 2026-08-06):**
 

@@ -3549,6 +3549,11 @@ class ClayClient:
         can under-report. Repoint references first (`get_field_references`), or
         pass `force=True`.
 
+        Ordering (2026-08-13): when removing several columns that reference
+        EACH OTHER one call at a time, delete referencers before referencees —
+        deleting the referencee first trips this guard. Or pass them all in a
+        single call: references from columns inside the delete set are ignored.
+
         Endpoint: `DELETE /tables/{t}/fields` body `{"fieldIds": [...]}` — the
         bulk primitive Clay's UI uses for single and multi-column deletes.
         """
