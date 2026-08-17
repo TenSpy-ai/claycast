@@ -379,6 +379,54 @@ Pull the `inputsBinding` array from the real POST and mirror it in `create_actio
 
 ---
 
+## Build pattern — sequence columns with GATES, not delays
+
+**This is the default way to order work in a Clay table.** When a column must wait for an
+upstream column, express the dependency in the run condition:
+
+```python
+# RIGHT — the dependency itself holds the column
+"conditionalRunFormulaText": "!!{{f_upstream}}"
+"conditionalRunFormulaText": "(!!{{f_a}}) && !!{{f_b}}"     # several upstreams
+
+# WRONG — a wall-clock guess standing in for the dependency
+"delaySettings": {"type": "delay-seconds", "delayFormulaText": "300"}
+```
+
+Reaching for `delaySettings` "so upstream has time to finish" is a recurring build mistake —
+treat it as a smell, not a technique. A delay is wrong in both directions: too short and the
+column fires on empty upstream cells anyway; too long and every row pays that latency even
+when upstream returned instantly. Delays also compound down a chain — one production table
+was found carrying six stacked delays totalling **~31 minutes of dead latency per row**, and
+all six columns *already* had correct `conditionalRunFormulaText` gates. The delays did
+nothing the gates weren't already doing.
+
+Rules:
+
+- **Default to `!!{{upstream}}` for all sequencing.** Only consider a delay after a gate has
+  been proven insufficient for that specific column, and record why.
+- **`!!` means "has produced output yet", not "is true".** A `text` column holding the string
+  `'false'` is truthy, so `!!` will pass it. For truth-testing, make the feeder emit
+  `"true"`/`""` and compare `== "true"` — see the type-mismatch dead-gate entry in the
+  reference.
+- **Gates are DAG edges.** Reference only columns strictly upstream; a cycle through a gate
+  is rejected with `400 "Dag is cyclical"`.
+- **Auto-run only.** Under API-driven `run_column`, gated columns skip silently and
+  `force_run` bypasses the gate entirely — never rely on gates for scripted runs.
+- **Auditing an inherited table:** a column carrying BOTH a real gate and a delay is a
+  removal candidate. Scan with
+  `re.search(r'"delayFormulaText": "([^"]*)"', json.dumps(f["typeSettings"]))`.
+
+One narrow exception is still on the books — the arrival-race note under "Action-column
+scheduling model" in `references/clay-api-reference.md`, which holds that a gate is evaluated
+once per row and a gate reading a still-empty upstream skips forever. That finding is
+contradicted by live tables where gates on action-derived upstreams run fine with no delay, so
+it is **not** a license to add delays by default. Gate first; only if a specific column
+demonstrably never fires should you reach for a delay, and then say so in the column
+description.
+
+---
+
 ## Gotchas
 
 Highest-risk items only. Full list in `references/clay-api-reference.md` (see its Gotchas section).

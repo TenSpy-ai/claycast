@@ -269,12 +269,28 @@ in your code.
   no-op formula dependency on another column does not help. The run condition is evaluated
   at execution time — so **`delaySettings` defers gate evaluation**: a column whose gate is
   false at arrival (upstream lookup pending) but true 20s later FIRES if it carries
-  `delaySettings: {"type": "delay-seconds", "delayFormulaText": "20"}` (proven live). This
-  makes the delay the standard sequencer for gate-on-upstream-action patterns; without it,
-  the column silently never runs. (Re-verified 2026-08-13: this is the arrival-race fix —
-  under `AUTO_RUN_MODE: keep_existing` the gate is evaluated ONCE per row and never
-  re-evaluated, so a gate that reads still-empty upstream cells at arrival skips forever;
-  `delaySettings` defers that one-time evaluation past the upstream fill.)
+  `delaySettings: {"type": "delay-seconds", "delayFormulaText": "20"}` (proven live).
+  (Re-verified 2026-08-13: under `AUTO_RUN_MODE: keep_existing` the gate was observed
+  evaluated ONCE per row; `delaySettings` defers that one-time evaluation past the
+  upstream fill.)
+
+  **DISPUTED — do NOT read this as "delays are the standard sequencer" (2026-08-17).** That
+  earlier prescription is the direct cause of a recurring build mistake. Counter-evidence
+  from a live production people-table: four action columns whose gates reference
+  **action**-derived upstreams (two Salesforce lookups, an enrichment, and a record update)
+  carry **no delay at all** and run correctly — while a subroutine-caller column carries a
+  90s delay whose gate references only a formula. Delays in that table are applied
+  inconsistently with the actual dependency graph, i.e. cargo-culted rather than
+  load-bearing. Across that table and its structural clone, 11 columns carry delays
+  (90s–600s) and **every one already has a correct `conditionalRunFormulaText`**; the clone's
+  chain alone stacks ~31 min of dead latency per row.
+
+  **Standing rule: gate first, always** — `!!{{upstream}}`, `&&`-combined for several. Only
+  add `delaySettings` for a specific column that demonstrably never fires on a gate alone,
+  and note the reason in the column description. Full rule in SKILL.md → "Build pattern —
+  sequence columns with GATES, not delays". The arrival-race mechanism above deserves a
+  clean re-probe (single table, one gated action column on an async upstream, with and
+  without delay) before it is trusted as general behavior.
 - **Table column cap:** creating a field on a ~100-column table 400s with
   `"cannot create new field due to table size limit"` / "column limit". Plan retrofits as
   repoint-in-place (PATCH existing formulas, keep fids so readers stay wired) instead of
@@ -1592,9 +1608,19 @@ under AUTO_RUN.
 
 **Delayed execution — `delaySettings` (verified 2026-08-06):** action columns accept
 `delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` in `typeSettings`.
-Recipe upgrade: put it on the results-GET column of the workflow-as-routine pattern to
-absorb the run-completion race (poll after 60s) instead of the manual re-run /
-AUTO_RUN-cascade workarounds documented there.
+
+**Use this as a LAST RESORT, not as a sequencer.** To make a column wait for an upstream
+column, gate it — `conditionalRunFormulaText: "!!{{f_upstream}}"` — because that encodes the
+real dependency instead of guessing wall-clock timing. Adding a delay "so upstream can
+finish" is a recurring build mistake; see SKILL.md → "Build pattern — sequence columns with
+GATES, not delays" and the DISPUTED block under "Action-column scheduling model" for the live
+counter-evidence (11 columns carrying redundant delays on top of already-correct gates).
+
+Legitimate remaining use: absorbing a **completion race against an external system that the
+table cannot observe** — e.g. the results-GET column of the workflow-as-routine pattern, where
+there is no upstream Clay cell to gate on because the run is finishing remotely. Poll after
+60s instead of the manual re-run / AUTO_RUN-cascade workarounds documented there. If a Clay
+cell exists that flips when the work is done, gate on that cell instead.
 
 ---
 
