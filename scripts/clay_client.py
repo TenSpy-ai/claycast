@@ -1049,13 +1049,137 @@ class ClayClient:
             return res
         return res.get("results", res.get("workspaces", res.get("data", [])))
 
-    def list_tables(self, folder_id: str = None) -> list[dict]:
-        """List all tables in the workspace, optionally filtered by folder."""
+    def list_tables(
+        self,
+        folder_id: str = None,
+        *,
+        include_functions: bool = True,
+    ) -> list[dict]:
+        """List the workspace's tables — regular data tables AND function tables.
+
+        Clay splits these across two endpoints and `GET /workspaces/{ws}/tables`
+        returns ONLY the regular ones. Function tables (Clay "functions" /
+        subroutines) live behind `GET /workspaces/{ws}/subroutines` and are
+        invisible here unless you go get them — which is why this method fetches
+        both. Verified live 2026-08-18 against workspace 12345: `/tables`
+        returned 212 tables, NONE carrying `tableSettings.BLOCK_TYPE ==
+        "SUBROUTINE"`, while `/subroutines` returned 31 more that all did, with
+        zero id overlap between the two sets.
+
+        The two kinds are not interchangeable and must not be read as one
+        undifferentiated list of "tables":
+
+        * `_kind == "TABLE"` — an ordinary data table you browse rows in.
+        * `_kind == "FUNCTION_TABLE"` — a callable Clay function. It is a
+          `spreadsheet` table underneath, but you INVOKE it (from an
+          `execute-subroutine` column, or a registered routine) rather than
+          reading it, and each call can cost credits.
+
+        Every item is the raw Clay table object plus synthetic `_`-prefixed keys,
+        so the distinction survives being merged into one list:
+
+            {..., "_kind": "TABLE"}
+
+            {..., "_kind": "FUNCTION_TABLE",
+                  "_note": "Function table (subroutine): CALLED, not browsed...",
+                  "_function": {"source_id": ..., "inputs": [...], "cost": ...,
+                                "action_execution_cost": ...,
+                                "contains_variable_pricing": ...,
+                                "reference_count": ..., "is_clay_managed": ...}}
+
+        Regular tables come first and function tables last, so reading only the
+        head of the list never silently mixes the two.
+
+        Args:
+            folder_id: sent as `parentFolderId` to `/tables`. WARNING: Clay
+                IGNORES it — verified live 2026-08-18, a real folder id and the
+                string `"garbage_xyz"` both returned the identical full
+                212-table set (and 211 of those 212 carry
+                `parentFolderId: null`, because tables belong to workbooks, not
+                folders). Kept for signature compatibility; do not rely on it to
+                scope results. It is deliberately NOT forwarded to
+                `/subroutines`, which DOES honor the param — forwarding it would
+                drop every function table whenever a folder was named, since all
+                function tables sit at the workspace root.
+            include_functions: pass False to skip the `/subroutines` call and get
+                regular tables only (one request instead of two). Items are still
+                `_kind`-tagged.
+        """
         params = {}
         if folder_id:
             params["parentFolderId"] = folder_id
         res = self.get(f"/workspaces/{self.workspace_id}/tables", params=params)
-        return res.get("results", res)
+        raw = res.get("results", res) if isinstance(res, dict) else res
+        tables = [{**t, "_kind": "TABLE"} for t in raw or []]
+        if not include_functions:
+            return tables
+        return tables + self.list_function_tables()
+
+    def list_function_tables(self) -> list[dict]:
+        """List ONLY the function tables (Clay "functions" / subroutines),
+        normalized to look like `list_tables()` entries.
+
+        These never appear in `GET /workspaces/{ws}/tables` (see `list_tables`),
+        so this is the only way to enumerate them. Source:
+        `GET /workspaces/{ws}/subroutines` -> `{"subroutines": [...]}`, where
+        each item wraps the function's underlying table plus its pricing/usage
+        metadata (verified live 2026-08-18 against workspace 12345, 31 items):
+
+            {"sourceId": "s_...",       # the subroutine input source
+             "table": {...},           # full table obj, BLOCK_TYPE=SUBROUTINE
+             "cost": 1.1,              # credits per call
+             "actionExecutionCost": ..., "containsVariablePricing": bool,
+             "referenceCount": 19,     # how many columns currently call it
+             "managedSubroutineSubscription": {...} | None}
+
+        Returned items spread `table` flat, tag it `_kind == "FUNCTION_TABLE"`,
+        and fold the wrapper metadata into `_function` — so they concatenate with
+        regular tables without losing the distinction.
+        `_function["is_clay_managed"]` separates Clay's built-in catalog
+        functions from ones this workspace authored (19 vs 12 in the smoke).
+
+        Declared inputs are surfaced as `_function["inputs"]` (names only); the
+        full specs stay where Clay puts them, at
+        `tableSettings.SUBROUTINE_INPUTS`.
+
+        `_function["routine_id"]` is the `function:{table_id}` handle you CALL
+        the function by (`POST /public/v0/routines/{routine_id}/run`) — it only
+        resolves once the function is registered in the workspace tools
+        registry, and UI-built functions do NOT auto-register (see
+        clay-api-reference.md § "Creating a custom function (subroutine table)
+        via API").
+        """
+        res = self.get(f"/workspaces/{self.workspace_id}/subroutines")
+        subs = res.get("subroutines", res) if isinstance(res, dict) else res
+        out: list[dict] = []
+        for sub in subs or []:
+            table = sub.get("table") or {}
+            settings = table.get("tableSettings") or {}
+            block_settings = settings.get("BLOCK_SETTINGS") or {}
+            out.append({
+                **table,
+                "_kind": "FUNCTION_TABLE",
+                "_note": (
+                    "Function table (subroutine): CALLED from an "
+                    "execute-subroutine column or a registered routine, not "
+                    "browsed like a data table. Calls can cost credits."
+                ),
+                "_function": {
+                    "source_id": sub.get("sourceId"),
+                    "routine_id": f"function:{table.get('id')}" if table.get("id") else None,
+                    "inputs": [
+                        i.get("inputName")
+                        for i in settings.get("SUBROUTINE_INPUTS") or []
+                    ],
+                    "cost": sub.get("cost"),
+                    "action_execution_cost": sub.get("actionExecutionCost"),
+                    "contains_variable_pricing": sub.get("containsVariablePricing"),
+                    "reference_count": sub.get("referenceCount"),
+                    "is_clay_managed": bool(sub.get("managedSubroutineSubscription"))
+                    or block_settings.get("isClayManaged") is True,
+                },
+            })
+        return out
 
     def list_folders(self) -> list[dict]:
         """List top-level folders and resources."""
@@ -5022,6 +5146,13 @@ class ClayClient:
         return res if isinstance(res, list) else res.get("accounts", [])
 
     def list_subroutines(self) -> list[dict]:
+        """Raw `GET /workspaces/{ws}/subroutines` — the workspace's function
+        tables exactly as Clay returns them (each item wraps `table` plus
+        pricing/usage metadata).
+
+        Prefer `list_function_tables()`, which flattens the same payload into
+        `list_tables()`-shaped, `_kind`-tagged entries.
+        """
         res = self.get(f"/workspaces/{self.workspace_id}/subroutines")
         return res.get("subroutines", res)
 
@@ -6132,11 +6263,16 @@ if __name__ == "__main__":
 
     print("\n--- Tables ---")
     tables = clay.list_tables()
-    for t in tables[:10]:
-        rtype = t.get("resourceType", "")
-        name = t.get("name", "?")
-        rid = t.get("id", "")
-        print(f"  [{rtype}] {name} ({rid})")
+    regular = [t for t in tables if t.get("_kind") == "TABLE"]
+    functions = [t for t in tables if t.get("_kind") == "FUNCTION_TABLE"]
+    print(f"  {len(regular)} data tables + {len(functions)} function tables")
+    for t in regular[:10]:
+        print(f"  [TABLE]    {t.get('name', '?')} ({t.get('id', '')})")
+    for t in functions[:10]:
+        fn = t.get("_function", {})
+        managed = "clay-managed" if fn.get("is_clay_managed") else "workspace"
+        print(f"  [FUNCTION] {t.get('name', '?')} ({t.get('id', '')}) "
+              f"{managed}, cost={fn.get('cost')}, inputs={fn.get('inputs')}")
 
     print("\n--- Auth Accounts ---")
     accounts = clay.list_auth_accounts()
@@ -6146,7 +6282,7 @@ if __name__ == "__main__":
 
     print("\n--- Formula generation test ---")
     # Use a real table id from the list above to test
-    tables_only = [t for t in tables if t.get("resourceType") == "TABLE"]
+    tables_only = regular
     if tables_only:
         tid = tables_only[0]["id"]
         result = clay.generate_formula(tid, "If company name is empty, output 'Unknown'")

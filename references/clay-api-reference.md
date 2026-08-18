@@ -2581,6 +2581,33 @@ Operational notes:
 - http-api-v2 is a BILLABLE workflow action: a post-loop cost ~1.6 data credits + 3 action executions per contact even though the public search API call it made is itself free — the HTTP plumbing bills, not the API. Contrast: the native Find People TABLE SOURCE imports rows at 0 credits (observed: 22 contacts via workflow HTTP ≈ 102 credits vs 200 free source rows). When a native source covers the job, use it; reserve http-api-v2 workflow calls for what sources can't do.
 - Pricing introspection: the 2026-08-05 clay-spy capture surfaced `GET /v3/workspaces/{id}/model-pricing/base-costs` (per-model credit base costs; a tc-workflow `input-schemas` GET rode the same capture). Read base-costs before estimating AI-heavy runs — raw shapes live in the capture JSONL; flesh out the entry when first used in anger.
 
+### Listing function tables — absent from `/tables` (verified 2026-08-18)
+
+Function tables are **invisible to the ordinary tables listing**. Against workspace
+12345: `GET /workspaces/{ws}/tables` returned 212 tables, **zero** of them carrying
+`tableSettings.BLOCK_TYPE == "SUBROUTINE"` (observed BLOCK_TYPEs: `null` x193,
+`MESSAGING` x9, `BULK_ENRICHMENT` x6, `MESSAGING_EVENTS` x4), while
+`GET /workspaces/{ws}/subroutines` returned 31 more that were **all** `SUBROUTINE` /
+`type: "spreadsheet"`. The two id sets do not overlap at all. Anything that enumerates
+"the workspace's tables" from `/tables` alone is silently missing every function.
+
+`/subroutines` envelope: `{"subroutines": [...]}`; per item —
+`sourceId`, `table` (the full table object), `cost` (credits per call),
+`actionExecutionCost`, `containsVariablePricing`, `referenceCount` (how many columns
+call it), `managedSubroutineSubscription` (non-null ⇔ `BLOCK_SETTINGS.isClayManaged`,
+i.e. a Clay catalog function rather than a workspace-authored one — 19 vs 12 here).
+
+- **`parentFolderId` is IGNORED by `/tables`.** A real folder id and the literal
+  `"garbage_xyz"` both returned the same full 212-table set. It is not a filter; 211 of
+  the 212 carry `parentFolderId: null` because tables belong to **workbooks**, not
+  folders. `/subroutines` *does* react to the param, but every function table sits at
+  the workspace root (`parentFolderId: null` x31), so passing any folder there yields 0.
+- **Wrapped (2026-08-18):** `clay.list_function_tables()` returns the functions
+  flattened into `list_tables()`-shaped dicts tagged `_kind: "FUNCTION_TABLE"` (with
+  `_function` metadata); `clay.list_tables()` now returns regular tables (`_kind:
+  "TABLE"`) followed by function tables, and `list_tables(include_functions=False)`
+  restores the old single-request behavior.
+
 ### Creating a custom function (subroutine table) via API (verified 2026-07-31)
 
 - **UI-built function tables do NOT auto-register in the workspace tools registry**
