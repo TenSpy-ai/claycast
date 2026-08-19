@@ -687,11 +687,35 @@ def _build_match_index(records, match_field_id):
 
 
 
+import re as _re_module
+
 _BODY_EXPR_TOKENS = (
     ("||", "logical OR"), ("??", "nullish coalescing"), ("==", "equality"),
-    ("!=", "inequality"), ("?.", "optional chaining"), ("JSON.stringify", "JSON.stringify"),
+    ("!=", "inequality"), ("JSON.stringify", "JSON.stringify"),
     ("Number(", "Number()"), ("new Date", "new Date"), (">=", "comparison"), ("<=", "comparison"),
 )
+
+# A field reference plus any path accessors that belong to the TOKEN itself:
+#   {{f_x}}            {{f_x}}?.key        {{f_x}}.key
+#   {{f_x}}?.[0]       {{f_x}}?.a?.b       {{f_x}}[0].name
+# Clay's own UI writes nested references this way and renders them as a single
+# field pill, so `?.` and `.` inside a reference are NOT expressions.
+_FIELD_REF_RE = _re_module.compile(
+    r"\{\{[^{}]+\}\}(?:\s*\??\.\s*[A-Za-z_$][\w$]*|\s*\??\[[^\]]*\])*"
+)
+
+
+def _strip_field_refs(body: str) -> str:
+    """Remove `{{field}}` tokens together with their path accessors.
+
+    Path accessors (`?.key`, `.key`, `?.[0]`, `[0]`) are part of the reference
+    token as Clay's UI writes it, not operators acting on the concatenation --
+    so they must be removed before scanning for real expressions, or a perfectly
+    canonical body like
+        "..." + Clay.formatForJSON({{f_x}}?.normalizedUrl) + "..."
+    would be flagged by the bare `?.` it contains.
+    """
+    return _FIELD_REF_RE.sub("@REF@", body)
 
 
 def _find_body_expression(body: str):
@@ -701,16 +725,17 @@ def _find_body_expression(body: str):
     Any expression in a body makes the column's inputs render BLANK in the Clay
     UI while the column still runs correctly -- verified 2026-08-19 across ||
     (inside and outside Clay.formatForJSON), ??, ternaries, == and arithmetic.
-    Only string literals, `+` concatenation, bare {{field}} refs and
-    Clay.formatForJSON({{field}}) calls are safe.
+    Safe content is: string literals, `+` concatenation, `{{field}}` references
+    (with their path accessors), and Clay.formatForJSON({{field}}) calls.
     """
+    scan = _strip_field_refs(body)
     for tok, label in _BODY_EXPR_TOKENS:
-        if tok in body:
+        if tok in scan:
             return tok, label
-    # ternary: a '?' that is not part of '?.' or '??'
-    for i, ch in enumerate(body):
-        if ch == "?" and body[i:i + 2] not in ("?.", "??") and body[i - 1:i + 1] != "??":
-            if ":" in body[i:]:
+    # ternary: a '?' surviving the field-ref strip, paired with a ':'
+    for i, ch in enumerate(scan):
+        if ch == "?" and scan[i:i + 2] not in ("?.", "??") and scan[i - 1:i + 1] != "??":
+            if ":" in scan[i:]:
                 return "? :", "ternary"
     return None
 

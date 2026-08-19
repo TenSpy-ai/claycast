@@ -753,9 +753,23 @@ known-good baseline except for one operator, all pinned and unrun:
 
 So the position of the operator is irrelevant — inside a `formatForJSON` argument or free in the
 concatenation, both break. The body must contain **nothing but** string literals, `+`
-concatenation, bare `{{field}}` refs and `Clay.formatForJSON({{field}})` calls. Everything else —
-`||`, `??`, `?:`, `==`, arithmetic, `JSON.stringify`, `new Date`, optional chaining — belongs in a
-formula column that the body then references.
+concatenation, `{{field}}` references and `Clay.formatForJSON({{field}})` calls. Everything that
+*operates on a value* — `||`, `??`, `?:`, `==`, arithmetic, `JSON.stringify`, `new Date` —
+belongs in a formula column that the body then references.
+
+**IMPORTANT EXEMPTION — path accessors on a field reference are SAFE.**
+`{{Field}}?.key`, `{{Field}}.key`, `{{Field}}?.[0]` and longer chains are part of the *reference
+token*, not expressions acting on the concatenation. Clay's own UI writes a reference into a
+JSON-valued column exactly this way and renders it as a single field pill, sandwiched by `+` like
+any other reference:
+
+```javascript
+"...\"keyword\": \"site:" + Clay.formatForJSON({{Normalize a Domain}}?.normalizedUrl) + " ..."
+```
+
+That body renders fine. The distinction that matters is **addressing a field** (safe, any depth)
+versus **computing on a value** (breaks). A naive "contains `?.`" check is a false positive — strip
+`{{…}}` tokens together with their trailing accessor chain *before* scanning for operators.
 
 Note the API is indifferent: Clay accepted every one of these bodies without a `settingsError`.
 The failure is purely client-side rendering, which is why it goes unnoticed.
