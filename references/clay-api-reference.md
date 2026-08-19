@@ -737,10 +737,31 @@ formula column and reference that column in the body:
 // body:  ... + Clay.formatForJSON({{f_company_or_none}}) + ...
 ```
 
-`format_json_body()` raises `ValueError` on a value containing `||`, and `create_action_column()`
-raises when an `http-api-v2` `body` formulaText contains one. Scope note: `||` is what was tested.
-Other bare operators (`??`, ternaries, arithmetic) are **untested** and presumed equally unsafe —
-treat any non-concatenation expression in a body as suspect until proven otherwise.
+**Scope — now fully tested (2026-08-19). It is NOT specific to `||`: ANY non-concatenation
+expression in the body breaks rendering.** A five-probe sweep, each column identical to the
+known-good baseline except for one operator, all pinned and unrun:
+
+| Probe | Body clause | UI |
+|---|---|---|
+| baseline (no operators) | `Clay.formatForJSON({{f}})` only | **renders** |
+| `\|\|` inside `formatForJSON` | `Clay.formatForJSON(({{f}} \|\| "NONE"))` | blank |
+| ternary | `+ (1 ? "a" : "b") +` | blank |
+| equality | `+ ({{f}} == "x") +` | blank |
+| arithmetic | `+ (Number({{f}}) * 2) +` | blank |
+| nullish `??` | `Clay.formatForJSON({{f}} ?? "NONE")` | blank |
+| `\|\|` OUTSIDE `formatForJSON` | `+ ("" \|\| "fallback") +` | blank |
+
+So the position of the operator is irrelevant — inside a `formatForJSON` argument or free in the
+concatenation, both break. The body must contain **nothing but** string literals, `+`
+concatenation, bare `{{field}}` refs and `Clay.formatForJSON({{field}})` calls. Everything else —
+`||`, `??`, `?:`, `==`, arithmetic, `JSON.stringify`, `new Date`, optional chaining — belongs in a
+formula column that the body then references.
+
+Note the API is indifferent: Clay accepted every one of these bodies without a `settingsError`.
+The failure is purely client-side rendering, which is why it goes unnoticed.
+
+`format_json_body()` and `create_action_column()` raise `ValueError` when they detect any of these
+operators in an `http-api-v2` body.
 
 **CRITICAL: bind the action's FULL parameter list — see "Action columns need the action's FULL parameter list" below; a partial binding renders NO inputs in the Clay UI.**
 
