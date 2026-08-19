@@ -279,6 +279,9 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
     `Clay.formatForJSON({{f_id}})` around each value (escapes quotes/newlines) — use the helper
     **`format_json_body({...})`** from `clay_client.py`. A `formulaMap` body also works but is not what the
     UI writes. (verified 2026-07-24)
+    **Keep the body a PURE concatenation — no `||`, ternaries or other bare JS operators inside it**, or the
+    Clay UI renders the column's inputs blank (verified 2026-08-19). Put any fallback in its own formula
+    column and reference that column instead.
   - `headers`: use `formulaMap` for each header (NOT `formulaText`)
   - `removeNull`, `followRedirects`, `shouldRetry` (optional booleans)
   - **Bind ALL 15 params** (unset as `None`) or the Clay UI shows no inputs for the column — full list:
@@ -290,7 +293,9 @@ Make any HTTP request to external APIs. Used for RapidAPI, HubSpot, Tavily, cust
 - **delayed execution:** action columns accept `delaySettings: {"type": "delay-seconds", "delayFormulaText": "60"}` in typeSettings (verified 2026-08-06) — e.g. a delayed results-GET that absorbs the workflow-run race; see clay-api-reference.md § "Conditional Execution"
 - **auth:** RapidAPI auth account ID from `clay.list_auth_accounts()` (auto-injects API key headers)
 - **gotchas:**
-  - `queryString`, `headers`, `body` MUST use `formulaMap` — `formulaText` with JSON splits chars into numbered rows. Verified 2026-04-23: formulaText `'{"q": hello}'` produced `?0={&1="&2=q...` per char. Don't trust the cell's `"Status Code: 200"` preview — inspect `externalContent.fullValue` to see what Clay actually sent.
+  - `queryString` and `headers` MUST use `formulaMap` — `formulaText` with JSON splits chars into numbered rows. Verified 2026-04-23: formulaText `'{"q": hello}'` produced `?0={&1="&2=q...` per char. Don't trust the cell's `"Status Code: 200"` preview — inspect `externalContent.fullValue` to see what Clay actually sent.
+    **Correction (2026-07-24): `body` is NOT in this list** — it is schema type `longtext` and its canonical binding is `formulaText` + `Clay.formatForJSON()` (see the `body` bullet above). This line previously included `body`; that was wrong and contradicted the bullet list ~15 lines above it.
+  - **NO `||` (or other bare JS operators) inside a `body` formulaText — it makes the column's inputs UNREADABLE in the Clay UI.** Verified 2026-08-19 by controlled A/B. The column still runs correctly and returns the right payload, but opening it in Clay shows a blank body, so nobody can see or edit the request. See clay-api-reference.md § "`||` in an http-api-v2 body renders the column unreadable in the UI".
   - Auth account (RapidAPI) auto-injects `X-RapidAPI-Key` and `Host` headers
   - Use `Clay.secret("token_name")` in formulas for stored secrets
 

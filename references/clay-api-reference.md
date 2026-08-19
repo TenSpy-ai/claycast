@@ -702,6 +702,46 @@ NOT the UI's canonical form — prefer `formulaText` + `Clay.formatForJSON()` so
 identically whether a human or claycast built it, and so values containing quotes/newlines can't break the
 payload.
 
+**CRITICAL: no `||` in the body — see "`||` in an http-api-v2 body renders the column unreadable in the UI" immediately below.**
+
+#### `||` in an http-api-v2 body renders the column unreadable in the UI
+
+**Verified 2026-08-19** by controlled A/B on table `t_xxx`. Two columns were created differing in
+exactly one respect — same 15 params, same `Clay.formatForJSON()`, same `\n` newlines, same
+`headers` formulaMap, same `json` dataType, both `settingsError: null`:
+
+```javascript
+// A (f_xxx) — body VISIBLE in the Clay UI
+"{\n  \"company\": \"" + Clay.formatForJSON({{f_domain}}) + "\"\n}"
+
+// B (f_yyy) — body BLANK in the Clay UI
+"{\n  \"company\": \"" + Clay.formatForJSON(({{f_domain}} || "NONE")) + "\"\n}"
+```
+
+Only B's body fails to render. **The column still works** — it runs, sends the correct JSON, and
+returns the right status — so this is purely a config-visibility failure, which is what makes it
+dangerous: an operator opening the column sees an empty body and reasonably concludes the request
+was never configured, or "someone deleted it".
+
+Estate evidence at time of discovery: of 19 `http-api-v2` columns in the workspace, exactly 3
+contained `||` in the body, and those 3 were precisely the ones reported as showing no body. The
+other 16 — including columns using `Clay.formatForJSON()` and `\n` newlines — all rendered, which
+rules out `formatForJSON` and newlines as the cause and isolates `||`.
+
+**Rule: keep an http-api-v2 `body` a pure concatenation of string literals and
+`Clay.formatForJSON({{field}})` calls.** For a default/fallback value, compute it in its own
+formula column and reference that column in the body:
+
+```javascript
+// formula column "Company (or NONE)":   {{f_domain}} || "NONE"
+// body:  ... + Clay.formatForJSON({{f_company_or_none}}) + ...
+```
+
+`format_json_body()` raises `ValueError` on a value containing `||`, and `create_action_column()`
+raises when an `http-api-v2` `body` formulaText contains one. Scope note: `||` is what was tested.
+Other bare operators (`??`, ternaries, arithmetic) are **untested** and presumed equally unsafe —
+treat any non-concatenation expression in a body as suspect until proven otherwise.
+
 **CRITICAL: bind the action's FULL parameter list — see "Action columns need the action's FULL parameter list" below; a partial binding renders NO inputs in the Clay UI.**
 
 **CRITICAL: `queryString` and `headers` use `formulaMap`, NOT `formulaText`.**

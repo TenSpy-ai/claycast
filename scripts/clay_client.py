@@ -701,6 +701,12 @@ def format_json_body(mapping: dict) -> str:
     differently from a human-built one, and raw values containing a quote or
     newline can break the payload.
 
+    A body must stay a PURE concatenation. A `||` anywhere inside it makes the
+    column's inputs unreadable in the Clay UI (blank body) even though the column
+    still runs correctly -- verified 2026-08-19 by controlled A/B. This function
+    raises `ValueError` on any value containing `||`; put fallbacks in their own
+    formula column and reference that column instead.
+
     Values are rendered by type:
       - `"{{f_xxx}}"` (a lone field reference) -> `Clay.formatForJSON({{f_xxx}})`, quoted
       - `bool`                                  -> bare `true` / `false`
@@ -727,6 +733,17 @@ def format_json_body(mapping: dict) -> str:
     items = list(mapping.items())
     for idx, (key, value) in enumerate(items):
         tail = "," if idx < len(items) - 1 else ""
+        if isinstance(value, str) and "||" in value:
+            raise ValueError(
+                "format_json_body(): value for %r contains '||' (%r).\n"
+                "A '||' inside an http-api-v2 body formulaText makes the column's "
+                "inputs UNREADABLE in the Clay UI - the column still runs and sends "
+                "the correct payload, but opening it in Clay shows a blank body "
+                "(verified 2026-08-19 by controlled A/B).\n"
+                "Fix: compute the fallback in its own formula column "
+                "(e.g. a column whose formula is '{{f_x}} || \"NONE\"') and pass a "
+                "lone reference to THAT column here." % (key, value)
+            )
         if isinstance(value, str) and _re.fullmatch(r"\{\{[^{}]+\}\}", value.strip()):
             literal += '  "%s": "' % key
             pieces.append(("lit", literal))
@@ -4615,6 +4632,20 @@ class ClayClient:
             data_type = ("json"
                          if any(h in akey for h in self._JSON_RESULT_ACTION_HINTS)
                          else "text")
+        if action_key == "http-api-v2":
+            _body = inputs.get("body")
+            if isinstance(_body, str) and "||" in _body:
+                raise ValueError(
+                    "create_action_column(): the http-api-v2 'body' formulaText "
+                    "contains '||', which makes the column's inputs UNREADABLE in "
+                    "the Clay UI. The column would still run and send the correct "
+                    "payload, but opening it in Clay shows a blank body, so nobody "
+                    "can see or edit the request (verified 2026-08-19 by controlled "
+                    "A/B; see references/clay-api-reference.md).\n"
+                    "Fix: keep the body a pure concatenation of string literals and "
+                    "Clay.formatForJSON({{field}}) calls, and move any fallback into "
+                    "its own formula column that the body then references."
+                )
         inputs_binding = []
         for k, v in inputs.items():
             if isinstance(v, dict):
