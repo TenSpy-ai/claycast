@@ -508,3 +508,20 @@ When you discover a missing capability that blocks a real workflow, add it here 
 4. Tier it honestly (1: blocks workflows, 2: high value + workaround-able, 3: nice-to-have)
 
 Keep the tone factual. This is a gap list, not a wishlist.
+
+## Table-level dedupe modes (OPEN — added 2026-08-20)
+
+User reports the Clay UI offers a table-level dedupe mode **"new rows overwrite old rows"**
+(vs the SKIP behavior verified 2026-07 on webhook sources). Unverified — workspace access was
+lost before it could be probed. Open questions:
+- Where does the mode live? `tableSettings` shows `DEDUPE_FIELD_ID` but no mode key was ever
+  observed. Possibly a separate settings key, possibly per-source, possibly UI-only.
+- Are webhook-source dedupe and table dedupe the same mechanism or two layers?
+- In overwrite mode, does the overwritten row re-fire the arrival cascade (gates re-evaluate
+  under `keep_existing`)? If yes, this is the clean re-processing pattern for time-based
+  verdicts (no force-runs).
+
+Probe recipe (needs any workspace): create a table, set the UI dedupe to overwrite on a text
+field, `get_table()` and diff `tableSettings` before/after to find the key; POST the same key
+twice via a webhook source with changed payload and observe row count + cell values + whether
+gated action columns re-evaluate on the second post.

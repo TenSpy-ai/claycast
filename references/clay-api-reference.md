@@ -1767,6 +1767,18 @@ record), with three sharp edges:
   neither creates a row nor updates the existing one — and **new payload keys are never
   merged retroactively** into existing rows. Adding a field to your POST body only reaches
   rows created after the change; backfill needs delete + re-post or a table-side enrichment.
+  - **UNVERIFIED nuance (user-reported 2026-08-20, no API verification possible at the time):**
+    the Clay UI reportedly offers a table-level dedupe MODE setting including
+    **"new rows overwrite old rows"** — i.e. SKIP may be one selectable mode, not the only
+    behavior, and the 2026-07 finding may have been observing the default. If real, overwrite
+    mode is architecturally significant on `keep_existing` tables: a deduped re-post becomes a
+    FRESH row-arrival event, so the whole gate cascade re-evaluates naturally — a clean
+    re-processing path that needs no force-runs (e.g. re-sweeping a person to refresh a
+    time-based verdict). The API shape is unknown: `tableSettings` carries `DEDUPE_FIELD_ID`
+    but no observed mode key. **Verify before designing on it** — probe recipe in
+    feature-gaps.md ("table-level dedupe modes"). Note the possible mechanism split:
+    webhook-SOURCE dedupe (the SKIP finding) vs the TABLE dedupe setting may be two
+    different layers.
 - **Received ≠ written.** The source's `state.numSourceRecords` still increments on every
   accepted POST, including dedupe-skipped ones — don't use it as a row count.
 
