@@ -3,7 +3,9 @@ Clay Browser Helper — Self-Healing API Discovery
 
 UNIX socket daemon wrapping Playwright/Chromium. Captures Clay API traffic
 so Claude Code can discover correct input parameter names for new action types
-without manual HAR exports.
+without manual HAR exports. On Windows (no AF_UNIX, no /tmp) the control channel
+is a loopback TCP socket and the runtime dir lives under the OS temp dir; set
+CLAY_BROWSER_DIR to override the runtime dir on any platform.
 
 Usage:
     python clay_browser.py launch [--headless]
@@ -22,14 +24,65 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
-RUNTIME_DIR = "/tmp/clay-browser"
-SOCK_PATH = "/tmp/clay-browser/server.sock"
-PID_PATH = "/tmp/clay-browser/server.pid"
-REQUESTS_PATH = "/tmp/clay-browser/requests.jsonl"
-LOG_PATH = "/tmp/clay-browser/daemon.log"
+# Windows has no AF_UNIX in CPython and no /tmp; keep POSIX behaviour byte-identical and
+# fall back to a loopback TCP control socket (port recorded in server.port) + the OS temp dir.
+IS_WINDOWS = os.name == "nt"
+USE_UNIX_SOCKET = hasattr(socket, "AF_UNIX")
+RUNTIME_DIR = os.environ.get("CLAY_BROWSER_DIR") or (
+    os.path.join(tempfile.gettempdir(), "clay-browser") if IS_WINDOWS else "/tmp/clay-browser"
+)
+SOCK_PATH = os.path.join(RUNTIME_DIR, "server.sock")
+PORT_PATH = os.path.join(RUNTIME_DIR, "server.port")
+PID_PATH = os.path.join(RUNTIME_DIR, "server.pid")
+REQUESTS_PATH = os.path.join(RUNTIME_DIR, "requests.jsonl")
+LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
+SCREENSHOT_PATH = os.path.join(RUNTIME_DIR, "screenshot.png")
+RUNTIME_FILES = [SOCK_PATH, PORT_PATH, PID_PATH, REQUESTS_PATH, LOG_PATH]
+
+
+def _control_endpoint_exists() -> bool:
+    return os.path.exists(SOCK_PATH if USE_UNIX_SOCKET else PORT_PATH)
+
+
+def _connect_control_socket() -> socket.socket:
+    """Connect to the daemon's control channel (UNIX socket, or loopback TCP on Windows).
+    Raises FileNotFoundError / ConnectionRefusedError / OSError when no daemon is listening."""
+    if USE_UNIX_SOCKET:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCK_PATH)
+        return s
+    with open(PORT_PATH) as f:
+        port = int(f.read().strip())
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(("127.0.0.1", port))
+    return s
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID is running. NOT os.kill(pid, 0) on Windows: CPython maps
+    any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so the 'liveness check' would
+    kill the daemon."""
+    if IS_WINDOWS:
+        import ctypes
+
+        SYNCHRONIZE, WAIT_TIMEOUT = 0x00100000, 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 sys.path.insert(0, os.path.dirname(__file__))
 from clay_client import _load_claysession  # noqa: E402
@@ -152,16 +205,26 @@ class ClayBrowserServer:
     def _serve_forever(self):
         """Accept commands on UNIX socket. 0.5s timeout between accepts
         to let Playwright event handlers fire."""
-        # Clean up stale socket
-        if os.path.exists(SOCK_PATH):
-            os.unlink(SOCK_PATH)
-
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(SOCK_PATH)
+        if USE_UNIX_SOCKET:
+            # Clean up stale socket
+            if os.path.exists(SOCK_PATH):
+                os.unlink(SOCK_PATH)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(SOCK_PATH)
+            endpoint = SOCK_PATH
+        else:
+            # Windows: loopback TCP on an OS-assigned port, advertised via server.port
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            with open(PORT_PATH, "w") as f:
+                f.write(str(port))
+            os.chmod(PORT_PATH, 0o600)
+            endpoint = f"127.0.0.1:{port}"
         sock.listen(1)
         sock.settimeout(0.5)
 
-        print(f"[clay-browser] listening on {SOCK_PATH}", flush=True)
+        print(f"[clay-browser] listening on {endpoint}", flush=True)
 
         while True:
             try:
@@ -230,7 +293,7 @@ class ClayBrowserServer:
         return {"ok": True, "snapshot": snap}
 
     def _cmd_screenshot(self, args) -> dict:
-        path = args.get("path", "/tmp/clay-browser/screenshot.png")
+        path = args.get("path", SCREENSHOT_PATH)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.page.screenshot(path=path, full_page=False)
         return {"ok": True, "path": path}
@@ -339,7 +402,7 @@ class ClayBrowserServer:
         # the open fd stays valid until the response is sent and conn.close()
         # fires. Browser teardown still happens in _shutdown() after the
         # response, since Playwright teardown is slow and racy to do inline.
-        for path in [SOCK_PATH, PID_PATH, REQUESTS_PATH, LOG_PATH]:
+        for path in RUNTIME_FILES:
             if os.path.exists(path):
                 try:
                     os.unlink(path)
@@ -378,10 +441,9 @@ class ClayBrowserClient:
     """Connect to daemon, send command, return result."""
 
     def send(self, cmd: str, **kwargs) -> dict:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.connect(SOCK_PATH)
-        except (FileNotFoundError, ConnectionRefusedError):
+            sock = _connect_control_socket()
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
             return {"ok": False, "error": "Daemon not running. Run: python clay_browser.py launch"}
 
         payload = json.dumps({"cmd": cmd, "args": kwargs}) + "\n"
@@ -412,17 +474,13 @@ def _is_daemon_alive() -> bool:
         return False
     with open(PID_PATH) as f:
         pid = int(f.read().strip())
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return _pid_alive(pid)
 
 
 def _cleanup_stale():
     """Remove stale socket/pid if daemon is dead."""
     if os.path.exists(PID_PATH) and not _is_daemon_alive():
-        for path in [SOCK_PATH, PID_PATH, REQUESTS_PATH, LOG_PATH]:
+        for path in RUNTIME_FILES:
             if os.path.exists(path):
                 os.unlink(path)
 
@@ -451,21 +509,24 @@ def launch_daemon(headless=False):
         flush=True,
     )
 
+    popen_kwargs = {"stdout": open(LOG_PATH, "a"), "stderr": subprocess.STDOUT}
+    if IS_WINDOWS:
+        # start_new_session is POSIX-only; detach so the daemon outlives this CLI process
+        popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         [sys.executable, __file__, "--daemon"] + (["--headless"] if headless else []),
-        stdout=open(LOG_PATH, "a"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+        **popen_kwargs,
     )
 
-    # Wait for socket to appear (up to 15s — browser launch can be slow)
+    # Wait for the control endpoint to appear (up to 15s — browser launch can be slow)
     for _ in range(30):
         time.sleep(0.5)
-        if os.path.exists(SOCK_PATH):
-            # Verify socket is connectable
+        if _control_endpoint_exists():
+            # Verify it is connectable
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.connect(SOCK_PATH)
+                s = _connect_control_socket()
                 s.close()
                 print(f"[clay-browser] launched. PID: {proc.pid}")
                 return
@@ -511,7 +572,7 @@ def main():
 
     # screenshot
     ss_p = sub.add_parser("screenshot", help="Save PNG screenshot")
-    ss_p.add_argument("path", nargs="?", default="/tmp/clay-browser/screenshot.png")
+    ss_p.add_argument("path", nargs="?", default=SCREENSHOT_PATH)
 
     # click
     click_p = sub.add_parser("click", help="Click element by text")
