@@ -428,7 +428,7 @@ while True:
 **Notable design points:**
 
 - The 300-row default `page_size` matches what the Clay UI uses (verified in HAR captures). Bumpable but unverified-above-300.
-- `audiences/contacts` returns full per-row data inline via `contact.entity.fields[]` — same field set the per-contact detail endpoint (`GET /audiences/contacts/{id}`) returns. **No N+1 detail fetches needed for the standard fields.** Verified 2026-04-30 by diffing both responses against the same record (id 464501906): same 17 `field_id` entries, just wrapped differently.
+- `audiences/contacts` returns full per-row data inline via `contact.entity.fields[]` — same field set the per-contact detail endpoint (`GET /audiences/contacts/{id}`) returns. **No N+1 detail fetches needed for the standard fields.** Verified 2026-04-30 by diffing both responses against the same record (id 123456789): same 17 `field_id` entries, just wrapped differently.
 - The CSV writer should pivot `entity.fields[]` from flat key/value/type rows into columns — each unique `field_id` becomes a column header. Example fields seen: `name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `country_iso`, `created_at`, `updated_at`, `origin_source_id`, `origin_source_type`, `is_draft`, `sources`, `enhanced_match_status`, `external_source_sync_status_v[123]`. Other fields visible in the UI's "All information" panel (Email, Phone, Job title, Seniority, Department, Hashed email 1-3) are NOT returned by the list endpoint when null — they're UI-side placeholders that render as `—`. So the CSV will only have columns for fields that have at least one populated row; null-only fields are omitted.
 - For Companies (ACCOUNT), drop `includeData.accountIds` — that's a contacts-specific field.
 - **Optional richer exports** for callers who want more than the default `entity.fields`: per-record signals, activities, and custom-objects each live in a separate endpoint (`GET /audiences/entities/{id}/signal-events`, `/audiences/entities/{id}/activities`, `/audiences/contacts/{id}/custom-objects`). These would be N+1 (one call per record), so expose via opt-in flags like `include_signals=False`, `include_activities=False`, `include_custom_objects=False`.
@@ -525,3 +525,40 @@ Probe recipe (needs any workspace): create a table, set the UI dedupe to overwri
 field, `get_table()` and diff `tableSettings` before/after to find the key; POST the same key
 twice via a webhook source with changed payload and observe row count + cell values + whether
 gated action columns re-evaluate on the second post.
+
+## Official-surface overlap audit — 2026-09-21 (CLI 1.3.0 / plugin 2.26.0)
+
+Re-checked which of claycast's 124 methods the official `clay` CLI can now replace.
+
+**Superseded — prefer the official CLI (no cookie, supported):**
+
+| claycast | Official replacement |
+|---|---|
+| `list_trigger_definitions` (`GET /workspaces/{ws}/trigger-definitions-with-schedule`) | **`clay signals`** — same surface. Clay's `signals` skill calls the runnable unit a *trigger definition* (`td_…`) and the underlying watch a *signal* (`sig_…`); claycast returns exactly that pair (`id`, `signalId`, `signal`, `schedule`). The CLI `id` is always `td_…` and is the only id its commands accept. |
+
+**NOT superseded — claycast is still the only path** (re-verified against `clay tables --help`, 1.3.0):
+
+| Area | claycast methods | Why official can't |
+|---|---|---|
+| Table/column schema | 41 | `clay tables` is read-only: no create, no column add/edit/delete |
+| Records / rows | 13 | No row writes on the official surface |
+| Views | 12 | No `clay views` command exists at all |
+
+*Re-checked against CLI 1.5.0 (2026-09-29): unchanged — `clay tables` still read-only, still no `clay views` group.*
+
+**Route-liveness probe (expired cookie, GET-only, 2026-09-21).** `401` = route alive and wants auth; `404` = gone. `/me`, `/my-workspaces`, `/tables`, `/sources` → **401, all alive**. No `/v3` removals detected.
+
+> ⚠ **`GET /v3/workbooks` returns 404 — this is NOT a regression.** claycast only ever calls
+> `POST /workbooks` (create); the path has no GET handler. Recorded so the next audit doesn't
+> re-investigate it as a broken endpoint.
+
+**Still unverified — needs a live `CLAY_SESSION`:** response *shape* drift, newly-required request fields, and silent write drops (200 that never commits). Route existence alone cannot detect those. Run `clay.preflight(table_id=…)` plus a read-only `get_table` / `count_records` against a known table when the cookie is refreshed.
+
+## Live WRITE verification — 2026-09-21 (closes the read-only-audit gap)
+
+The 2026-09-21 official-surface audit confirmed claycast READS but couldn't confirm a live WRITE.
+Now confirmed on a scratch testing workspace, **0 credits**:
+`create_table` → `create_column(tid, {"type":"text","name":...})` → **read back present (committed, not a silent 200)** → `delete_column` → `delete(/tables/{tid})` → verified gone.
+So the internal `/v3` write path is intact end-to-end. `preflight()` returns `write: None` (it can't
+prove writes without doing one) — a real create/delete round-trip is the only proof; use a
+`ZZ_`-prefixed scratch table in a testing workspace and clean up.

@@ -295,7 +295,7 @@ in your code.
   `"cannot create new field due to table size limit"` / "column limit". Plan retrofits as
   repoint-in-place (PATCH existing formulas, keep fids so readers stay wired) instead of
   new columns.
-- The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the plugin MCP's `execute_clay_action` (0.5cr observed).
+- The force-run stall is NOT use-ai-only (verified 2026-08-06): PROVIDER enrichment actions (e.g. `leadmagic-enrich-company`) hit the same park on dark tables — `run_column`/`force_run` ACKs, the cell sits at `{"metadata": {"trigger": "FORCE-RUN"}}`, 0 credits move, nothing executes — even when `preflight()` shows auth + writes OK (so this is not the write-restricted-cookie mode). The IDENTICAL inputs succeed via the (now-removed) plugin MCP's `execute_clay_action` — CLI successor: `clay workflows nodes test` (0.5cr observed).
 - Decision rule: on a dark table, verify an enrichment via `execute_clay_action` or the UI Run button; do not burn time debugging `run_column` stalls — only free lookups/formulas run reliably through the in-table API path.
 - **`typeSettings.runAsButton: true` = the UI's "Click to run" mode (verified 2026-08-06):**
   the column never auto-runs regardless of table AUTO_RUN or gates — a third blocking layer
@@ -2452,7 +2452,8 @@ guess `/tc-workflows/{wf}/nodes/{id}` 404s):
 ```
 
 - **`nodeConfig.inputSchema` + `inputRefs` are REPLACED wholesale.** This is the escape
-  hatch for the plugin MCP's `edit_node` on CODE nodes, whose inputSchema edits merge
+  hatch for the (now-removed) plugin MCP's `edit_node` on CODE nodes — its CLI successor is
+  `clay workflows nodes` — whose inputSchema edits merge
   per-property and can NEVER remove pins or required flags (an explicit
   `{properties: {}, required: []}` returns "noop"). PATCH here with the pin-free schema
   to actually remove wiring.
