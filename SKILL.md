@@ -100,6 +100,7 @@ tables = clay.list_tables()
 | Credit usage / spend reporting | `get_credit_usage`, `get_table_credit_usage`, `get_default_workbook_credit_limit` |
 | Export / Documentation | `export_csv`, `fetch_all_records_full`, `export_rows`, `export_workspace`, `document_table`, `search_export_artifacts` |
 | Audience export (>50K rows) | `list_audience_segments`, `count_audience_segment`, `export_audience_segment` |
+| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields`, `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status` |
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
 | Registry | `list_actions`, `list_subroutines`, `get_dynamic_action_fields` |
@@ -208,6 +209,33 @@ Helpers:
 - `list_audience_segments(entity_type="CONTACT"|"ACCOUNT")` — lists available segments
 - `count_audience_segment(segment_id, ...)` — cheap count before export
 - `export_audience_segment(...)` — writes local CSV/JSON under `<project_root>/tmp/clay-artifacts/`
+
+### Audiences: Salesforce sync field mapping
+
+The Clay UI's Audiences → Settings → Salesforce sync → "add field" has no official CLI or API
+equivalent (the `clay` CLI's `audiences fields create` makes an empty field nothing fills).
+ClayCast replays what the UI sends — create the Audiences field(s), then PATCH the import's
+whole mapping — verified live 2026-09-29:
+
+```python
+imports = clay.list_audience_imports(entity_type="ACCOUNT")      # find the Salesforce import (audimp_...)
+imp = next(i for i in imports if i["importSourceType"] == "SALESFORCE")
+res = clay.add_salesforce_import_fields(imp["id"], [
+    {"salesforceFieldId": "Account_Owner_Manager__c", "displayName": "Account Owner - Manager"},
+    {"salesforceFieldId": "Account_Owner_Active__c"},   # displayName defaults to the SF label; dataType inferred (boolean)
+])
+res["created_fields"]                                             # [{"id": "audf_...", "dataType": ..., ...}]
+clay.get_audience_import_sync_status(imp["id"])                   # {"importSyncStatus": ..., "numImportRecordsSynced": ...}
+```
+
+- `add_salesforce_import_fields` validates each API name against the connection's field
+  catalog (`list_salesforce_import_fields`), skips ones already mapped, infers `dataType` from
+  the Salesforce type (boolean / date / number / email / url, else text), and sends the
+  EXISTING mapping plus the new pairs — because the PATCH replaces the whole list.
+- Use `update_salesforce_import_field_mapping(...)` directly only to remove mappings, and pass
+  the complete list.
+- No credits; these are workspace-config writes. Endpoint shapes and gotchas:
+  `references/clay-api-reference.md` → "Audiences: Salesforce import field mapping".
 
 CSV ordering is deterministic: `name`, `first_name`, `last_name`, `title` first when present, then alphabetical by `field_id`. Optional `include_signals`, `include_activities`, and `include_custom_objects` add per-row N+1 fetches; leave them off unless you really need the extra data.
 

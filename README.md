@@ -13,7 +13,8 @@ It ships as a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) **sk
 - **Schema operations** — create/modify/clone tables, columns, formula columns, and action columns programmatically.
 - **Enrichment** — trigger runs and wait for completion (`run_column`, `run_and_wait`).
 - **Export / import** — serialize a table's column structure (the portable **ClayPrint** format) to copy or clone structure across tables; export rows to CSV/JSON; export whole workspaces.
-- **Discovery** — a Playwright-based browser daemon (`clay_browser.py`) that runs Clay with your session cookie and auto-captures every `api.clay.com` request/response, so you can reverse the shape of endpoints ClayCast doesn't wrap yet.
+- **Discovery** — a Playwright-based browser daemon (`clay_browser.py`) that runs Clay with your session cookie and auto-captures every `api.clay.com` request/response, so you can reverse the shape of endpoints ClayCast doesn't wrap yet. Runs on macOS, Linux and Windows.
+- **Audiences ↔ Salesforce sync** — map more Salesforce fields into the People / Companies audience (`add_salesforce_import_fields`), something neither the official CLI nor the public API can do.
 
 ## Install as a Claude Code skill
 
@@ -36,7 +37,7 @@ git clone https://github.com/TenSpy-ai/claycast.git .claude/skills/claycast
 pip install -r .claude/skills/claycast/references/requirements.txt
 ```
 
-Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+.
+Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+. On Windows, `clay_browser.py` uses a loopback TCP control socket and `%TEMP%\clay-browser\` instead of a UNIX socket and `/tmp` (set `CLAY_BROWSER_DIR` to override on any platform).
 
 > Project-level beats global when two projects need different versions, or when you want the skill version-controlled alongside the project. Global is simplest for personal use across many projects.
 

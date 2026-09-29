@@ -2731,6 +2731,279 @@ class ClayClient:
         )
         return res.get("segments", res) if isinstance(res, dict) else res
 
+    # ── Audiences: Salesforce import field mapping ───────────────────────────
+    # Captured live with clay_browser.py on 2026-09-29 while adding one field in the
+    # Audiences > Salesforce sync settings UI. The UI does two calls: POST /audiences/field
+    # (bulk-creates the Audiences field definitions) and PATCH /audiences/salesforce-imports
+    # (REPLACES the import's whole field mapping). Neither spends credits; both are
+    # workspace-config writes. There is no official CLI/API surface for this mapping.
+
+    # Salesforce field `type` (from /imports/salesforce-fields/{object}) -> Audiences dataType.
+    _SF_TO_AUDIENCE_DATA_TYPE = {
+        "boolean": "boolean",
+        "date": "date",
+        "datetime": "date",
+        "double": "number",
+        "int": "number",
+        "currency": "number",
+        "percent": "number",
+        "email": "email",
+        "url": "url",
+    }
+
+    def list_audience_imports(
+        self,
+        *,
+        entity_type: str | None = None,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """List the Audiences imports (Salesforce object syncs, CPJ imports, …).
+
+        GET /workspaces/{ws}/audiences/imports[?entityType=ACCOUNT|CONTACT]. Each item
+        carries `id` (audimp_…), `entityType`, `displayName`, `importSourceType`
+        (e.g. SALESFORCE), `importSourceSubtype` (the Salesforce object, e.g. `account`),
+        `status`, `importedCount`, `fieldMapping.fieldMappings` (the current mapping)
+        and `importMetadata` (appAccountId `aa_…`, sync flags). Verified live
+        2026-09-29 against workspace 12345: 3 imports, 2 of them Salesforce.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        params = {}
+        if entity_type:
+            entity_type = str(entity_type).upper()
+            if entity_type not in {"CONTACT", "ACCOUNT"}:
+                raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+            params["entityType"] = entity_type
+        res = self.get(f"/workspaces/{ws_id}/audiences/imports", params=params or None)
+        if isinstance(res, dict):
+            return res.get("audienceImports") or res.get("imports") or []
+        return res
+
+    def get_audience_import_sync_status(
+        self,
+        import_id: str,
+        *,
+        source_type: str = "SALESFORCE",
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Sync progress for one external-source import.
+
+        GET /workspaces/{ws}/audiences/imports/external-source-sync-status/{SOURCE}/{import_id}
+        -> {importSyncStatus, importSyncType, lastSyncedTime, numImportRecordsSynced,
+        numImportRecordsTotal, …}. The UI polls this every ~5s after a mapping change.
+        Verified live 2026-09-29.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.get(
+            f"/workspaces/{ws_id}/audiences/imports/external-source-sync-status/"
+            f"{source_type.upper()}/{import_id}"
+        )
+
+    def list_salesforce_import_fields(
+        self,
+        object_name: str,
+        *,
+        auth_account_id: str,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """The Salesforce fields Clay can map for one object on one connection.
+
+        GET /workspaces/{ws}/audiences/imports/salesforce-fields/{object}?authAccountId=aa_…
+        -> {"fields": [{value (API name), label, type, isUpdateable, externalId,
+        isAssociatedObjectField}, …]}. `object_name` is the import's
+        `importSourceSubtype` (`account`, `contact`); `auth_account_id` is
+        `importMetadata.appAccountId`. Verified live 2026-09-29 (842 mappable fields on a
+        large Account object).
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        res = self.get(
+            f"/workspaces/{ws_id}/audiences/imports/salesforce-fields/{object_name}",
+            params={"authAccountId": auth_account_id},
+        )
+        return res.get("fields", res) if isinstance(res, dict) else res
+
+    def create_audience_fields(
+        self,
+        entity_type: str,
+        fields: list[dict],
+        *,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """Bulk-create Audiences field definitions (the "columns" of People / Companies).
+
+        POST /workspaces/{ws}/audiences/field with
+        {"entityType": "ACCOUNT"|"CONTACT", "audienceFields": [{"displayName", "fieldType":
+        "SCALAR", "dataType": "text"|"number"|"boolean"|"date"|"email"|"url"}, …]}
+        -> list of the created fields, each with its `id` (audf_…). Returns an array even
+        for one field. Verified live 2026-09-29. No credits.
+        """
+        entity_type = str(entity_type).upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+        if not fields:
+            return []
+        payload = [
+            {
+                "displayName": f["displayName"],
+                "fieldType": f.get("fieldType", "SCALAR"),
+                "dataType": f.get("dataType", "text"),
+            }
+            for f in fields
+        ]
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.post(
+            f"/workspaces/{ws_id}/audiences/field",
+            {"entityType": entity_type, "audienceFields": payload},
+        )
+
+    def update_salesforce_import_field_mapping(
+        self,
+        import_id: str,
+        field_mapping: list[dict],
+        *,
+        entity_type: str,
+        is_import_sync_enabled: bool = True,
+        is_export_sync_enabled: bool = False,
+        is_create_new_records_enabled: bool = False,
+        create_new_records_id_mapping: dict | None = None,
+        is_task_sync_enabled: bool = False,
+        reconcile_opportunity_import_dependencies: bool = True,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """REPLACE a Salesforce import's field mapping (what the UI's Save button sends).
+
+        PATCH /workspaces/{ws}/audiences/salesforce-imports. `field_mapping` is the COMPLETE
+        list — anything you leave out stops syncing — of
+        {"type": "SALESFORCE", "audienceFieldId": "audf_…"|built-in id such as "org_name",
+        "salesforceFieldId": "<API name>", "mappingRule": "NEVER_WRITE"}. The sync flags
+        mirror the import's `importMetadata`; pass them through from a fresh
+        list_audience_imports() read. Shape trap: you send `fieldMapping: [...]`, the
+        response nests it as `fieldMapping.fieldMappings`. The response `status` flips to
+        PENDING and the import backfills the new fields (~11k rows took a few minutes).
+        Prefer add_salesforce_import_fields() unless you need to remove mappings.
+        Verified live 2026-09-29. No credits.
+        """
+        entity_type = str(entity_type).upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+        for m in field_mapping:
+            for key in ("audienceFieldId", "salesforceFieldId"):
+                if not m.get(key):
+                    raise ValueError(f"field_mapping entry missing {key}: {m!r}")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        body = {
+            "audienceImports": [
+                {
+                    "audienceImportId": import_id,
+                    "fieldMapping": [
+                        {
+                            "type": m.get("type", "SALESFORCE"),
+                            "audienceFieldId": m["audienceFieldId"],
+                            "salesforceFieldId": m["salesforceFieldId"],
+                            "mappingRule": m.get("mappingRule", "NEVER_WRITE"),
+                        }
+                        for m in field_mapping
+                    ],
+                    "isImportSyncEnabled": is_import_sync_enabled,
+                    "isExportSyncEnabled": is_export_sync_enabled,
+                    "isCreateNewRecordsEnabled": is_create_new_records_enabled,
+                    "createNewRecordsIdMapping": create_new_records_id_mapping,
+                    "entityType": entity_type,
+                    "isTaskSyncEnabled": is_task_sync_enabled,
+                }
+            ],
+            "reconcileOpportunityImportDependencies": reconcile_opportunity_import_dependencies,
+        }
+        return self.patch(f"/workspaces/{ws_id}/audiences/salesforce-imports", body)
+
+    def add_salesforce_import_fields(
+        self,
+        import_id: str,
+        new_fields: list[dict],
+        *,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Map more Salesforce fields into an existing Audiences import — the safe way.
+
+        `new_fields` = [{"salesforceFieldId": "Account_Owner_Manager__c",
+        "displayName": "Account Owner - Manager", "dataType": "text"?}, …]. Reads the
+        import (current mapping + sync flags), validates each Salesforce API name against
+        the connection's field catalog, infers `dataType` from the Salesforce type when not
+        given (boolean/date/number/email/url, else text), bulk-creates the missing Audiences
+        fields, then PATCHes the import with existing + new mappings (duplicates by
+        salesforceFieldId are skipped). Returns {"import": <PATCH response import>,
+        "created_fields": [...], "skipped": [salesforceFieldId, …]}. Verified live
+        2026-09-29: two fields added to a 512k-row Account import, backfill started
+        immediately (status PENDING). No credits.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        imports = self.list_audience_imports(workspace_id=ws_id)
+        imp = next((i for i in imports if i.get("id") == import_id), None)
+        if imp is None:
+            raise ValueError(f"import {import_id!r} not found in workspace {ws_id}")
+        meta = imp.get("importMetadata") or {}
+        if (imp.get("importSourceType") or meta.get("type")) != "SALESFORCE":
+            raise ValueError(f"import {import_id!r} is not a Salesforce import")
+        entity_type = imp["entityType"]
+        current = list((imp.get("fieldMapping") or {}).get("fieldMappings") or [])
+        already = {m["salesforceFieldId"] for m in current}
+
+        catalog = {
+            f["value"]: f
+            for f in self.list_salesforce_import_fields(
+                imp["importSourceSubtype"],
+                auth_account_id=meta["appAccountId"],
+                workspace_id=ws_id,
+            )
+        }
+        to_create, skipped = [], []
+        for nf in new_fields:
+            sf_id = nf["salesforceFieldId"]
+            if sf_id in already:
+                skipped.append(sf_id)
+                continue
+            if sf_id not in catalog:
+                raise ValueError(f"{sf_id!r} is not a mappable field on this Salesforce connection")
+            sf_type = catalog[sf_id].get("type", "")
+            to_create.append(
+                {
+                    "salesforceFieldId": sf_id,
+                    "displayName": nf.get("displayName") or catalog[sf_id].get("label") or sf_id,
+                    "dataType": nf.get("dataType") or self._SF_TO_AUDIENCE_DATA_TYPE.get(sf_type, "text"),
+                }
+            )
+        if not to_create:
+            return {"import": imp, "created_fields": [], "skipped": skipped}
+
+        created = self.create_audience_fields(
+            entity_type,
+            [{"displayName": c["displayName"], "dataType": c["dataType"]} for c in to_create],
+            workspace_id=ws_id,
+        )
+        if len(created) != len(to_create):
+            raise RuntimeError(f"expected {len(to_create)} created fields, got {len(created)}")
+        mapping = current + [
+            {
+                "type": "SALESFORCE",
+                "audienceFieldId": field["id"],
+                "salesforceFieldId": spec["salesforceFieldId"],
+                "mappingRule": "NEVER_WRITE",
+            }
+            for spec, field in zip(to_create, created)
+        ]
+        res = self.update_salesforce_import_field_mapping(
+            import_id,
+            mapping,
+            entity_type=entity_type,
+            is_import_sync_enabled=meta.get("isImportSyncEnabled", True),
+            is_export_sync_enabled=meta.get("isExportSyncEnabled", False),
+            is_create_new_records_enabled=meta.get("isCreateNewRecordsEnabled", False),
+            create_new_records_id_mapping=meta.get("createNewRecordsIdMapping"),
+            is_task_sync_enabled=meta.get("isTaskSyncEnabled", False),
+            workspace_id=ws_id,
+        )
+        updated = (res.get("audienceImports") or [res])[0] if isinstance(res, dict) else res
+        return {"import": updated, "created_fields": created, "skipped": skipped}
+
     def search_export_artifacts(
         self,
         sources: list[str],

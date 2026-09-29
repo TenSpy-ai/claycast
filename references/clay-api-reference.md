@@ -1894,7 +1894,7 @@ Required query params and body shapes are listed verbatim from the captured call
 |---|---|---|
 | `GET /v3/workspaces/{ws}/audiences/segments` | `entityType=ACCOUNT\|CONTACT` | `{segments: [...], total: N}` |
 | `GET /v3/workspaces/{ws}/audiences/scheduled-searches` | none | `{scheduledSearches: [...], total: N}` |
-| `GET /v3/workspaces/{ws}/audiences/imports` | `entityType=ACCOUNT\|CONTACT` | `{imports: [...]}` |
+| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType=ACCOUNT\|CONTACT` | `{audienceImports: [...]}` (corrected 2026-09-29 — the key is `audienceImports`, not `imports`; see the Salesforce import field mapping section) |
 | `GET /v3/workspaces/{ws}/audiences/imports/external-source-import-history/{TYPE}` | `{TYPE}` is `ACCOUNT` or `CONTACT` (path segment, not query) | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/accounts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/contacts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
@@ -1905,6 +1905,79 @@ Required query params and body shapes are listed verbatim from the captured call
 | `GET /v3/workspaces/{ws}/ad-audiences/sync-limit-status` | none | `{limit, used, remaining, canStartNewSync, isEnabled}` |
 
 Concrete request/response payloads for any of these are in the local clay-spy capture archives (look for the corresponding `kind: "http"` lines).
+
+---
+
+## Audiences: Salesforce import field mapping (verified live 2026-09-29, wrapped)
+
+How Audiences → Settings → Salesforce sync → "add field" maps more Salesforce fields into the
+People / Companies audience. Captured with `clay_browser.py` while saving one field in the UI,
+then replayed through the SDK for two more (one `text`, one `boolean`): the import re-synced
+within a minute and the new columns populated. **There is no official CLI or public-API surface
+for this** — the `clay` CLI's `audiences fields create` makes an empty field nothing fills.
+
+SDK: `clay.add_salesforce_import_fields(import_id, [...])` (the safe convenience), built on
+`list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`,
+`update_salesforce_import_field_mapping` and `get_audience_import_sync_status`.
+
+Model: one **import** (`audimp_<id>`) per synced Salesforce object (`importSourceSubtype`
+`account` / `contact`, `entityType` ACCOUNT / CONTACT), owned by one Salesforce connection
+(`importMetadata.appAccountId` = `aa_<id>`). The import's `fieldMapping.fieldMappings` is the
+list of `{audienceFieldId ↔ salesforceFieldId}` pairs. Activity imports (`audactimp_<id>`,
+Tasks/Events) are a separate object and were not captured being edited.
+
+### The write — what Save sends (two calls)
+
+1. `POST /v3/workspaces/{ws}/audiences/field` — bulk-create the Audiences field definitions.
+   Body `{"entityType": "ACCOUNT", "audienceFields": [{"displayName": "Account Owner - Manager", "fieldType": "SCALAR", "dataType": "text"}]}`.
+   Response: an array (even for one field) of `{"id": "audf_<id>", "displayName", "fieldType": "SCALAR", "dataType", "entityType", "order", "hidden": false, "isDefaultField": false, "isSystemField": false, "version": 1, ...}`.
+   `dataType` accepted: `text`, `number`, `boolean`, `date`, `email`, `url`.
+2. `PATCH /v3/workspaces/{ws}/audiences/salesforce-imports` — REPLACE the import's mapping.
+
+   ```json
+   {"audienceImports": [{
+       "audienceImportId": "audimp_<id>",
+       "fieldMapping": [
+         {"type": "SALESFORCE", "audienceFieldId": "org_name",   "salesforceFieldId": "Name",                     "mappingRule": "NEVER_WRITE"},
+         {"type": "SALESFORCE", "audienceFieldId": "audf_<id>",  "salesforceFieldId": "Account_Owner_Manager__c", "mappingRule": "NEVER_WRITE"}
+       ],
+       "isImportSyncEnabled": true, "isExportSyncEnabled": false,
+       "isCreateNewRecordsEnabled": false, "createNewRecordsIdMapping": null,
+       "entityType": "ACCOUNT", "isTaskSyncEnabled": false
+     }],
+     "reconcileOpportunityImportDependencies": true}
+   ```
+
+   Response `{"audienceImports": [<import>]}` with `status: "PENDING"` and `updatedAt` bumped.
+   **Shape trap:** you send a flat `fieldMapping` array; the response nests it as
+   `fieldMapping: {version: 1, fieldMappings: [...]}`. Built-in audience fields use their bare
+   ids as `audienceFieldId` (`org_name`, `domain`, `linkedin_url`, `sfdc_owner_id`; `name`,
+   `title`, `email`, `phone` on contacts); custom ones use `audf_<id>`. `mappingRule` was
+   `NEVER_WRITE` on every pair. **The list is the whole mapping** — read it first with
+   `list_audience_imports` and append, or the omitted pairs stop syncing.
+
+### The reads around it
+
+| Endpoint | Params | Response |
+|---|---|---|
+| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType` | `{"audienceImports": [...]}` — each with `id`, `entityType`, `displayName`, `importSourceType`, `importSourceSubtype`, `status`, `importedCount`, `fieldMapping.fieldMappings`, `importMetadata{appAccountId, salesforceOrgId, isImportSyncEnabled, isExportSyncEnabled, isCreateNewRecordsEnabled, createNewRecordsIdMapping, isTaskSyncEnabled, salesforceImportKind}` |
+| `GET /v3/workspaces/{ws}/audiences/imports/salesforce-fields/{object}` | `authAccountId=aa_<id>`; `{object}` = the import's `importSourceSubtype` | `{"fields": [{"value": "<API name>", "label", "type" (string, picklist, multipicklist, boolean, double, int, currency, percent, date, datetime, reference, url, email, textarea, id), "isUpdateable", "externalId", "isAssociatedObjectField"}]}` |
+| `GET /v3/workspaces/{ws}/audiences/imports/salesforce-preview/{Object}` | `authAccountId=aa_<id>` | sample records (`Task` returned 400 on the captured connection) |
+| `GET /v3/workspaces/{ws}/audiences/imports/external-source-sync-status/SALESFORCE/{audimp_<id>}` | — | `{importSyncStatus, importSyncType ("sync_incremental"), lastSyncedTime, numImportRecordsSynced, numImportRecordsTotal, lastExportedTime, hasExportInProgress, ...}`; the UI polls this every ~5 s after a save |
+| `GET /v3/workspaces/{ws}/audiences/import-connections` | — | connections usable by imports |
+| `GET /v3/workspaces/{ws}/audiences/activity-imports` | optional `appAccountId=aa_<id>` | activity imports (`audactimp_<id>`) |
+| `GET /v3/workspaces/{ws}/audiences/settings` | `entityType=ACCOUNT\|CONTACT` | audience settings |
+| `GET /v3/workspaces/{ws}/audiences/workspace-activity-types` | `includeStandard=true` | activity types |
+
+### Gotchas
+
+- A Salesforce lookup (e.g. `OwnerId`-style reference fields) arrives as the 18-char record
+  ID, not a name — map the companion name/formula field too if a human will read it.
+- Backfill is fast (tens of thousands of rows in the first minute on a ~500k-row import) but
+  the import's `importedCount` stays 0 and `status` stays PENDING for a while; watch the
+  sync-status endpoint or count non-null values in the new column instead.
+- Mapping is per import: the CONTACT import is a different `audimp_<id>` with its own list.
+- No credits are spent by any of these calls; they are workspace-config writes.
 
 ---
 
