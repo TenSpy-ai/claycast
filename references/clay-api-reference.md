@@ -1981,6 +1981,68 @@ Tasks/Events) are a separate object and were not captured being edited.
 
 ---
 
+## Audiences: segments (saved filters) — create / update / delete / count (verified live 2026-09-30, wrapped)
+
+Captured with `clay_browser.py` while clicking Create segment → Rename → Delete segment in the
+Companies audience, then replayed through the SDK (workspace 12345). SDK:
+`create_audience_segment`, `update_audience_segment`, `delete_audience_segment`,
+`get_audience_segment`, `count_audience_records`, `count_audience_filter_stages`,
+`verify_audience_filter_complement`, and the module-level `af_*` filter-AST builder in
+`clay_client.py`. No credits — workspace-config writes.
+
+| Call | Body | Response / notes |
+|---|---|---|
+| `POST /v3/workspaces/{ws}/audiences/segments` | `{"name", "filterAst": <root GroupOp>, "entityType": "ACCOUNT"\|"CONTACT"}` | the segment object: `id` (`audseg_…`), `name`, `description`, `filterAst`, `entityType`, `estimatedSize` (cached member count), `ownerId`, `order`, `segmentType`, `signalDaysLookback`, `bitmapProcessedAt`, timestamps. **Every AST node needs a UUID `id`** (`af_root()` stamps them) or the call is 400 `Field "filterAst.items.N" - Invalid input`. The UI's "Create segment" button sends an empty `items: []` (matches everything) and opens the editor. |
+| `PUT /v3/workspaces/{ws}/audiences/segments/{id}` | partial — any of `name`, `description`, `filterAst` | the full segment; `estimatedSize` is recomputed immediately. The UI's Rename sends just `{"name"}`. `PATCH` and `DELETE` on this URL are 404 `NoMatchingURL`. |
+| `POST /v3/workspaces/{ws}/audiences/segments/{id}/delete` | `{}` | `{"success": true, "segmentId"}`. HARD delete: `GET …/segments/{id}` is then 404 `Segment not found` and the segment is gone from the list — no undo. |
+| `GET /v3/workspaces/{ws}/audiences/segments/{id}` | — | the segment object; `filterAst` is the saved filter (the official CLI names the same object `filter`). |
+| `POST /v3/workspaces/{ws}/audiences/count` | `{"entityType", "isArchived": false, "shouldInjectDraftFilter": true, "segmentType": null, "filters": <AST>}` | `{"count"}`. **`segmentId` alone does NOT apply the segment's filter** — the editor keeps the filter client-side and sends it as `filters`; a body with only `segmentId` returns the size of the whole entity (a latent bug in `count_audience_segment`, fixed 2026-09-30 by fetching `filterAst` first). |
+| `POST /v3/workspaces/{ws}/audiences/{ACCOUNT\|CONTACT}/signals` | `{"segmentId"}` | signal summaries for the segment (and `"ALL"`). |
+
+### The filter AST (what the UI writes; the `af_*` helpers produce exactly these shapes)
+
+```json
+{"type": "GroupOp", "combinationMode": "And", "id": "<uuid>", "items": [
+  {"type": "BinOp", "key": "audf_<id>", "dataPath": ["account_entity_field_values", "field", "audf_<id>"],
+   "operator": "NotEqual", "value": "Current Client", "entityType": "ACCOUNT", "id": "<uuid>"},
+  {"type": "BinOp", "key": "title::acttyp_<id>", "dataPath": ["activities", "fields", "title", "acttyp_<id>"],
+   "operator": "NotEmpty", "id": "<uuid>"}
+]}
+```
+
+- Entity field paths: `["account_entity_field_values", "field", <fieldId>]` for companies,
+  `["contact_entity_field_values", "field", <fieldId>]` for people; a people segment may include
+  ACCOUNT-path conditions (evaluated on the linked company). Built-in ids (`org_name`, `domain`,
+  `sfdc_owner_id`, `email`, `title`, `linkedin_url`, …) and custom `audf_…` ids both work.
+- Activity conditions: `key: "<fieldId>::<activityTypeId>"`, `dataPath: ["activities", "fields",
+  <fieldId>, <activityTypeId>]` (`fieldId` = `title`, `created_at` or a custom `actf_…`). This is
+  the one-row shape the UI renders. **Two sibling activity rows are evaluated independently** —
+  "type = X" AND "date within 30d" as siblings means "ever had type X" AND "any activity within
+  30d" (measured: 65 vs the true 25). Conditions that must hold on the same activity go inside a
+  `ColOp` (`{"type": "ColOp", "dataPath": ["activities", <activityTypeId>], "operator": "AnyItems"|"NoItems",
+  "entityType", "condition": <GroupOp>}`, with `["activities", "activity_timestamp"]` for recency)
+  — which evaluates correctly but **renders as "deleted field" in the UI**.
+- Operators by data type (the official CLI's filter reference; all accepted here): date —
+  `WithinLast`/`NotWithinLast`/`WithinNext`/`NotWithinNext` (`value` + `timeUnit` day|week|month),
+  `Before`/`After` (ISO timestamp), `Empty`/`NotEmpty`; number/currency — `GreaterThan`, `LessThan`,
+  `Equal`, `GreaterThanOrEqual`, `LessThanOrEqual`, `Empty`, `NotEmpty`; boolean — `True`, `False`;
+  select/text/email/url — `Equal`, `NotEqual`, `Contain`, `NotContain`, `ContainAny` (list),
+  `StartsWith`, `EndsWith`, `Empty`, `NotEmpty`. Text operators are case-insensitive substring/exact.
+- `ContainAny` with a list of 18-char Salesforce IDs on `sfdc_owner_id` is exact and renders as
+  one row (counted identically to an Or of 125 `Equal` rows).
+- Blank values match neither `Equal` nor `NotEqual`/`NotContain`. An exclusion and its
+  "everything else" complement therefore need an explicit `Empty` branch on the inclusion side —
+  `af_none_of()` does that, and only operators with a single-operator negation may appear in a
+  rule table (`StartsWith`/`EndsWith`/`GreaterThan`/`ContainAny` have none). Prove the pair with
+  `verify_audience_filter_complement()`; counts drift while an import back-fills (`both` stays 0,
+  `neither` wobbles) — re-run rather than trust one reading.
+- Use real values: `GET …/audiences/{accounts|contacts}/columns?includeSystemFields=true` lists
+  fields; the official CLI's `audiences fields list-values <id>` lists values with counts. A rule
+  on a value that does not exist ("Current Customer" where the data says "Current Client")
+  silently matches nothing. Lookup fields (e.g. owner, BDR owner) hold IDs, not names.
+
+---
+
 ## Find People / Find Companies sourced-table creation (documented, NOT yet wrapped in claycast)
 
 Captured during the Find leads UI walkthrough on 2026-04-30. **This is the endpoint that closes `feature-gaps.md` #2** ("Find People / Find Companies sourced-table creation"). One atomic call creates workbook + table + view + source.
