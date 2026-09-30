@@ -256,8 +256,10 @@ clay.get_audience_import_sync_status(imp["id"])                   # {"importSync
   the ACCOUNT import had all five; the UI's replay sent False.
 - If the mapping PATCH fails after the fields were created, `AudienceFieldsOrphanedError` (a
   `RuntimeError`) carries `.created_field_ids`, `.mapping`, `.entity_type`, `.sync_flags`,
-  `.pairing_verified` and `.mapped_after_failure`. With `pairing_verified` True, re-send the
-  mapping — idempotent, the PATCH is a full REPLACE:
+  `.pairing_verified` and `.mapped_after_failure`. With `pairing_verified` True and `.mapping`
+  set, re-send the mapping — idempotent, the PATCH is a full REPLACE (`.mapping` is None only
+  when the import could not be found or parsed on the re-read before the PATCH; the message
+  says so — check the import first):
   `clay.update_salesforce_import_field_mapping(err.import_id, err.mapping, entity_type=err.entity_type, **err.sync_flag_kwargs())`.
   With it False (the create response could not be paired with the request) `.mapping` is None:
   map the fields by hand after checking each displayName, or delete them. claycast has no

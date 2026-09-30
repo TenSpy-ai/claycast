@@ -14,8 +14,9 @@
 #                                  # + server.port, and no NOTE because the path fits)
 #
 # Needs Playwright with Chromium for $PYTHON (default: python3; `playwright install chromium`)
-# and a CLAY_SESSION value that RESOLVES (env var, or a .env on the walk-up path from the repo
-# root, which is where this script runs from). It does not have to be a working cookie: the only
+# and a CLAY_SESSION value that resolves: export CLAY_SESSION, or keep a .env at the repo root
+# (this script cd's there; the loader stops at the nearest directory with a .git entry, and a
+# git worktree's .git *file* counts). It does not have to be a working cookie: the only
 # page opened is a local data: URL, so no request to Clay has to succeed. Spends no credits.
 # Aborts if a daemon is already running in the runtime dir it would use.
 set -u

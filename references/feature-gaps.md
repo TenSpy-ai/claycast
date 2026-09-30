@@ -374,7 +374,7 @@ For workflows where the audience already holds 100K+ leads (Find People → Save
 
 **Native Clay UI doesn't help.** The `GET /v3/workspaces/{ws}/audiences/{TYPE}/exports?segmentId=<aud>` endpoint surfaces only two export types — `TABLE` (= Flow F, 50K-capped) and `EMAIL_CAMPAIGN`. There is **no native CSV export** for audience segments.
 
-**Proposed claycast surface:**
+**Proposed claycast surface** (historical sketch from 2026-04-30 — the shipped `export_audience_segment` takes `entity_type: str | None = None`, derives it from the fetched segment since 2026-09-30, and raises on a contradicting explicit value):
 
 ```python
 def export_audience_segment(

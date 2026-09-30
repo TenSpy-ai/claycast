@@ -1166,7 +1166,8 @@ def af_exclusion_pair(entity_type: str, rule_table: list[tuple[str, list]]) -> t
     """From [(field_id, rules), ...] return (excluded_items, included_items): the record is excluded
     if ANY field matches any of its rules (Or the first list), included if EVERY field matches none
     (And the second) — a blank cell counts as "matches none" unless that field has an ("Empty",)
-    rule, which excludes it. A rule is (op,), (op, value) or (op, value, time_unit) — see af_rule()
+    rule — or, on a boolean field, a ("False",) rule, since a blank checkbox is False — which
+    excludes it. A rule is (op,), (op, value) or (op, value, time_unit) — see af_rule()
     for the grammar — using only the operators in AUDIENCE_NEGATED_OPERATOR. The whole table is
     validated before anything is built (entity type, (field_id, rules) entries, every rule; an
     empty table or a field with no rules is a ValueError). Fields with a negative operator are
@@ -1250,8 +1251,11 @@ class AudienceFieldsOrphanedError(RuntimeError):
     settings keyed like importMetadata), `mapping`, `pairing_verified` and `mapped_after_failure`.
 
     * `pairing_verified=True`: every created field echoed the requested displayName in request
-      order, so `mapping` is the exact list the PATCH should carry (existing pairs + new pairs)
-      and re-sending it is safe — the PATCH is a full REPLACE, so the retry is idempotent:
+      order, so `mapping` is the exact list the PATCH should carry (existing pairs + new pairs,
+      or the freshly re-read pairs + new pairs when the import changed underneath) and
+      re-sending it is safe — the PATCH is a full REPLACE, so the retry is idempotent. One
+      exception: if the import was not found (or its mapping was malformed) when re-read before
+      the PATCH, `mapping` is None and the message says so — check the import first:
           clay.update_salesforce_import_field_mapping(err.import_id, err.mapping,
               entity_type=err.entity_type, **err.sync_flag_kwargs())
     * `pairing_verified=False`: the create response could not be paired with the request (wrong
@@ -3812,7 +3816,7 @@ class ClayClient:
             workspace_id=ws_id,
         )
         delete_text = _audience_fields_delete_text(entity_type, ws_id)
-        unpaired = dict(
+        unpaired: dict[str, Any] = dict(
             import_id=import_id, entity_type=entity_type, workspace_id=ws_id, mapping=None,
             pairing_verified=False, sync_flags=flags,
         )
@@ -3861,7 +3865,7 @@ class ClayClient:
             }
             for spec, field in zip(to_create, created)
         ]
-        verified = dict(
+        verified: dict[str, Any] = dict(
             import_id=import_id, entity_type=entity_type, workspace_id=ws_id, created_fields=created,
             pairing_verified=True, sync_flags=flags,
         )
