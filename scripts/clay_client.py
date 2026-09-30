@@ -21,6 +21,7 @@ import random
 import re
 import string
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -826,6 +827,168 @@ def format_json_body(mapping: dict) -> str:
         return '"' + raw.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
     return " + ".join(_enc(v) if kind == "lit" else v for kind, v in pieces if not (kind == "lit" and v == ""))
+
+# ── Audiences: filter AST builder ────────────────────────────────────────────
+# Audiences segments are saved as a filter AST (`filterAst` on POST/PATCH /audiences/segments;
+# the official `clay` CLI calls the same object `filter`). These helpers build the exact node
+# shapes the Clay UI writes, so segments built from code stay readable and editable in the UI:
+#   GroupOp  {"type": "GroupOp", "combinationMode": "And"|"Or", "items": [...]}
+#   BinOp    {"type": "BinOp", "key": <fieldId>, "dataPath": ["<entity>_entity_field_values", "field", <fieldId>],
+#             "operator": ..., "value"?: ..., "entityType": "ACCOUNT"|"CONTACT"}
+#   activity {"type": "BinOp", "key": "<fieldId>::<activityTypeId>",
+#             "dataPath": ["activities", "fields", <fieldId>, <activityTypeId>], "operator": ..., "value"?: ...}
+#   ColOp    {"type": "ColOp", "dataPath": ["activities", <activityTypeId>], "operator": "AnyItems"|"NoItems",
+#             "entityType": ..., "condition": <GroupOp of BinOps that must hold on the SAME activity>}
+# Verified live 2026-09-29/30 (workspace 12345): each shape counts via POST /audiences/count and
+# saves via POST/PATCH /audiences/segments.
+#
+# Two traps these helpers encode:
+#   1. Sibling activity conditions are evaluated independently ("type = X" AND "date within 30d"
+#      as two rows = "ever had type X" AND "any activity within 30d"). Conditions that must
+#      describe the same activity go inside one ColOp — but the Clay UI renders a ColOp row as
+#      "deleted field", so prefer af_activity() when a segment needs only ONE activity condition.
+#   2. An exclusion segment and the "everything else" segment must be exact complements, which
+#      requires every rule to use an operator with a single-operator negation (Equal/NotEqual,
+#      Contain/NotContain, True/False, Empty/NotEmpty, ...). af_exclusion_pair() enforces that and
+#      treats a blank field as "not excluded" on both sides.
+
+AUDIENCE_ENTITY_PATHS = {"ACCOUNT": "account_entity_field_values", "CONTACT": "contact_entity_field_values"}
+AUDIENCE_NEGATED_OPERATOR = {
+    "Equal": "NotEqual", "NotEqual": "Equal",
+    "Contain": "NotContain", "NotContain": "Contain",
+    "True": "False", "False": "True",
+    "Empty": "NotEmpty", "NotEmpty": "Empty",
+    "WithinLast": "NotWithinLast", "NotWithinLast": "WithinLast",
+    "WithinNext": "NotWithinNext", "NotWithinNext": "WithinNext",
+}
+
+
+def _af_entity(entity_type: str) -> str:
+    et = str(entity_type).upper()
+    if et not in AUDIENCE_ENTITY_PATHS:
+        raise ValueError(f"entity_type must be ACCOUNT or CONTACT, got {entity_type!r}")
+    return et
+
+
+def af_and(*items: dict) -> dict:
+    """GroupOp with combinationMode And."""
+    return {"type": "GroupOp", "combinationMode": "And", "items": list(items)}
+
+
+def af_or(*items: dict) -> dict:
+    """GroupOp with combinationMode Or."""
+    return {"type": "GroupOp", "combinationMode": "Or", "items": list(items)}
+
+
+def af_field(entity_type: str, field_id: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """BinOp on an Audiences field of a company (ACCOUNT) or person (CONTACT).
+
+    `field_id` is a built-in id (`org_name`, `domain`, `sfdc_owner_id`, `email`, `title`, ...) or a
+    custom `audf_...` id. A people segment may test company fields by passing entity_type="ACCOUNT"
+    (Clay evaluates them on the linked company). `value` is omitted for Empty/NotEmpty/True/False;
+    WithinLast/WithinNext take a number plus time_unit ("day"|"week"|"month"); ContainAny takes a list.
+    """
+    et = _af_entity(entity_type)
+    node = {"type": "BinOp", "key": field_id, "dataPath": [AUDIENCE_ENTITY_PATHS[et], "field", field_id], "operator": operator, "entityType": et}
+    if value is not None:
+        node["value"] = value
+    if time_unit:
+        node["timeUnit"] = time_unit
+    return node
+
+
+def af_activity(activity_type_id: str, field_id: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """UI-native single condition on an imported activity (e.g. a CRM custom object).
+
+    `activity_type_id` is the `acttyp_...` id (from `activities get/summary` or the Audiences settings);
+    `field_id` is "title", "created_at" or a custom `actf_...` field on that activity type. Renders and
+    edits in the Clay UI. Two of these as siblings do NOT bind to the same activity — see
+    af_activity_same_event().
+    """
+    node = {"type": "BinOp", "key": f"{field_id}::{activity_type_id}", "dataPath": ["activities", "fields", field_id, activity_type_id], "operator": operator}
+    if value is not None:
+        node["value"] = value
+    if time_unit:
+        node["timeUnit"] = time_unit
+    return node
+
+
+def af_activity_timestamp(entity_type: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """Recency of an activity, for use INSIDE af_activity_same_event() (dataPath ["activities", "activity_timestamp"])."""
+    node = {"type": "BinOp", "dataPath": ["activities", "activity_timestamp"], "operator": operator, "entityType": _af_entity(entity_type)}
+    if value is not None:
+        node["value"] = value
+    if time_unit:
+        node["timeUnit"] = time_unit
+    return node
+
+
+def af_activity_same_event(activity_type_id: str, entity_type: str, *conditions: dict, operator: str = "AnyItems") -> dict:
+    """ColOp: the record has (AnyItems) / lacks (NoItems) an activity of this type on which ALL
+    `conditions` hold at once. Use for "type X within 30 days" style rules. The Clay UI cannot
+    render this node (it shows "deleted field") — the segment still evaluates correctly.
+    """
+    et = _af_entity(entity_type)
+    if operator not in {"AnyItems", "NoItems"}:
+        raise ValueError("operator must be AnyItems or NoItems (AllItems is not supported by Clay)")
+    items = [dict(c, entityType=et) for c in conditions]
+    return {"type": "ColOp", "dataPath": ["activities", activity_type_id], "operator": operator, "entityType": et, "condition": af_and(*items)}
+
+
+def af_owner_in(owner_ids: list[str], entity_type: str = "ACCOUNT") -> dict:
+    """Company owned by any of these Salesforce users (18-char User IDs). ContainAny on the
+    built-in `sfdc_owner_id` is exact for IDs and renders as ONE row in the UI (verified equal to
+    an Or of 125 Equal rows)."""
+    return af_field(entity_type, "sfdc_owner_id", "ContainAny", list(owner_ids))
+
+
+def af_any_of(entity_type: str, field_id: str, rules: list[tuple]) -> dict:
+    """Or of one BinOp per rule; a rule is (operator,) or (operator, value). The 'excluded' side of a pair."""
+    return af_or(*[af_field(entity_type, field_id, r[0], r[1] if len(r) > 1 else None) for r in rules])
+
+
+def af_none_of(entity_type: str, field_id: str, rules: list[tuple]) -> dict:
+    """Blank OR none of the rules match — the exact complement of af_any_of() for the same rules.
+    Every operator must have a single-operator negation (see AUDIENCE_NEGATED_OPERATOR)."""
+    negated = []
+    for r in rules:
+        op = r[0]
+        if op not in AUDIENCE_NEGATED_OPERATOR:
+            raise ValueError(f"operator {op!r} has no exact negation; use Equal/Contain/True/Empty-family operators in rule tables")
+        negated.append(af_field(entity_type, field_id, AUDIENCE_NEGATED_OPERATOR[op], r[1] if len(r) > 1 else None))
+    return af_or(af_field(entity_type, field_id, "Empty"), af_and(*negated))
+
+
+def af_exclusion_pair(entity_type: str, rule_table: list[tuple[str, list[tuple]]]) -> tuple[list[dict], list[dict]]:
+    """From [(field_id, rules), ...] return (excluded_items, included_items): the record is excluded
+    if ANY field matches any of its rules (Or the first list), included if EVERY field is blank or
+    matches none (And the second). Count both plus the total to prove they partition the entity —
+    see ClayClient.verify_audience_filter_complement()."""
+    excluded = [af_any_of(entity_type, f, rules) for f, rules in rule_table]
+    included = [af_none_of(entity_type, f, rules) for f, rules in rule_table]
+    return excluded, included
+
+
+def af_with_ids(node: dict) -> dict:
+    """Return a copy of the AST with a UUID `id` on EVERY node (GroupOp, BinOp, ColOp and each
+    ColOp condition). The internal segments endpoint validates them — a node without an `id`
+    fails with 400 "filterAst.items.N - Invalid input" (verified 2026-09-30); the public API
+    documents the same ids as optional editor bookkeeping. Existing ids are kept."""
+    out = dict(node)
+    out.setdefault("id", str(uuid.uuid4()))
+    if isinstance(out.get("items"), list):
+        out["items"] = [af_with_ids(x) for x in out["items"]]
+    if isinstance(out.get("condition"), dict):
+        out["condition"] = af_with_ids(out["condition"])
+    return out
+
+
+def af_root(ast: dict) -> dict:
+    """Wrap a node in a root GroupOp (Clay rejects a bare BinOp/ColOp) and stamp UUID ids on every
+    node, which is what the UI editor writes and what the internal API requires."""
+    root = ast if ast.get("type") == "GroupOp" else af_and(ast)
+    return af_with_ids(root)
+
 
 class ClayClient:
     def __init__(self, workspace_id: int = None, clay_session: str | None = None):
@@ -2699,20 +2862,14 @@ class ClayClient:
         entity_type: str = "CONTACT",
         workspace_id: int | str | None = None,
     ) -> int:
-        """Count rows in an audience segment without fetching them."""
-        entity_type = str(entity_type).upper()
-        if entity_type not in {"CONTACT", "ACCOUNT"}:
-            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
-        ws_id = self._resolve_workspace_id(workspace_id)
-        body = {
-            "entityType": entity_type,
-            "segmentId": segment_id,
-            "isArchived": False,
-            "shouldInjectDraftFilter": True,
-            "segmentType": None,
-        }
-        res = self.post(f"/workspaces/{ws_id}/audiences/count", body)
-        return int(res.get("count", 0))
+        """Count rows in an audience segment without fetching them.
+
+        Fixed 2026-09-30: `segmentId` alone does not apply the segment's filter — Clay's count
+        endpoint expects the filter in `filters` (the UI keeps it client-side), so the old body
+        returned the size of the whole entity. Now delegates to count_audience_records(), which
+        fetches the saved `filterAst` and sends both.
+        """
+        return self.count_audience_records(entity_type, segment_id=segment_id, workspace_id=workspace_id)
 
     def list_audience_segments(
         self,
@@ -3003,6 +3160,142 @@ class ClayClient:
         )
         updated = (res.get("audienceImports") or [res])[0] if isinstance(res, dict) else res
         return {"import": updated, "created_fields": created, "skipped": skipped}
+
+    # ── Audiences: segments (saved filters) and ad-hoc counts ────────────────
+    # Captured live with clay_browser.py 2026-09-30 while creating a segment in the UI and
+    # replayed via the SDK (workspace 12345). No credits; workspace-config writes. Build the
+    # filter with the af_* helpers above.
+
+    def get_audience_segment(self, segment_id: str, *, workspace_id: int | str | None = None) -> dict:
+        """GET /workspaces/{ws}/audiences/segments/{id} -> {id, name, description, filterAst,
+        entityType, estimatedSize, ownerId, order, createdAt, updatedAt, deletedAt, ...}.
+        `estimatedSize` is Clay's cached member count. Verified live 2026-09-30."""
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.get(f"/workspaces/{ws_id}/audiences/segments/{segment_id}")
+
+    def create_audience_segment(
+        self,
+        entity_type: str,
+        name: str,
+        filter_ast: dict | None = None,
+        *,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Create a saved segment. POST /workspaces/{ws}/audiences/segments with
+        {"name", "filterAst": <root GroupOp>, "entityType": "ACCOUNT"|"CONTACT"} -> the segment
+        object (see get_audience_segment). An empty filter (the default) matches every record —
+        that is exactly what the UI's "Create segment" button sends. Set a description with
+        update_audience_segment(). Verified live 2026-09-30. No credits.
+        """
+        et = _af_entity(entity_type)
+        ws_id = self._resolve_workspace_id(workspace_id)
+        body = {"name": name, "filterAst": af_root(filter_ast if filter_ast is not None else af_and()), "entityType": et}
+        return self.post(f"/workspaces/{ws_id}/audiences/segments", body)
+
+    def update_audience_segment(
+        self,
+        segment_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        filter_ast: dict | None = None,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Rename, describe or re-filter a saved segment. PUT /workspaces/{ws}/audiences/segments/{id}
+        with a PARTIAL body — only the keys you pass change (the UI's Rename sends just {"name"}).
+        Returns the full segment object. PATCH and DELETE on this URL are 404 (NoMatchingURL).
+        Verified live 2026-09-30 (UI capture for name; SDK for description and filterAst). No credits.
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if filter_ast is not None:
+            body["filterAst"] = af_root(filter_ast)
+        if not body:
+            raise ValueError("pass at least one of name, description, filter_ast")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        r = self.session.put(self._url(f"/workspaces/{ws_id}/audiences/segments/{segment_id}"), json=body)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_audience_segment(self, segment_id: str, *, workspace_id: int | str | None = None) -> dict:
+        """Delete a saved segment (the UI's "Delete segment"). POST
+        /workspaces/{ws}/audiences/segments/{id}/delete -> {"success": true, "segmentId": ...}.
+        Verified live 2026-09-30 (UI capture and SDK). HARD delete: afterwards GET returns 404
+        "Segment not found" and the segment is gone from the list — there is no undo, so confirm
+        before calling it on anything you did not create. (Whether the official CLI's `archive`
+        maps to this or to a soft archive was not verified.) No credits.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.post(f"/workspaces/{ws_id}/audiences/segments/{segment_id}/delete", {})
+
+    def count_audience_records(
+        self,
+        entity_type: str,
+        *,
+        filter_ast: dict | None = None,
+        segment_id: str | None = None,
+        archived: bool = False,
+        workspace_id: int | str | None = None,
+    ) -> int:
+        """Server-side count of people/companies matching an ad-hoc filter AST, a saved segment,
+        or (neither) the whole entity. POST /workspaces/{ws}/audiences/count with
+        {"entityType", "isArchived", "shouldInjectDraftFilter": true, "segmentType": null} plus
+        "filters": <AST> or "segmentId". This is what the segment editor calls while you edit, so
+        an ad-hoc count equals the segment the same AST would save. Verified live 2026-09-30.
+        """
+        et = _af_entity(entity_type)
+        if filter_ast is not None and segment_id is not None:
+            raise ValueError("pass filter_ast or segment_id, not both")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        body = {"entityType": et, "isArchived": archived, "shouldInjectDraftFilter": True, "segmentType": None}
+        if segment_id is not None:
+            # `segmentId` alone does NOT apply the segment's filter — the UI keeps the filter
+            # client-side and sends it as `filters` (verified 2026-09-30: segmentId-only returned the
+            # whole entity). Fetch the saved AST and send both.
+            body["segmentId"] = segment_id
+            filter_ast = self.get_audience_segment(segment_id, workspace_id=ws_id).get("filterAst") or af_and()
+        if filter_ast is not None:
+            body["filters"] = af_root(filter_ast)
+        res = self.post(f"/workspaces/{ws_id}/audiences/count", body)
+        return int(res.get("count", 0))
+
+    def count_audience_filter_stages(
+        self,
+        entity_type: str,
+        stages: list[dict],
+        *,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """Count a filter one rule at a time: stage k counts And(stages[0..k]). Returns
+        [{"stage": k, "count": n}, ...] — the funnel that shows what each rule removes. Use it
+        before saving a segment so a rule that removes nothing (a value that does not exist, a
+        dead predicate) is caught. Each stage is one count call."""
+        out = []
+        for k in range(len(stages)):
+            out.append({"stage": k + 1, "count": self.count_audience_records(entity_type, filter_ast=af_and(*stages[: k + 1]), workspace_id=workspace_id)})
+        return out
+
+    def verify_audience_filter_complement(
+        self,
+        entity_type: str,
+        exclusion_ast: dict,
+        inclusion_ast: dict,
+        *,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Prove two filters partition the entity: total == excluded + included and nothing is in
+        both. Returns {total, excluded, included, both, neither, exact}. `neither` > 0 with
+        `both` == 0 usually means a field is being back-filled between counts (re-run) or that
+        records lack the related object the rules test (people with no linked company)."""
+        total = self.count_audience_records(entity_type, workspace_id=workspace_id)
+        excluded = self.count_audience_records(entity_type, filter_ast=exclusion_ast, workspace_id=workspace_id)
+        included = self.count_audience_records(entity_type, filter_ast=inclusion_ast, workspace_id=workspace_id)
+        both = self.count_audience_records(entity_type, filter_ast=af_and(exclusion_ast, inclusion_ast), workspace_id=workspace_id)
+        neither = total - excluded - included + both
+        return {"total": total, "excluded": excluded, "included": included, "both": both, "neither": neither, "exact": both == 0 and neither == 0}
 
     def search_export_artifacts(
         self,
