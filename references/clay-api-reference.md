@@ -1521,6 +1521,47 @@ and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. 
   statement BODY that kills them.
 - **Spread syntax fails SILENTLY (verified 2026-09-30):** `{...obj}` and `[...iterable]` both
   produced no cell. Use `Object.assign({}, a, b)` and `Array.from(iterable)`.
+- **`typeof` and `instanceof` fail SILENTLY (verified 2026-09-30):** any formula that contains
+  either keyword produces no cell, even `typeof x` alone. `.constructor` gives FORMULA_ERROR. Type
+  tests that work instead (all probed):
+  - number: `Number.isFinite(x)`;
+  - string: `String(x) === x`;
+  - boolean: `x === true || x === false`;
+  - array: `Array.isArray(x)`;
+  - plain object: `Object(x) === x && !Array.isArray(x)`.
+- **`Intl` is not available** (FORMULA_ERROR). The evaluator runs in **UTC**:
+  `getTimezoneOffset()` is 0, and a date-time with no offset parses as UTC.
+- **`JSON.stringify` sorts object keys alphabetically at every level** (verified 2026-09-30):
+  `JSON.stringify({b:1, a:2})` returns `{"a":2,"b":1}`. `Object.keys`, `Object.entries` and
+  `Object.assign` keep normal insertion order. Never compare stringified JSON as text.
+- **There is no json-typed formula column:** PATCHing a formula with
+  `dataTypeSettings.type: "json"` returns 400 `Data type "json" is not supported for basic fields`.
+  A formula returns text; pass structure as a JSON string and `JSON.parse` it downstream.
+
+**Cell size cap: 8,192 characters, and a longer value is DROPPED SILENTLY** (verified
+2026-09-30):
+- A formula RESULT of 8,193+ characters stores nothing. The cell still reports `status: SUCCESS`,
+  with `coercionErrorCode: "SIZE_LIMIT_EXCEED"` in its metadata.
+- **Plain TEXT cells have the same cap:** writing 8,193 / 20k / 100k / 300k characters via the
+  records PATCH stored nothing, with the same code.
+- **A formula reading a dropped cell sees `""`**, so it computes on an empty input and reports
+  SUCCESS. Nothing downstream can tell.
+- Formula TEXT (the source) is not capped this way: a 60,000-character string literal inside a
+  formula evaluated fine.
+- Design rule: keep each formula's output well under 8 KB, split big results across columns, and
+  check any input that could exceed 8 KB before trusting a formula that reads it. The limit for
+  action cells (AI, HTTP, SOQL results) was not measured here.
+
+**Also verified working 2026-09-30:**
+- values and coercion: `undefined`, `==`/`!=`, `Math.trunc`, `Number(' 72 ')` / `Number('0x40')` /
+  `Number('1e2')`;
+- dates: `new Date('2026-02-30')` rolls over exactly as V8 does (to 2026-03-02), and invalid dates
+  give NaN;
+- syntax: reserved words as object keys (`{class: 1}`), 3-argument `filter` callbacks, reduce with
+  object accumulators, and a regex character class containing `/` (`/[\/?#]/`).
+
+A formula that throws (e.g. `JSON.parse('{')`) shows status ERROR with `staleReason: FORMULA_ERROR`
+(visible, unlike the silent failures above).
 - `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
 - Multi-statement `let` with semicolons — only last expression returns, earlier variables lost.
   To name an intermediate value, pass it into an arrow IIFE: `((x) => x.a + x.b)(JSON.parse(s))`.
