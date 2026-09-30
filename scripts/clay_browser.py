@@ -14,6 +14,7 @@ Usage:
     python clay_browser.py screenshot [path]
     python clay_browser.py click <text> [--role button] [--nth 0]
     python clay_browser.py fill <text> [--placeholder "Search"]
+    python clay_browser.py press <key>            # e.g. Enter, Escape, Control+a
     python clay_browser.py requests [--filter fields] [--last 5]
     python clay_browser.py close
 """
@@ -384,6 +385,19 @@ class ClayBrowserServer:
             pass
         return {"ok": True, "result": result}
 
+    def _cmd_press(self, args) -> dict:
+        # Real key press via Playwright (synthetic KeyboardEvents from eval do not submit
+        # dialogs/forms). Key names as in Playwright: "Enter", "Escape", "Tab", "Control+a".
+        key = args.get("key", "")
+        if not key:
+            return {"ok": False, "error": "key required"}
+        self.page.keyboard.press(key)
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
+        return {"ok": True, "pressed": key}
+
     def _cmd_click_selector(self, args) -> dict:
         selector = args.get("selector", "")
         if not selector:
@@ -598,6 +612,10 @@ def main():
     sel_p = sub.add_parser("click_selector", help="Click element by CSS selector")
     sel_p.add_argument("selector", help="CSS selector")
 
+    # press
+    press_p = sub.add_parser("press", help="Press a key (Playwright key name, e.g. Enter, Escape, Control+a)")
+    press_p.add_argument("key", help="Key to press")
+
     args = parser.parse_args()
 
     # Daemon mode (internal — spawned by launch_daemon)
@@ -649,6 +667,8 @@ def main():
         result = client.send("eval", js=args.js)
     elif args.command == "click_selector":
         result = client.send("click_selector", selector=args.selector)
+    elif args.command == "press":
+        result = client.send("press", key=args.key)
     else:
         parser.print_help()
         return
