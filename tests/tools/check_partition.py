@@ -11,16 +11,24 @@ when the candidate is loaded) - do not copy them. The candidate may be scripts/c
 itself, which checks the shipped implementation.
 
 Method: both sides of every rule table in BATTERY are evaluated over every record of a
-small domain (blank = None or "") under EVERY combination of blank semantics for the
-operators whose behaviour on a blank cell is unknown offline
-    NotEqual, NotContain, False, NotWithinLast, NotWithinNext  -> each False or True on blank
-= 32 models. Positive operators (Equal, Contain, True, WithinLast, WithinNext, ContainAny)
-are False on a blank; Empty is True, NotEmpty False. A table PASSES when exactly one side
-is true for every record under every model. Time operators must carry `timeUnit`.
+small domain (blank = None or "") under every combination of blank semantics for the
+operators whose behaviour on a blank cell is not fixed offline
+    NotEqual, NotContain, NotWithinLast, NotWithinNext  -> each False or True on blank
+= 16 models by default. `False` is FIXED to True-on-blank (MEASURED_ON_BLANK): measured live
+2026-09-29, an unset checkbox is stored blank and Clay's False matches it (True + False = total),
+so the unpinned boolean pair is exact and a NotEmpty pin would make ("False",) match nothing.
+`--all-models` (check_candidate(all_models=True)) enumerates False both ways too - 32 models,
+for reference only: a correct candidate fails the boolean tables under the 16 unmeasured
+"False never matches a blank" models. Positive operators (Equal, Contain, True, WithinLast,
+WithinNext, ContainAny) are False on a blank; Empty is True, NotEmpty False. A table PASSES
+when exactly one side is true for every record under every model, and - for tables flagged
+{"unpinned": True} - when each side holds exactly one row per rule (no NotEmpty pin, no
+Empty guard). Time operators must carry `timeUnit`.
 
-Usage:  python3 tests/tools/check_partition.py <candidate.py> [--json]
+Usage:  python3 tests/tools/check_partition.py <candidate.py> [--json] [--all-models]
 Import: from check_partition import check_candidate
-        check_candidate(path, extra_battery=[(name, [(field, kind, rules), ...]), ...])
+        check_candidate(path, extra_battery=[(name, [(field, kind, rules), ...][, expect]), ...],
+                        all_models=False)
 """
 from __future__ import annotations
 
@@ -34,6 +42,9 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 UNKNOWN_ON_BLANK = ["NotEqual", "NotContain", "False", "NotWithinLast", "NotWithinNext"]
+# Measured live 2026-09-29 (one production workspace, read-only counts): False matches a blank
+# boolean cell. Fixed in the default model set; enumerated both ways only under --all-models.
+MEASURED_ON_BLANK = {"False": True}
 TIME_OPS = {"WithinLast", "NotWithinLast", "WithinNext", "NotWithinNext"}
 DOMAINS = {
     "text": [None, "", "alpha", "beta", "alphabet"],
@@ -41,7 +52,7 @@ DOMAINS = {
     "date": [None, "recent", "old", "soon"],
 }
 
-# (name, [(field_id, kind, rules), ...])
+# (name, [(field_id, kind, rules), ...]) or (name, [...], {"unpinned": True})
 BATTERY = [
     ("single_equal",            [("t1", "text", [("Equal", "alpha")])]),
     ("two_positive_same_field", [("t1", "text", [("Equal", "alpha"), ("Contain", "bet")])]),
@@ -53,8 +64,10 @@ BATTERY = [
     ("notempty_alone",          [("t1", "text", [("NotEmpty",)])]),
     ("notequal_alone",          [("t1", "text", [("NotEqual", "alpha")])]),
     ("notcontain_plus_equal",   [("t1", "text", [("NotContain", "alp"), ("Equal", "beta")])]),
-    ("bool_false",              [("b1", "bool", [("False",)])]),
-    ("bool_true",               [("b1", "bool", [("True",)])]),
+    ("bool_false",              [("b1", "bool", [("False",)])], {"unpinned": True}),
+    ("bool_true",               [("b1", "bool", [("True",)])], {"unpinned": True}),
+    ("bool_true_false",         [("b1", "bool", [("True",), ("False",)])], {"unpinned": True}),
+    ("bool_false_plus_empty",   [("b1", "bool", [("False",), ("Empty",)])], {"unpinned": True}),
     ("within_last",             [("d1", "date", [("WithinLast", 30, "day")])]),
     ("not_within_last",         [("d1", "date", [("NotWithinLast", 7, "week")])]),
     ("mixed_three_fields",      [("t1", "text", [("Equal", "alpha")]),
@@ -67,6 +80,16 @@ BATTERY = [
 
 class CheckError(Exception):
     pass
+
+
+def blank_models(all_models: bool = False):
+    """The blank-semantics models to evaluate under: every combination for the unmeasured
+    operators, with the measured ones fixed unless all_models."""
+    free = [op for op in UNKNOWN_ON_BLANK if all_models or op not in MEASURED_ON_BLANK]
+    for bits in itertools.product([False, True], repeat=len(free)):
+        model = {} if all_models else dict(MEASURED_ON_BLANK)
+        model.update(zip(free, bits))
+        yield model
 
 
 def load_candidate(path: str):
@@ -145,9 +168,11 @@ def all_have_ids(node):
         all_have_ids(node["condition"]) if isinstance(node.get("condition"), dict) else True)
 
 
-def check_table(cand, pr, name, table):
-    out = {"name": name, "passed": False, "error": None, "failing_models": 0, "examples": [],
-           "rows_excluded": None, "rows_included": None, "id_stamp_ok": None}
+def check_table(cand, pr, name, table, expect=None, all_models=False):
+    models = list(blank_models(all_models))
+    out = {"name": name, "passed": False, "error": None, "failing_models": 0, "models": len(models),
+           "examples": [], "rows_excluded": None, "rows_included": None, "id_stamp_ok": None,
+           "unpinned_ok": None}
     try:
         excl, incl = cand.af_exclusion_pair("ACCOUNT", [(f, rules) for f, _, rules in table])
         ex_ast, in_ast = pr.af_or(*excl), pr.af_and(*incl)
@@ -159,10 +184,12 @@ def check_table(cand, pr, name, table):
         out["id_stamp_ok"] = all_have_ids(pr.af_root(ex_ast)) and all_have_ids(pr.af_root(in_ast))
     except Exception as e:  # noqa: BLE001
         out["id_stamp_ok"] = f"error: {e}"
+    if (expect or {}).get("unpinned"):
+        n_rules = sum(len(rules) for _, _, rules in table)
+        out["unpinned_ok"] = out["rows_excluded"] == n_rules and out["rows_included"] == n_rules
     fields = [(f, kind) for f, kind, _ in table]
     failing = 0
-    for bits in itertools.product([False, True], repeat=len(UNKNOWN_ON_BLANK)):
-        model = dict(zip(UNKNOWN_ON_BLANK, bits))
+    for model in models:
         bad = None
         for values in itertools.product(*[DOMAINS[k] for _, k in fields]):
             rec = {f: v for (f, _), v in zip(fields, values)}
@@ -180,7 +207,7 @@ def check_table(cand, pr, name, table):
             if len(out["examples"]) < 3:
                 out["examples"].append(bad)
     out["failing_models"] = failing
-    out["passed"] = failing == 0
+    out["passed"] = failing == 0 and out["unpinned_ok"] is not False
     return out
 
 
@@ -205,6 +232,15 @@ def check_contracts(cand):
         res["time_op_without_unit"] = f"ValueError: {e}"
     except Exception as e:  # noqa: BLE001
         res["time_op_without_unit"] = f"{type(e).__name__}: {e}"
+    for key, table in (("empty_rules_list", [("t1", [])]),
+                       ("empty_string_value", [("t1", [("Equal", "")])])):
+        try:
+            cand.af_exclusion_pair("ACCOUNT", table)
+            res[key] = "built silently (no ValueError)"
+        except ValueError as e:
+            res[key] = f"ValueError: {e}"
+        except Exception as e:  # noqa: BLE001
+            res[key] = f"{type(e).__name__}: {e}"
     try:
         ex, inc = cand.af_exclusion_pair("ACCOUNT", [("t1", [("Equal", "alpha")])])
         res["legacy_tuple_forms_accepted"] = bool(ex) and bool(inc)
@@ -213,10 +249,15 @@ def check_contracts(cand):
     return res
 
 
-def check_candidate(path, extra_battery=None):
+def check_candidate(path, extra_battery=None, all_models=False):
     cand, pr = load_candidate(path), load_pr()
-    tables = [check_table(cand, pr, n, t) for n, t in BATTERY + list(extra_battery or [])]
+    tables = []
+    for entry in BATTERY + list(extra_battery or []):
+        name, table = entry[0], entry[1]
+        expect = entry[2] if len(entry) > 2 else None
+        tables.append(check_table(cand, pr, name, table, expect, all_models))
     return {"candidate": os.path.abspath(path), "tables": tables, "contracts": check_contracts(cand),
+            "models": len(list(blank_models(all_models))),
             "all_passed": all(t["passed"] for t in tables),
             "total_rows": sum((t["rows_excluded"] or 0) + (t["rows_included"] or 0) for t in tables)}
 
@@ -226,17 +267,19 @@ def main():
     if not args:
         print(__doc__)
         sys.exit(2)
-    result = check_candidate(args[0])
+    result = check_candidate(args[0], all_models="--all-models" in sys.argv)
     if "--json" in sys.argv:
         print(json.dumps(result, indent=2, default=str))
     else:
         for t in result["tables"]:
             flag = "PASS" if t["passed"] else "FAIL"
             extra = f" error={t['error']}" if t["error"] else (
-                f" failing_models={t['failing_models']}/32 e.g. {t['examples'][0]}" if t["examples"] else "")
+                f" failing_models={t['failing_models']}/{t['models']} e.g. {t['examples'][0]}" if t["examples"] else "")
+            if t["unpinned_ok"] is not None:
+                extra += f" unpinned={t['unpinned_ok']}"
             print(f"{flag:4} {t['name']:26} rows ex/in={t['rows_excluded']}/{t['rows_included']} ids={t['id_stamp_ok']}{extra}")
         print("contracts:", json.dumps(result["contracts"]))
-        print(f"ALL_PASSED={result['all_passed']} total_rows={result['total_rows']}")
+        print(f"ALL_PASSED={result['all_passed']} total_rows={result['total_rows']} models={result['models']}")
     sys.exit(0 if result["all_passed"] else 1)
 
 

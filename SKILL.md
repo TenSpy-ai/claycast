@@ -297,6 +297,8 @@ from clay_client import ClayClient, af_and, af_or, af_field, af_activity, af_own
 
 clay = ClayClient()
 signal = af_activity("acttyp_<id>", "title", "NotEmpty")               # has any imported CRM activity of this type
+# NotEqual/NotContain also match BLANK cells (verified live 2026-09-29): pin with
+# af_and(af_field(..., "NotEmpty"), rule) when blanks must not be selected.
 status_ok = af_field("ACCOUNT", "audf_<status>", "NotEqual", "Current Client")
 
 # 1. Explore before you save: the funnel shows what each rule removes (a rule that removes
@@ -323,10 +325,20 @@ Rules that keep segments honest (each cost a real mistake):
 - **One activity condition → `af_activity()`** (renders in the UI). Conditions that must describe
   the *same* activity (type AND date) → `af_activity_same_event()` (a `ColOp`; correct, but the UI
   shows the row as "deleted field" — tell the user).
-- **Exclusion pairs need exact negations and a blank branch.** `af_exclusion_pair()` refuses
-  operators without a single-operator negation and treats blank as "not excluded" on both sides.
-  Prove it with `verify_audience_filter_complement()`; if `neither` wobbles while `both` is 0, an
-  import is back-filling — re-run.
+- **Exclusion pairs need exact negations, and blanks are decided per field.** A rule is `(op,)`,
+  `(op, value)` or `(op, value, time_unit)` (or a dict); `af_exclusion_pair()` accepts only
+  Equal/NotEqual, Contain/NotContain, True/False, Empty/NotEmpty, WithinLast/NotWithinLast and
+  WithinNext/NotWithinNext (time rules need `"day"|"week"|"month"` — a unit-less time node is a
+  Clay server error) and raises on `""`/`None`/list values, empty rule lists and unknown
+  operators. A blank cell counts as "not excluded" on both sides unless the field has an
+  `("Empty",)` rule, which excludes it. Blank behaviour: NotEqual/NotContain match blank cells
+  (verified live 2026-09-29), so the excluded side pins such a field under `And(NotEmpty, …)`;
+  for a standalone negative operator outside a pair, pin with `af_and(af_field(..., "NotEmpty"),
+  rule)` when blanks must not be selected. Booleans are the exception: a blank checkbox IS False,
+  so True/False rules are exact without a pin. Prove every pair with
+  `verify_audience_filter_complement()`: `both` and `neither` must both be 0; `neither` > 0 means
+  an import is back-filling (counts drift — re-run) or records lack the related object (a people
+  segment testing company fields).
 - **Use the values the data actually holds** (`audiences/{accounts|contacts}/columns`, or the
   official CLI's `fields list-values`). Lookup fields hold IDs, not names.
 - **ID lists go in one `ContainAny`** (`af_owner_in`), not N `Equal` rows.

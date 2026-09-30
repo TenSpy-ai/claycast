@@ -2046,6 +2046,10 @@ Companies audience, then replayed through the SDK (workspace 12345). SDK:
 ]}
 ```
 
+- Node ids: the internal segments endpoint **requires** a UUID `id` on every node (400 `Field
+  "filterAst.items.N" - Invalid input` without one, verified 2026-09-30 — `af_root()` stamps them),
+  while the official CLI / public API document the same ids as UI-editor bookkeeping that is
+  ignored and stripped. Both hold: stamp ids here, never author them for the official surface.
 - Entity field paths: `["account_entity_field_values", "field", <fieldId>]` for companies,
   `["contact_entity_field_values", "field", <fieldId>]` for people; a people segment may include
   ACCOUNT-path conditions (evaluated on the linked company). Built-in ids (`org_name`, `domain`,
@@ -2059,19 +2063,35 @@ Companies audience, then replayed through the SDK (workspace 12345). SDK:
   "entityType", "condition": <GroupOp>}`, with `["activities", "activity_timestamp"]` for recency)
   — which evaluates correctly but **renders as "deleted field" in the UI**.
 - Operators by data type (the official CLI's filter reference; all accepted here): date —
-  `WithinLast`/`NotWithinLast`/`WithinNext`/`NotWithinNext` (`value` + `timeUnit` day|week|month),
+  `WithinLast`/`NotWithinLast`/`WithinNext`/`NotWithinNext` (`value` + `timeUnit` day|week|month —
+  `af_field(..., time_unit=)` or, in an `af_exclusion_pair` rule table, `(op, value, time_unit)`;
+  a node without `timeUnit` is a server error (500) and `year` is rejected (400), verified live
+  2026-09-29, so every builder raises `ValueError` instead of emitting either),
   `Before`/`After` (ISO timestamp), `Empty`/`NotEmpty`; number/currency — `GreaterThan`, `LessThan`,
   `Equal`, `GreaterThanOrEqual`, `LessThanOrEqual`, `Empty`, `NotEmpty`; boolean — `True`, `False`;
   select/text/email/url — `Equal`, `NotEqual`, `Contain`, `NotContain`, `ContainAny` (list),
   `StartsWith`, `EndsWith`, `Empty`, `NotEmpty`. Text operators are case-insensitive substring/exact.
 - `ContainAny` with a list of 18-char Salesforce IDs on `sfdc_owner_id` is exact and renders as
   one row (counted identically to an Or of 125 `Equal` rows).
-- Blank values match neither `Equal` nor `NotEqual`/`NotContain`. An exclusion and its
-  "everything else" complement therefore need an explicit `Empty` branch on the inclusion side —
-  `af_none_of()` does that, and only operators with a single-operator negation may appear in a
-  rule table (`StartsWith`/`EndsWith`/`GreaterThan`/`ContainAny` have none). Prove the pair with
-  `verify_audience_filter_complement()`; counts drift while an import back-fills (`both` stays 0,
-  `neither` wobbles) — re-run rather than trust one reading.
+- Blank cells. Verified live 2026-09-29 (one production workspace, ACCOUNT entity, read-only
+  counts): NotEqual and NotContain match blank cells; Equal "" matches blank cells; Equal/NotEqual
+  are case-insensitive and exact complements on populated cells; positive operators never match a
+  blank; Empty + NotEmpty = total. Booleans: Empty/NotEmpty are accepted, an unset checkbox is
+  blank, and False matches blank cells (True + False = total). timeUnit accepts day/week/month;
+  year is rejected (400); a time node without timeUnit is a server error (500). Nested
+  And(NotEmpty, ...) / Or(..., Empty) evaluate as ordinary conjunction/disjunction. So an
+  exclusion and its "everything else" complement cannot use a bare negative operator:
+  `af_any_of()` pins a field that has one under `And(NotEmpty, …)` (a blank is never excluded)
+  unless the field has an `("Empty",)` rule — which excludes blanks, and makes `af_none_of()` drop
+  its `Empty` guard; a `("NotEmpty",)` rule makes the included side `And(Empty)`; True/False
+  rules use the bare, unpinned pair because a blank boolean is False. Rule tables accept only the
+  operators in `AUDIENCE_NEGATED_OPERATOR` — Contain, Empty, Equal, False, NotContain, NotEmpty,
+  NotEqual, NotWithinLast, NotWithinNext, True, WithinLast, WithinNext
+  (`StartsWith`/`EndsWith`/`GreaterThan`/`ContainAny` have no exact negation) — as `(op,)`,
+  `(op, value)` or `(op, value, time_unit)`; time rules must carry a unit in day|week|month; `""`,
+  `None` and list values, empty rule lists and an empty table raise `ValueError`. Prove the pair
+  with `verify_audience_filter_complement()`: `both` and `neither` must both be 0; `neither` > 0
+  means an import is back-filling (counts drift — re-run) or records lack the related object.
 - Use real values: `GET …/audiences/{accounts|contacts}/columns?includeSystemFields=true` lists
   fields; the official CLI's `audiences fields list-values <id>` lists values with counts. A rule
   on a value that does not exist ("Current Customer" where the data says "Current Client")

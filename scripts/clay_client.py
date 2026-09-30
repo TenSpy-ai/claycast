@@ -16,6 +16,7 @@ import csv
 import datetime
 import io
 import json
+import math
 import os
 import random
 import re
@@ -849,10 +850,27 @@ def format_json_body(mapping: dict) -> str:
 #      "deleted field", so prefer af_activity() when a segment needs only ONE activity condition.
 #   2. An exclusion segment and the "everything else" segment must be exact complements, which
 #      requires every rule to use an operator with a single-operator negation (Equal/NotEqual,
-#      Contain/NotContain, True/False, Empty/NotEmpty, ...). af_exclusion_pair() enforces that and
-#      treats a blank field as "not excluded" on both sides.
+#      Contain/NotContain, True/False, Empty/NotEmpty, WithinLast/NotWithinLast,
+#      WithinNext/NotWithinNext). af_exclusion_pair() enforces that and decides blank cells per
+#      field: a blank counts as "matches none" (not excluded) unless the field has an ("Empty",)
+#      rule, which excludes it. Negative text/date operators DO match blank cells, so on the
+#      excluded side they are pinned under And(NotEmpty, ...); boolean rules are exact without a
+#      pin because a blank boolean IS False; a ("NotEmpty",) rule makes the included side
+#      And(Empty). The partition rests on four assumptions, verified live 2026-09-29 (one
+#      production workspace, ACCOUNT entity, read-only counts):
+#        A1 Empty and NotEmpty are exact complements (Empty + NotEmpty = total); Equal "" matches
+#           blank cells, so "" is refused as a rule value.
+#        A2 An operator and its negation are exact complements on populated cells (Equal/NotEqual
+#           are case-insensitive).
+#        A3 Positive operators (Equal, Contain, True, WithinLast, WithinNext) never match a blank.
+#        A4 Nested And/Or groups evaluate as ordinary conjunction/disjunction.
 
 AUDIENCE_ENTITY_PATHS = {"ACCOUNT": "account_entity_field_values", "CONTACT": "contact_entity_field_values"}
+# The negation map: operator -> the operator that is its exact complement on a POPULATED cell
+# (Empty/NotEmpty are complements on every cell). It is NOT the rule-table allow-list by itself:
+# af_none_of()/af_exclusion_pair() accept exactly its keys, while af_any_of() also passes other
+# operators through (ContainAny, like af_owner_in). The WithinLast-family entries need `timeUnit`,
+# which a rule carries as its third element — (op, value, time_unit), see af_rule().
 AUDIENCE_NEGATED_OPERATOR = {
     "Equal": "NotEqual", "NotEqual": "Equal",
     "Contain": "NotContain", "NotContain": "Contain",
@@ -861,6 +879,28 @@ AUDIENCE_NEGATED_OPERATOR = {
     "WithinLast": "NotWithinLast", "NotWithinLast": "WithinLast",
     "WithinNext": "NotWithinNext", "NotWithinNext": "WithinNext",
 }
+# Operators that take a numeric value plus "timeUnit". Verified live 2026-09-29: day/week/month are
+# accepted, "year" is rejected (400) and a time node WITHOUT timeUnit is a server error (500) — so
+# every builder here refuses to emit one (_af_time_unit).
+AUDIENCE_TIME_OPERATORS = frozenset({"WithinLast", "NotWithinLast", "WithinNext", "NotWithinNext"})
+AUDIENCE_TIME_UNITS = ("day", "week", "month")
+# Negations of positive operators that, unlike the positive operators, also match a BLANK cell.
+# Verified live 2026-09-29 (one production workspace, ACCOUNT entity): NotEqual and NotContain
+# matched every blank text cell and False matched every blank boolean; NotWithinLast/NotWithinNext
+# could not be measured (the probed date field had no blanks) and are treated the same way. A bare
+# one on the excluded side of a pair would put blank records on BOTH sides, so af_any_of() pins the
+# group under NotEmpty — the pin is the correctness mechanism, not insurance.
+AUDIENCE_BLANK_UNKNOWN_OPERATORS = frozenset({"NotEqual", "NotContain", "False", "NotWithinLast", "NotWithinNext"})
+# Boolean fields: an unset checkbox is stored blank and Clay's False matches it — True + False = total
+# on all 5 boolean fields checked (verified live 2026-09-29, one production workspace). So True/False
+# rules use the plain unpinned pair — excluded Or(rules), included And(negations) with no Empty guard
+# — and a NotEmpty pin would make a ("False",) rule match nothing (And(NotEmpty, False) matched no
+# record live). Flip this only if a workspace is measured the other way.
+AUDIENCE_BOOLEAN_BLANK_IS_FALSE = True
+_AF_NO_VALUE_OPERATORS = frozenset({"Empty", "NotEmpty", "True", "False"})
+_AF_BOOLEAN_OPERATORS = frozenset({"True", "False"})
+_AF_SCALAR_VALUE_OPERATORS = frozenset({"Equal", "NotEqual", "Contain", "NotContain"})
+_AF_RULE_DICT_KEYS = frozenset({"operator", "op", "value", "time_unit", "timeUnit"})
 
 
 def _af_entity(entity_type: str) -> str:
@@ -901,20 +941,41 @@ def af_or(*items: dict) -> dict:
     return {"type": "GroupOp", "combinationMode": "Or", "items": list(items)}
 
 
+def _af_time_unit(operator: str, time_unit: Any, *, where: str) -> str | None:
+    """Enforce the timeUnit contract for one node and return the unit to stamp (None for a
+    non-time operator). Verified live 2026-09-29: a WithinLast-family node without timeUnit is a
+    server error (500) and timeUnit "year" is rejected (400) — both are ValueErrors here, as is a
+    time_unit on any other operator (Clay would silently carry it)."""
+    units = "/".join(AUDIENCE_TIME_UNITS)
+    if operator in AUDIENCE_TIME_OPERATORS:
+        if time_unit is None:
+            raise ValueError(f"{where}: {operator} needs time_unit ({units}); a time node without timeUnit is a Clay server error")
+        if time_unit not in AUDIENCE_TIME_UNITS:
+            raise ValueError(f"{where}: time_unit must be one of {units}, got {time_unit!r}")
+        return time_unit
+    if time_unit is not None:
+        raise ValueError(f"{where}: time_unit only applies to {'/'.join(sorted(AUDIENCE_TIME_OPERATORS))}, got {time_unit!r} on {operator!r}")
+    return None
+
+
 def af_field(entity_type: str, field_id: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
     """BinOp on an Audiences field of a company (ACCOUNT) or person (CONTACT).
 
     `field_id` is a built-in id (`org_name`, `domain`, `sfdc_owner_id`, `email`, `title`, ...) or a
     custom `audf_...` id. A people segment may test company fields by passing entity_type="ACCOUNT"
     (Clay evaluates them on the linked company). `value` is omitted for Empty/NotEmpty/True/False;
-    WithinLast/WithinNext take a number plus time_unit ("day"|"week"|"month"); ContainAny takes a list.
+    WithinLast/NotWithinLast/WithinNext/NotWithinNext take a number plus time_unit
+    ("day"|"week"|"month") and raise ValueError without it (a unit-less time node is a Clay server
+    error, verified live 2026-09-29) or when a time_unit is given for any other operator;
+    ContainAny takes a list.
     """
     et = _af_entity(entity_type)
+    unit = _af_time_unit(operator, time_unit, where="af_field")
     node = {"type": "BinOp", "key": field_id, "dataPath": [AUDIENCE_ENTITY_PATHS[et], "field", field_id], "operator": operator, "entityType": et}
     if value is not None:
         node["value"] = value
-    if time_unit:
-        node["timeUnit"] = time_unit
+    if unit is not None:
+        node["timeUnit"] = unit
     return node
 
 
@@ -924,23 +985,28 @@ def af_activity(activity_type_id: str, field_id: str, operator: str, value: Any 
     `activity_type_id` is the `acttyp_...` id (from `activities get/summary` or the Audiences settings);
     `field_id` is "title", "created_at" or a custom `actf_...` field on that activity type. Renders and
     edits in the Clay UI. Two of these as siblings do NOT bind to the same activity — see
-    af_activity_same_event().
+    af_activity_same_event(). Same time_unit contract as af_field() (ValueError without a unit on
+    a WithinLast-family operator, or with one on any other).
     """
+    unit = _af_time_unit(operator, time_unit, where="af_activity")
     node = {"type": "BinOp", "key": f"{field_id}::{activity_type_id}", "dataPath": ["activities", "fields", field_id, activity_type_id], "operator": operator}
     if value is not None:
         node["value"] = value
-    if time_unit:
-        node["timeUnit"] = time_unit
+    if unit is not None:
+        node["timeUnit"] = unit
     return node
 
 
 def af_activity_timestamp(entity_type: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
-    """Recency of an activity, for use INSIDE af_activity_same_event() (dataPath ["activities", "activity_timestamp"])."""
+    """Recency of an activity, for use INSIDE af_activity_same_event() (dataPath ["activities",
+    "activity_timestamp"]). Same time_unit contract as af_field() (ValueError without a unit on a
+    WithinLast-family operator, or with one on any other)."""
+    unit = _af_time_unit(operator, time_unit, where="af_activity_timestamp")
     node = {"type": "BinOp", "dataPath": ["activities", "activity_timestamp"], "operator": operator, "entityType": _af_entity(entity_type)}
     if value is not None:
         node["value"] = value
-    if time_unit:
-        node["timeUnit"] = time_unit
+    if unit is not None:
+        node["timeUnit"] = unit
     return node
 
 
@@ -963,30 +1029,166 @@ def af_owner_in(owner_ids: list[str], entity_type: str = "ACCOUNT") -> dict:
     return af_field(entity_type, "sfdc_owner_id", "ContainAny", list(owner_ids))
 
 
-def af_any_of(entity_type: str, field_id: str, rules: list[tuple]) -> dict:
-    """Or of one BinOp per rule; a rule is (operator,) or (operator, value). The 'excluded' side of a pair."""
-    return af_or(*[af_field(entity_type, field_id, r[0], r[1] if len(r) > 1 else None) for r in rules])
+def af_rule(rule: Any) -> tuple[str, Any, str | None]:
+    """Normalise one exclusion-pair rule to (operator, value, time_unit) and validate it — pure, so
+    a rule table can be checked before any HTTP call. Accepted forms: (op,), (op, value),
+    (op, value, time_unit), a list in place of a tuple, or a dict {"operator"|"op", "value",
+    "time_unit"|"timeUnit"}. Per operator: Empty/NotEmpty/True/False take no value and no unit;
+    WithinLast/NotWithinLast/WithinNext/NotWithinNext take a finite number >= 0 plus a unit in
+    AUDIENCE_TIME_UNITS (a unit-less time node is a server error, verified live 2026-09-29);
+    Equal/NotEqual/Contain/NotContain take one scalar value — not None, not "" (Equal "" matches
+    blank cells, verified live 2026-09-29: write ("Empty",) instead) and not a list (one rule per
+    value; ContainAny has no exact negation); any other operator takes a value and no unit
+    (af_any_of() passes it through, af_none_of() rejects it). Everything else is a ValueError."""
+    if isinstance(rule, dict):
+        unknown = set(rule) - _AF_RULE_DICT_KEYS
+        if unknown:
+            raise ValueError(f"rule {rule!r}: unknown keys {sorted(unknown)}; a rule dict has operator (or op), value, time_unit (or timeUnit)")
+        if "operator" in rule and "op" in rule:
+            raise ValueError(f"rule {rule!r}: give 'operator' or 'op', not both")
+        if "time_unit" in rule and "timeUnit" in rule:
+            raise ValueError(f"rule {rule!r}: give 'time_unit' or 'timeUnit', not both")
+        if "operator" not in rule and "op" not in rule:
+            raise ValueError(f"rule {rule!r} needs an 'operator' key")
+        op = rule["operator"] if "operator" in rule else rule["op"]
+        value = rule.get("value")
+        time_unit = rule["time_unit"] if "time_unit" in rule else rule.get("timeUnit")
+    elif isinstance(rule, (tuple, list)):
+        if not 1 <= len(rule) <= 3:
+            raise ValueError(f"a rule is (op,), (op, value) or (op, value, time_unit), got {rule!r}")
+        op = rule[0]
+        value = rule[1] if len(rule) > 1 else None
+        time_unit = rule[2] if len(rule) > 2 else None
+    else:
+        raise ValueError(f"a rule is (op,), (op, value), (op, value, time_unit) or a dict, got {rule!r}")
+    if not isinstance(op, str) or not op:
+        raise ValueError(f"rule {rule!r}: operator must be a non-empty string")
+    unit = _af_time_unit(op, time_unit, where=f"rule {rule!r}")
+    if op in _AF_NO_VALUE_OPERATORS:
+        if value is not None:
+            raise ValueError(f"rule {rule!r}: {op} takes no value; write ({op!r},)")
+        return op, None, None
+    if op in AUDIENCE_TIME_OPERATORS:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"rule {rule!r}: {op} needs a finite number >= 0 as value, e.g. ({op!r}, 30, 'day')")
+        return op, value, unit
+    if value is None:
+        raise ValueError(f"rule {rule!r}: {op} needs a value")
+    if isinstance(value, str) and value == "":
+        raise ValueError(f"rule {rule!r}: an empty-string value is ambiguous on blank cells (Equal \"\" matches them); use ('Empty',) or ('NotEmpty',)")
+    if op in _AF_SCALAR_VALUE_OPERATORS and isinstance(value, (list, tuple, set, frozenset, dict)):
+        raise ValueError(f"rule {rule!r}: {op} takes one scalar value; write one rule per value (ContainAny has no exact negation)")
+    return op, value, None
 
 
-def af_none_of(entity_type: str, field_id: str, rules: list[tuple]) -> dict:
-    """Blank OR none of the rules match — the exact complement of af_any_of() for the same rules.
-    Every operator must have a single-operator negation (see AUDIENCE_NEGATED_OPERATOR)."""
-    negated = []
-    for r in rules:
-        op = r[0]
+def _af_rules(field_id: Any, rules: Any) -> list[tuple[str, Any, str | None]]:
+    """One field's rules through af_rule(): validated, identical rules collapsed (first occurrence
+    kept), never empty; every error names the field."""
+    if not isinstance(field_id, str) or not field_id:
+        raise ValueError(f"field id must be a non-empty string, got {field_id!r}")
+    if isinstance(rules, (str, bytes, dict)) or not hasattr(rules, "__iter__"):
+        raise ValueError(f"field {field_id!r}: rules must be a list of rules, got {rules!r}")
+    norm: list[tuple[str, Any, str | None]] = []
+    for rule in rules:
+        try:
+            parts = af_rule(rule)
+        except ValueError as e:
+            raise ValueError(f"field {field_id!r}: {e}") from None
+        if parts not in norm:
+            norm.append(parts)
+    if not norm:
+        raise ValueError(f"field {field_id!r} has no rules; drop the field from the table instead")
+    return norm
+
+
+def _af_check_negatable(field_id: str, norm: list[tuple[str, Any, str | None]]) -> None:
+    """Every rule of an exclusion pair needs an operator with a single-operator negation."""
+    for op, _, _ in norm:
         if op not in AUDIENCE_NEGATED_OPERATOR:
-            raise ValueError(f"operator {op!r} has no exact negation; use Equal/Contain/True/Empty-family operators in rule tables")
-        negated.append(af_field(entity_type, field_id, AUDIENCE_NEGATED_OPERATOR[op], r[1] if len(r) > 1 else None))
-    return af_or(af_field(entity_type, field_id, "Empty"), af_and(*negated))
+            raise ValueError(
+                f"field {field_id!r}: operator {op!r} is unknown or has no exact negation; "
+                f"exclusion tables accept only {', '.join(sorted(AUDIENCE_NEGATED_OPERATOR))}"
+            )
 
 
-def af_exclusion_pair(entity_type: str, rule_table: list[tuple[str, list[tuple]]]) -> tuple[list[dict], list[dict]]:
+def _af_any_of(et: str, field_id: str, norm: list[tuple[str, Any, str | None]]) -> dict:
+    group = af_or(*[af_field(et, field_id, op, value, time_unit=tu) for op, value, tu in norm])
+    ops = {op for op, _, _ in norm}
+    if ops & _AF_BOOLEAN_OPERATORS and AUDIENCE_BOOLEAN_BLANK_IS_FALSE:
+        return group  # a blank boolean IS False: the bare rules already decide blank cells exactly
+    if "Empty" not in ops and ops & AUDIENCE_BLANK_UNKNOWN_OPERATORS:
+        # NotEqual/NotContain/... match blank cells (verified live 2026-09-29): without this pin a
+        # blank record would be excluded here AND included by the Empty guard of _af_none_of().
+        return af_and(af_field(et, field_id, "NotEmpty"), group)
+    return group
+
+
+def _af_none_of(et: str, field_id: str, norm: list[tuple[str, Any, str | None]]) -> dict:
+    negated = [af_field(et, field_id, AUDIENCE_NEGATED_OPERATOR[op], value, time_unit=tu) for op, value, tu in norm]
+    ops = {op for op, _, _ in norm}
+    if ops & _AF_BOOLEAN_OPERATORS and AUDIENCE_BOOLEAN_BLANK_IS_FALSE:
+        return af_and(*negated)  # no Empty guard: True/False already partition blank cells
+    if "Empty" in ops:
+        return af_and(*negated)  # the Empty rule excludes blanks; NotEmpty (its negation) is in here
+    if "NotEmpty" in ops:
+        return af_and(af_field(et, field_id, "Empty"))  # every populated record is excluded
+    return af_or(af_field(et, field_id, "Empty"), af_and(*negated))
+
+
+def af_any_of(entity_type: str, field_id: str, rules: list) -> dict:
+    """Or of one BinOp per rule — the 'excluded' side of a pair for one field. A rule is (op,),
+    (op, value), (op, value, time_unit) or a dict (see af_rule(); identical rules collapse, an
+    empty list raises). Any operator is passed through (ContainAny, like af_owner_in). Blank cells:
+    NotEqual/NotContain/False/NotWithinLast/NotWithinNext match them (verified live 2026-09-29),
+    so a field with one of those and no ("Empty",) rule is pinned — And(NotEmpty, Or(rules)), one
+    extra UI row — and a blank is never excluded; that pin is what keeps the pair exact, not
+    insurance. Exception: True/False rules are emitted bare, because a blank boolean IS False and
+    a NotEmpty pin would make ("False",) match nothing (AUDIENCE_BOOLEAN_BLANK_IS_FALSE)."""
+    et = _af_entity(entity_type)
+    return _af_any_of(et, field_id, _af_rules(field_id, rules))
+
+
+def af_none_of(entity_type: str, field_id: str, rules: list) -> dict:
+    """The exact complement of af_any_of() for the same rules. Every operator must be a key of
+    AUDIENCE_NEGATED_OPERATOR (ValueError otherwise, naming the field and the allowed operators).
+    Without an ("Empty",) rule: blank OR none of the rules match -> Or(Empty, And(negated)). With
+    one, the blank is excluded by that rule, so the guard is dropped -> And(negated), where
+    NotEmpty is the negation of the Empty rule. A ("NotEmpty",) rule excludes every populated
+    record, so the complement is And(Empty). True/False rules: And(negated) with no guard (a blank
+    boolean is False)."""
+    et = _af_entity(entity_type)
+    norm = _af_rules(field_id, rules)
+    _af_check_negatable(field_id, norm)
+    return _af_none_of(et, field_id, norm)
+
+
+def af_exclusion_pair(entity_type: str, rule_table: list[tuple[str, list]]) -> tuple[list[dict], list[dict]]:
     """From [(field_id, rules), ...] return (excluded_items, included_items): the record is excluded
-    if ANY field matches any of its rules (Or the first list), included if EVERY field is blank or
-    matches none (And the second). Count both plus the total to prove they partition the entity —
-    see ClayClient.verify_audience_filter_complement()."""
-    excluded = [af_any_of(entity_type, f, rules) for f, rules in rule_table]
-    included = [af_none_of(entity_type, f, rules) for f, rules in rule_table]
+    if ANY field matches any of its rules (Or the first list), included if EVERY field matches none
+    (And the second) — a blank cell counts as "matches none" unless that field has an ("Empty",)
+    rule, which excludes it. A rule is (op,), (op, value) or (op, value, time_unit) — see af_rule()
+    for the grammar — using only the operators in AUDIENCE_NEGATED_OPERATOR. The whole table is
+    validated before anything is built (entity type, (field_id, rules) entries, every rule; an
+    empty table or a field with no rules is a ValueError). Fields with a negative operator are
+    pinned under NotEmpty on the excluded side, boolean rules are exact unpinned, and a
+    ("NotEmpty",) rule makes the included side And(Empty). Count both plus the total to prove they
+    partition the entity — see ClayClient.verify_audience_filter_complement()."""
+    et = _af_entity(entity_type)
+    if isinstance(rule_table, (str, bytes, dict)) or not hasattr(rule_table, "__iter__"):
+        raise ValueError(f"rule_table must be a list of (field_id, rules) entries, got {rule_table!r}")
+    entries = list(rule_table)
+    if not entries:
+        raise ValueError("rule_table is empty; an exclusion pair needs at least one (field_id, rules) entry")
+    normalised = []
+    for entry in entries:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+            raise ValueError(f"rule_table entry {entry!r}: expected (field_id, rules)")
+        field_id, rules = entry
+        norm = _af_rules(field_id, rules)
+        _af_check_negatable(field_id, norm)
+        normalised.append((field_id, norm))
+    excluded = [_af_any_of(et, f, norm) for f, norm in normalised]
+    included = [_af_none_of(et, f, norm) for f, norm in normalised]
     return excluded, included
 
 
