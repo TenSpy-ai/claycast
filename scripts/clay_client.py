@@ -866,6 +866,10 @@ def format_json_body(mapping: dict) -> str:
 #           are case-insensitive).
 #        A3 Positive operators (Equal, Contain, True, WithinLast, WithinNext) never match a blank.
 #        A4 Nested And/Or groups evaluate as ordinary conjunction/disjunction.
+#      UI: verified 2026-09-30 in the segment editor — the pinned And(NotEmpty, Or(...)) and the
+#      guarded Or(Empty, And(...)) render as ordinary editable rows and groups (no "deleted
+#      field"), the editor's count equals the API count, and the saved AST round-trips with its
+#      nesting intact.
 
 AUDIENCE_ENTITY_PATHS = {"ACCOUNT": "account_entity_field_values", "CONTACT": "contact_entity_field_values"}
 # The negation map: operator -> the operator that is its exact complement on a POPULATED cell

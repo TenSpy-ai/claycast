@@ -337,7 +337,9 @@ Rules that keep segments honest (each cost a real mistake):
   (verified live 2026-09-29), so the excluded side pins such a field under `And(NotEmpty, …)`;
   for a standalone negative operator outside a pair, pin with `af_and(af_field(..., "NotEmpty"),
   rule)` when blanks must not be selected. Booleans are the exception: a blank checkbox IS False,
-  so True/False rules are exact without a pin. Prove every pair with
+  so True/False rules are exact without a pin. The nested shapes both sides produce render and
+  edit in the segment editor as ordinary rows and groups (verified 2026-09-30: no "deleted
+  field", editor count = API count, saved filter round-trips intact). Prove every pair with
   `verify_audience_filter_complement()`: `both` and `neither` must both be 0; `neither` > 0 means
   an import is back-filling (counts drift — re-run) or records lack the related object (a people
   segment testing company fields).

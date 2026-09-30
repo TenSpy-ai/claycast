@@ -2079,7 +2079,10 @@ Companies audience, then replayed through the SDK (workspace 12345). SDK:
   blank; Empty + NotEmpty = total. Booleans: Empty/NotEmpty are accepted, an unset checkbox is
   blank, and False matches blank cells (True + False = total). timeUnit accepts day/week/month;
   year is rejected (400); a time node without timeUnit is a server error (500). Nested
-  And(NotEmpty, ...) / Or(..., Empty) evaluate as ordinary conjunction/disjunction. So an
+  And(NotEmpty, ...) / Or(..., Empty) evaluate as ordinary conjunction/disjunction — and both
+  shapes were opened in the segment editor on 2026-09-30: they render as ordinary editable rows
+  and groups (no "deleted field"), the editor's count equals the API count, and the saved filter
+  round-trips with the nesting intact. So an
   exclusion and its "everything else" complement cannot use a bare negative operator:
   `af_any_of()` pins a field that has one under `And(NotEmpty, …)` (a blank is never excluded)
   unless the field has an `("Empty",)` rule — which excludes blanks, and makes `af_none_of()` drop
