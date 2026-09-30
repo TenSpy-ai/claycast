@@ -1916,9 +1916,18 @@ then replayed through the SDK for two more (one `text`, one `boolean`): the impo
 within a minute and the new columns populated. **There is no official CLI or public-API surface
 for this** — the `clay` CLI's `audiences fields create` makes an empty field nothing fills.
 
-SDK: `clay.add_salesforce_import_fields(import_id, [...])` (the safe convenience), built on
+SDK: `clay.add_salesforce_import_fields(import_id, [...])` — the safe convenience, built on
 `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`,
-`update_salesforce_import_field_mapping` and `get_audience_import_sync_status`.
+`update_salesforce_import_field_mapping` and `get_audience_import_sync_status`. "Safe" means:
+the five sync settings are echoed from `importMetadata` or the call aborts (never defaulted);
+the import, every EXISTING mapping entry, the field catalog and the new fields' displayNames
+are validated before the first write; duplicate `salesforceFieldId`s collapse to one field;
+`dry_run=True` returns the plan with no writes; the import is re-read before the PATCH so a
+concurrent mapping change is not overwritten; and a second write that fails after the fields
+were created surfaces as `AudienceFieldsOrphanedError` (created ids + the exact mapping to
+re-send when the create response paired with the request). No internal endpoint for deleting
+or updating an Audiences field definition has been captured; the official CLI
+`clay audiences fields delete|update` covers that.
 
 Model: one **import** (`audimp_<id>`) per synced Salesforce object (`importSourceSubtype`
 `account` / `contact`, `entityType` ACCOUNT / CONTACT), owned by one Salesforce connection
@@ -1927,6 +1936,11 @@ list of `{audienceFieldId ↔ salesforceFieldId}` pairs. Activity imports (`auda
 Tasks/Events) are a separate object and were not captured being edited.
 
 ### The write — what Save sends (two calls)
+
+The pair is not transactional: a failed step 2 leaves step 1's `audf_` fields as orphans, and
+no DELETE for `/audiences/field` has been captured or wrapped. The SDK therefore validates the
+existing `fieldMappings` before step 1, re-reads the import between the steps, and raises
+`AudienceFieldsOrphanedError` if step 2 still fails.
 
 1. `POST /v3/workspaces/{ws}/audiences/field` — bulk-create the Audiences field definitions.
    Body `{"entityType": "ACCOUNT", "audienceFields": [{"displayName": "Account Owner - Manager", "fieldType": "SCALAR", "dataType": "text"}]}`.
@@ -1954,13 +1968,20 @@ Tasks/Events) are a separate object and were not captured being edited.
    ids as `audienceFieldId` (`org_name`, `domain`, `linkedin_url`, `sfdc_owner_id`; `name`,
    `title`, `email`, `phone` on contacts); custom ones use `audf_<id>`. `mappingRule` was
    `NEVER_WRITE` on every pair. **The list is the whole mapping** — read it first with
-   `list_audience_imports` and append, or the omitted pairs stop syncing.
+   `list_audience_imports` and append, or the omitted pairs stop syncing. **The body also
+   REPLACES the five sync settings** (`isImportSyncEnabled`, `isExportSyncEnabled`,
+   `isCreateNewRecordsEnabled`, `createNewRecordsIdMapping`, `isTaskSyncEnabled`) — they are
+   written as sent, so echo the import's `importMetadata` values; a default of false would switch
+   export or task sync off. claycast requires them explicitly
+   (`update_salesforce_import_field_mapping` has no defaults — omitting one is a TypeError; the
+   `sync_flags={...}` form takes them keyed like importMetadata) and `add_salesforce_import_fields`
+   copies them from `importMetadata`, failing closed when one is absent.
 
 ### The reads around it
 
 | Endpoint | Params | Response |
 |---|---|---|
-| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType` | `{"audienceImports": [...]}` — each with `id`, `entityType`, `displayName`, `importSourceType`, `importSourceSubtype`, `status`, `importedCount`, `fieldMapping.fieldMappings`, `importMetadata{appAccountId, salesforceOrgId, isImportSyncEnabled, isExportSyncEnabled, isCreateNewRecordsEnabled, createNewRecordsIdMapping, isTaskSyncEnabled, salesforceImportKind}` |
+| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType` | `{"audienceImports": [...]}` — each with `id`, `entityType`, `displayName`, `importSourceType`, `importSourceSubtype`, `status`, `importedCount`, `fieldMapping.fieldMappings`, `importMetadata{appAccountId, salesforceOrgId, isImportSyncEnabled, isExportSyncEnabled, isCreateNewRecordsEnabled, createNewRecordsIdMapping, isTaskSyncEnabled, salesforceImportKind}` (the five sync keys are what the mapping PATCH replaces; observed under `importMetadata` only, never at the import's top level. Verified live 2026-09-29: the ACCOUNT import carried all five, the CONTACT import had no `isTaskSyncEnabled` — the SDK refuses to guess it and takes `sync_flags=`) |
 | `GET /v3/workspaces/{ws}/audiences/imports/salesforce-fields/{object}` | `authAccountId=aa_<id>`; `{object}` = the import's `importSourceSubtype` | `{"fields": [{"value": "<API name>", "label", "type" (string, picklist, multipicklist, boolean, double, int, currency, percent, date, datetime, reference, url, email, textarea, id), "isUpdateable", "externalId", "isAssociatedObjectField"}]}` |
 | `GET /v3/workspaces/{ws}/audiences/imports/salesforce-preview/{Object}` | `authAccountId=aa_<id>` | sample records (`Task` returned 400 on the captured connection) |
 | `GET /v3/workspaces/{ws}/audiences/imports/external-source-sync-status/SALESFORCE/{audimp_<id>}` | — | `{importSyncStatus, importSyncType ("sync_incremental"), lastSyncedTime, numImportRecordsSynced, numImportRecordsTotal, lastExportedTime, hasExportInProgress, ...}`; the UI polls this every ~5 s after a save |
@@ -1978,6 +1999,21 @@ Tasks/Events) are a separate object and were not captured being edited.
   sync-status endpoint or count non-null values in the new column instead.
 - Mapping is per import: the CONTACT import is a different `audimp_<id>` with its own list.
 - No credits are spent by any of these calls; they are workspace-config writes.
+- Orphan fields: the two-call write is not atomic. Validate the existing `fieldMappings`
+  before `POST /audiences/field` (the SDK does — an incomplete pair would otherwise be rejected
+  by the PATCH only after the fields exist), and treat a PATCH failure afterwards as fields that
+  exist unmapped: the SDK raises `AudienceFieldsOrphanedError` with the created `audf_` ids and,
+  when the create response paired with the request, the exact mapping to re-send (idempotent —
+  the PATCH is a REPLACE). No wrapped delete exists; remove orphans with the official CLI
+  `clay audiences fields delete <audf_id> --entity-type people|companies` (soft, idempotent) or
+  the UI, and only after a re-read confirms they are unmapped — a connection error after the
+  PATCH was sent leaves its outcome unknown.
+- The endpoints do not dedupe: `POST /audiences/field` creates a second field for a repeated
+  displayName and the PATCH accepts two pairs for one `salesforceFieldId`. The SDK collapses
+  repeats within one `add_salesforce_import_fields` call client-side (conflicting displayName /
+  dataType raise before any request), skips API names already mapped, and requires distinct
+  displayNames among the new fields; duplicates already inside the import's current mapping are
+  preserved verbatim.
 
 ---
 

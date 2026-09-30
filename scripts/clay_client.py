@@ -990,6 +990,289 @@ def af_root(ast: dict) -> dict:
     return af_with_ids(root)
 
 
+# ── Audiences: Salesforce import mapping — module-level helpers ───────────────
+# The five import-level sync settings the mapping PATCH replaces. They live in the import's
+# `importMetadata` (verified live 2026-09-29 — there and nowhere else, not at the import's top
+# level). Four are booleans, the fifth is a dict or None.
+_SF_IMPORT_SYNC_BOOL_KEYS = (
+    "isImportSyncEnabled",
+    "isExportSyncEnabled",
+    "isCreateNewRecordsEnabled",
+    "isTaskSyncEnabled",
+)
+_SF_IMPORT_SYNC_KEYS = _SF_IMPORT_SYNC_BOOL_KEYS + ("createNewRecordsIdMapping",)
+# importMetadata key -> the matching update_salesforce_import_field_mapping() keyword argument.
+_SF_IMPORT_SYNC_KWARGS = {
+    "isImportSyncEnabled": "is_import_sync_enabled",
+    "isExportSyncEnabled": "is_export_sync_enabled",
+    "isCreateNewRecordsEnabled": "is_create_new_records_enabled",
+    "createNewRecordsIdMapping": "create_new_records_id_mapping",
+    "isTaskSyncEnabled": "is_task_sync_enabled",
+}
+# "Not passed" marker for the five sync-flag kwargs of update_salesforce_import_field_mapping().
+# They have no usable default on purpose (the PATCH replaces them on the import), and a sentinel
+# rather than None lets the method tell an omitted flag from an explicit None.
+_REQUIRED_SYNC_FLAG: Any = object()
+
+
+class AudienceFieldsOrphanedError(RuntimeError):
+    """add_salesforce_import_fields() created Audiences fields but did not map them.
+
+    Raised after the first write (POST /audiences/field) when the second — the mapping PATCH —
+    was not sent or did not succeed, so `audf_…` fields exist that nothing fills. A RuntimeError
+    subclass: a post-write contract violation, like the rest of the module.
+
+    Attributes: `import_id`, `entity_type` (ACCOUNT / CONTACT), `workspace_id`,
+    `created_fields` (the create response), `created_field_ids`, `sync_flags` (the five sync
+    settings keyed like importMetadata), `mapping`, `pairing_verified` and `mapped_after_failure`.
+
+    * `pairing_verified=True`: every created field echoed the requested displayName in request
+      order, so `mapping` is the exact list the PATCH should carry (existing pairs + new pairs)
+      and re-sending it is safe — the PATCH is a full REPLACE, so the retry is idempotent:
+          clay.update_salesforce_import_field_mapping(err.import_id, err.mapping,
+              entity_type=err.entity_type, **err.sync_flag_kwargs())
+    * `pairing_verified=False`: the create response could not be paired with the request (wrong
+      shape, wrong count, or a displayName that did not match), `mapping` is None, and the
+      created ids must NOT be mapped by position — check each field's displayName in the UI or
+      delete the orphans.
+    * `mapped_after_failure`: after a failed PATCH the import is re-read once (best effort):
+      True = every created id is now in `fieldMapping.fieldMappings`, False = not all are,
+      None = the re-read did not succeed. Only a confirmed False justifies a delete.
+
+    claycast has no wrapper for deleting an Audiences field (that endpoint was never captured);
+    the official CLI `clay audiences fields delete <audf_id> --entity-type people|companies`
+    (soft, idempotent) or the UI does it. Picklable (`__reduce__`), so it crosses process pools.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        import_id: str | None = None,
+        entity_type: str | None = None,
+        workspace_id: int | str | None = None,
+        created_fields: list[dict] | None = None,
+        mapping: list[dict] | None = None,
+        pairing_verified: bool = False,
+        sync_flags: dict | None = None,
+        mapped_after_failure: bool | None = None,
+    ):
+        super().__init__(message)
+        self.import_id = import_id
+        self.entity_type = entity_type
+        self.workspace_id = workspace_id
+        self.created_fields = list(created_fields or [])
+        self.created_field_ids = [f.get("id") if isinstance(f, dict) else None for f in self.created_fields]
+        self.mapping = mapping
+        self.pairing_verified = pairing_verified
+        self.sync_flags = dict(sync_flags or {})
+        self.mapped_after_failure = mapped_after_failure
+
+    def sync_flag_kwargs(self) -> dict:
+        """`sync_flags` translated to update_salesforce_import_field_mapping() keyword arguments
+        (isImportSyncEnabled -> is_import_sync_enabled, …), so the retry in the message runs as
+        written."""
+        return {_SF_IMPORT_SYNC_KWARGS[k]: self.sync_flags[k] for k in _SF_IMPORT_SYNC_KEYS if k in self.sync_flags}
+
+    def __reduce__(self):
+        return (self.__class__, (str(self),), self.__dict__)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+
+def _check_salesforce_sync_overrides(overrides: dict | None, *, where: str) -> dict:
+    """Shape-check a `sync_flags` dict before any request: it must be a dict keyed like
+    importMetadata — isImportSyncEnabled / isExportSyncEnabled / isCreateNewRecordsEnabled /
+    isTaskSyncEnabled (True or False) and createNewRecordsIdMapping (a dict or None). Unknown keys
+    (snake_case typos) and wrong types raise ValueError that names sync_flags, not the import.
+    Returns a copy; None -> {}."""
+    if overrides is None:
+        return {}
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"{where}: sync_flags must be a dict keyed like importMetadata "
+            f"({', '.join(_SF_IMPORT_SYNC_KEYS)}), got {type(overrides).__name__}"
+        )
+    unknown = sorted(str(k) for k in overrides if k not in _SF_IMPORT_SYNC_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown sync_flags key(s) {', '.join(unknown)}; "
+            f"expected any of {', '.join(_SF_IMPORT_SYNC_KEYS)}"
+        )
+    for key in _SF_IMPORT_SYNC_BOOL_KEYS:
+        if key in overrides and not isinstance(overrides[key], bool):
+            raise ValueError(f"{where}: sync_flags[{key!r}] must be True or False, got {overrides[key]!r}")
+    if "createNewRecordsIdMapping" in overrides:
+        val = overrides["createNewRecordsIdMapping"]
+        if val is not None and not isinstance(val, dict):
+            raise ValueError(
+                f"{where}: sync_flags['createNewRecordsIdMapping'] must be a dict or None, got {val!r}"
+            )
+    return dict(overrides)
+
+
+def _salesforce_import_sync_flags(
+    import_id: str, meta: dict, overrides: dict | None, *, where: str = "add_salesforce_import_fields"
+) -> dict:
+    """The five sync settings for the mapping PATCH, read from the import's importMetadata with
+    `overrides` (a sync_flags dict, shape-checked here) winning.
+
+    Fails closed. A setting that is absent or null in importMetadata and not overridden raises
+    ValueError naming every such key and the exact `sync_flags={...}` remedy — never a default,
+    because the PATCH replaces the settings and a guessed value would switch a sync on or off.
+    Problems are attributed to their source: "importMetadata is missing …" / "has sync
+    setting(s) of an unexpected type" versus "sync_flags[k] must be True or False, got …".
+    isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None is refused only when an
+    override introduced that combination; the import's own state passes through. Verified live
+    2026-09-29: an ACCOUNT import carried all five keys; a CONTACT import had no
+    isTaskSyncEnabled (the UI's replay sent False) — the operator supplies it via sync_flags."""
+    overrides = _check_salesforce_sync_overrides(overrides, where=where)
+    flags: dict = {}
+    wrong: list[str] = []
+    for key in _SF_IMPORT_SYNC_BOOL_KEYS:
+        val = meta.get(key)
+        if val is None:
+            continue  # absent or null: missing unless overridden
+        if isinstance(val, bool):
+            flags[key] = val
+        else:
+            wrong.append(f"{key}={val!r} (expected True or False)")
+    if "createNewRecordsIdMapping" in meta:
+        val = meta["createNewRecordsIdMapping"]
+        if val is None or isinstance(val, dict):
+            flags["createNewRecordsIdMapping"] = val
+        else:
+            wrong.append(f"createNewRecordsIdMapping={val!r} (expected a dict or None)")
+    wrong = [w for w in wrong if w.split("=", 1)[0] not in overrides]  # an override replaces a bad value
+    wrong_keys = [w.split("=", 1)[0] for w in wrong]
+    flags.update(overrides)
+    missing = [k for k in _SF_IMPORT_SYNC_KEYS if k not in flags and k not in wrong_keys]
+    if missing or wrong:
+        problems = []
+        if missing:
+            problems.append(f"is missing sync setting(s) {', '.join(missing)}")
+        if wrong:
+            problems.append(f"has sync setting(s) of an unexpected type: {', '.join(wrong)}")
+        example = ", ".join(
+            f'"{k}": {"None" if k == "createNewRecordsIdMapping" else "False"}'
+            for k in _SF_IMPORT_SYNC_KEYS if k in missing or k in wrong_keys
+        )
+        raise ValueError(
+            f"{where}: import {import_id!r} importMetadata {' and '.join(problems)}; refusing to guess "
+            f"(the mapping PATCH replaces them, so a default could switch a sync on or off). Read the import "
+            f"with list_audience_imports() to see what Clay put there, then pass the setting(s) explicitly, "
+            f"e.g. sync_flags={{{example}}}, using the value the UI's Salesforce sync toggle shows. "
+            f"(isTaskSyncEnabled was absent from a live CONTACT import's importMetadata on 2026-09-29 while "
+            f"the ACCOUNT import had all five; the UI's replay sent False.)"
+        )
+    if (
+        flags["isCreateNewRecordsEnabled"] is True
+        and flags["createNewRecordsIdMapping"] is None
+        and not (meta.get("isCreateNewRecordsEnabled") is True and meta.get("createNewRecordsIdMapping") is None)
+    ):
+        raise ValueError(
+            f"{where}: sync_flags would set isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None "
+            f"on import {import_id!r} (create-new-records enabled without an id mapping); pass both settings, "
+            f"leave the import's own values in place, or send the PATCH yourself with "
+            f"update_salesforce_import_field_mapping()"
+        )
+    return flags
+
+
+def _validate_salesforce_field_mapping(field_mapping: list[dict], *, where: str) -> None:
+    """Every mapping entry must be a dict with a non-empty audienceFieldId and salesforceFieldId.
+    Shared by update_salesforce_import_field_mapping (its own input, where=
+    "update_salesforce_import_field_mapping: field_mapping") and add_salesforce_import_fields
+    (the import's EXISTING entries, checked before anything is written — the PATCH replaces the
+    whole list, so an incomplete pair fails the call rather than being dropped)."""
+    if not isinstance(field_mapping, list):
+        raise ValueError(f"{where} must be a list of mapping entries, got {type(field_mapping).__name__}")
+    for i, m in enumerate(field_mapping):
+        if not isinstance(m, dict):
+            raise ValueError(f"{where}[{i}] is not a mapping entry: {m!r}")
+        for key in ("audienceFieldId", "salesforceFieldId"):
+            if not m.get(key):
+                raise ValueError(f"{where}[{i}] missing {key}: {m!r}")
+
+
+def _salesforce_import_current_mapping(imp: dict, *, where: str) -> list[dict]:
+    """An import's existing pairs: `fieldMapping.fieldMappings` (the shape the GET returns) or a
+    bare list (the shape the PATCH is sent); None -> []. Any other shape is a ValueError, raised
+    before anything is written."""
+    fm = imp.get("fieldMapping")
+    if fm is None:
+        return []
+    if isinstance(fm, list):
+        return list(fm)
+    if isinstance(fm, dict):
+        entries = fm.get("fieldMappings")
+        if entries is None:
+            return []
+        if isinstance(entries, list):
+            return list(entries)
+        raise ValueError(
+            f"{where}: import {imp.get('id')!r} fieldMapping.fieldMappings is not a list "
+            f"({type(entries).__name__})"
+        )
+    raise ValueError(
+        f"{where}: import {imp.get('id')!r} fieldMapping has an unexpected shape ({type(fm).__name__}); "
+        f"expected {{'fieldMappings': [...]}} or a list"
+    )
+
+
+def _salesforce_mapping_signature(entries: list[dict]) -> list[str]:
+    """Order-independent fingerprint of a mapping list, for the drift check between the import
+    read at the start of add_salesforce_import_fields() and the re-read before its PATCH."""
+    return sorted(json.dumps(m, sort_keys=True, default=str) for m in entries)
+
+
+def _dedupe_new_salesforce_fields(new_fields: list[dict]) -> list[dict]:
+    """One spec per salesforceFieldId, first-seen order kept — the endpoints do not dedupe (a
+    repeated id would create a second field and map it twice). Repeats merge: a displayName /
+    dataType that one entry gives and another leaves out (None or "") is not a conflict — the
+    to_create builder treats "" as absent too; two explicit values that disagree are ambiguous
+    and raise. Every entry must be a dict with a non-empty salesforceFieldId; an empty list
+    raises. Network-free, so it runs before any read."""
+    if not isinstance(new_fields, (list, tuple)):
+        raise ValueError(
+            f"add_salesforce_import_fields: new_fields must be a list of {{'salesforceFieldId': ...}} dicts, "
+            f"got {type(new_fields).__name__}"
+        )
+    if not new_fields:
+        raise ValueError("add_salesforce_import_fields: new_fields is empty")
+    merged: dict[str, dict] = {}
+    for i, nf in enumerate(new_fields):
+        if not isinstance(nf, dict) or not nf.get("salesforceFieldId"):
+            raise ValueError(f"add_salesforce_import_fields: new_fields[{i}] missing salesforceFieldId: {nf!r}")
+        sf_id = nf["salesforceFieldId"]
+        spec = merged.setdefault(sf_id, {"salesforceFieldId": sf_id})
+        for key in ("displayName", "dataType"):
+            val = nf.get(key)
+            if val is None or val == "":
+                continue
+            if key in spec and spec[key] != val:
+                raise ValueError(
+                    f"add_salesforce_import_fields: new_fields has conflicting entries for "
+                    f"salesforceFieldId {sf_id!r}: {key} {spec[key]!r} vs {val!r}; give one entry per "
+                    f"Salesforce field"
+                )
+            spec[key] = val
+    return list(merged.values())
+
+
+def _audience_fields_delete_text(entity_type: str, ws_id: int | str | None) -> str:
+    """The only path for removing orphaned Audiences fields, spelled out for error messages:
+    claycast wraps no delete (endpoint never captured), the official CLI does a soft delete."""
+    cli_entity = "companies" if entity_type == "ACCOUNT" else "people"
+    return (
+        f"after confirming 'clay whoami' reports workspace {ws_id}; claycast has no delete wrapper for "
+        f"Audiences fields (endpoint never captured): official CLI clay audiences fields delete <audf_id> "
+        f"--entity-type {cli_entity} (soft, idempotent; run 'clay audiences fields segments <id>' first) "
+        f"or the UI."
+    )
+
+
 class ClayClient:
     def __init__(self, workspace_id: int = None, clay_session: str | None = None):
         """
@@ -3018,11 +3301,12 @@ class ClayClient:
         field_mapping: list[dict],
         *,
         entity_type: str,
-        is_import_sync_enabled: bool = True,
-        is_export_sync_enabled: bool = False,
-        is_create_new_records_enabled: bool = False,
-        create_new_records_id_mapping: dict | None = None,
-        is_task_sync_enabled: bool = False,
+        is_import_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        is_export_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        is_create_new_records_enabled: bool = _REQUIRED_SYNC_FLAG,
+        create_new_records_id_mapping: dict | None = _REQUIRED_SYNC_FLAG,
+        is_task_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        sync_flags: dict | None = None,
         reconcile_opportunity_import_dependencies: bool = True,
         workspace_id: int | str | None = None,
     ) -> dict:
@@ -3031,21 +3315,77 @@ class ClayClient:
         PATCH /workspaces/{ws}/audiences/salesforce-imports. `field_mapping` is the COMPLETE
         list — anything you leave out stops syncing — of
         {"type": "SALESFORCE", "audienceFieldId": "audf_…"|built-in id such as "org_name",
-        "salesforceFieldId": "<API name>", "mappingRule": "NEVER_WRITE"}. The sync flags
-        mirror the import's `importMetadata`; pass them through from a fresh
-        list_audience_imports() read. Shape trap: you send `fieldMapping: [...]`, the
-        response nests it as `fieldMapping.fieldMappings`. The response `status` flips to
-        PENDING and the import backfills the new fields (~11k rows took a few minutes).
-        Prefer add_salesforce_import_fields() unless you need to remove mappings.
-        Verified live 2026-09-29. No credits.
+        "salesforceFieldId": "<API name>", "mappingRule": "NEVER_WRITE"}; every entry is
+        validated (a dict, both ids non-empty) before anything is sent.
+
+        The five sync settings are REQUIRED and have no defaults, because the body REPLACES
+        them on the import: pass `is_import_sync_enabled`, `is_export_sync_enabled`,
+        `is_create_new_records_enabled`, `create_new_records_id_mapping` (a dict or None —
+        None is a real value and must still be passed) and `is_task_sync_enabled` from a fresh
+        list_audience_imports() read of `importMetadata`, or pass them together as
+        `sync_flags={...}` keyed like importMetadata (the shape AudienceFieldsOrphanedError
+        hands back). Omitting them is a TypeError naming the missing kwargs; a boolean flag
+        that is None or a string is a ValueError; giving both forms is a ValueError.
+        `reconcile_opportunity_import_dependencies` is a request option (captured as true),
+        not import state, and keeps its default.
+
+        Shape trap: you send `fieldMapping: [...]`, the response nests it as
+        `fieldMapping.fieldMappings`. The response `status` flips to PENDING and the import
+        backfills the new fields (~11k rows took a few minutes). Prefer
+        add_salesforce_import_fields() unless you need to remove mappings. Verified live
+        2026-09-29. No credits.
         """
+        where = "update_salesforce_import_field_mapping"
+        given = {
+            "is_import_sync_enabled": is_import_sync_enabled,
+            "is_export_sync_enabled": is_export_sync_enabled,
+            "is_create_new_records_enabled": is_create_new_records_enabled,
+            "create_new_records_id_mapping": create_new_records_id_mapping,
+            "is_task_sync_enabled": is_task_sync_enabled,
+        }
+        omitted = [name for name, val in given.items() if val is _REQUIRED_SYNC_FLAG]
+        if sync_flags is not None:
+            if len(omitted) < len(given):
+                raise ValueError(
+                    f"{where}: pass either sync_flags= or the five sync-flag kwargs ({', '.join(given)}), not both"
+                )
+            flags = _check_salesforce_sync_overrides(sync_flags, where=where)
+            missing = [k for k in _SF_IMPORT_SYNC_KEYS if k not in flags]
+            if missing:
+                raise ValueError(
+                    f"{where}: sync_flags is missing {', '.join(missing)}; it must carry all five settings "
+                    f"({', '.join(_SF_IMPORT_SYNC_KEYS)}) — copy them from the import's importMetadata"
+                )
+            given = {_SF_IMPORT_SYNC_KWARGS[k]: flags[k] for k in _SF_IMPORT_SYNC_KEYS}
+        elif omitted:
+            # Same wording as Python's own error for required keyword-only arguments: the five
+            # have no usable default (a guess would switch a sync on or off) and sync_flags= is
+            # the only alternative to passing them all.
+            if len(omitted) == 1:
+                listing = repr(omitted[0])
+            elif len(omitted) == 2:
+                listing = f"{omitted[0]!r} and {omitted[1]!r}"
+            else:
+                listing = ", ".join(repr(n) for n in omitted[:-1]) + f", and {omitted[-1]!r}"
+            raise TypeError(
+                f"{where}() missing {len(omitted)} required keyword-only argument{'s' if len(omitted) > 1 else ''}: "
+                f"{listing} (pass all five, or sync_flags={{...}} keyed like importMetadata)"
+            )
         entity_type = str(entity_type).upper()
         if entity_type not in {"CONTACT", "ACCOUNT"}:
             raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
-        for m in field_mapping:
-            for key in ("audienceFieldId", "salesforceFieldId"):
-                if not m.get(key):
-                    raise ValueError(f"field_mapping entry missing {key}: {m!r}")
+        for name in (
+            "is_import_sync_enabled",
+            "is_export_sync_enabled",
+            "is_create_new_records_enabled",
+            "is_task_sync_enabled",
+        ):
+            if not isinstance(given[name], bool):
+                raise ValueError(f"{where}: {name} must be True or False, got {given[name]!r}")
+        id_mapping = given["create_new_records_id_mapping"]
+        if id_mapping is not None and not isinstance(id_mapping, dict):
+            raise ValueError(f"{where}: create_new_records_id_mapping must be a dict or None, got {id_mapping!r}")
+        _validate_salesforce_field_mapping(field_mapping, where=f"{where}: field_mapping")
         ws_id = self._resolve_workspace_id(workspace_id)
         body = {
             "audienceImports": [
@@ -3060,66 +3400,157 @@ class ClayClient:
                         }
                         for m in field_mapping
                     ],
-                    "isImportSyncEnabled": is_import_sync_enabled,
-                    "isExportSyncEnabled": is_export_sync_enabled,
-                    "isCreateNewRecordsEnabled": is_create_new_records_enabled,
-                    "createNewRecordsIdMapping": create_new_records_id_mapping,
+                    "isImportSyncEnabled": given["is_import_sync_enabled"],
+                    "isExportSyncEnabled": given["is_export_sync_enabled"],
+                    "isCreateNewRecordsEnabled": given["is_create_new_records_enabled"],
+                    "createNewRecordsIdMapping": id_mapping,
                     "entityType": entity_type,
-                    "isTaskSyncEnabled": is_task_sync_enabled,
+                    "isTaskSyncEnabled": given["is_task_sync_enabled"],
                 }
             ],
             "reconcileOpportunityImportDependencies": reconcile_opportunity_import_dependencies,
         }
         return self.patch(f"/workspaces/{ws_id}/audiences/salesforce-imports", body)
 
+    def _read_salesforce_import_mapping(
+        self, import_id: str, *, workspace_id: int | str | None = None
+    ) -> list[dict] | None:
+        """One GET of the imports list -> the import's current `fieldMapping.fieldMappings`, or
+        None when the import is not there or its mapping is malformed. Network errors propagate.
+        Used by add_salesforce_import_fields() before its PATCH (drift check) and after a failed
+        one (did the REPLACE land?)."""
+        imports = self.list_audience_imports(workspace_id=workspace_id)
+        imp = next((i for i in imports if isinstance(i, dict) and i.get("id") == import_id), None)
+        if imp is None:
+            return None
+        try:
+            entries = _salesforce_import_current_mapping(imp, where="add_salesforce_import_fields")
+            _validate_salesforce_field_mapping(
+                entries, where="add_salesforce_import_fields: re-read mapping entry fieldMappings"
+            )
+        except ValueError:
+            return None
+        return entries
+
     def add_salesforce_import_fields(
         self,
         import_id: str,
         new_fields: list[dict],
         *,
+        sync_flags: dict | None = None,
+        dry_run: bool = False,
         workspace_id: int | str | None = None,
     ) -> dict:
         """Map more Salesforce fields into an existing Audiences import — the safe way.
 
         `new_fields` = [{"salesforceFieldId": "Account_Owner_Manager__c",
-        "displayName": "Account Owner - Manager", "dataType": "text"?}, …]. Reads the
-        import (current mapping + sync flags), validates each Salesforce API name against
-        the connection's field catalog, infers `dataType` from the Salesforce type when not
-        given (boolean/date/number/email/url, else text), bulk-creates the missing Audiences
-        fields, then PATCHes the import with existing + new mappings (duplicates by
-        salesforceFieldId are skipped). Returns {"import": <PATCH response import>,
-        "created_fields": [...], "skipped": [salesforceFieldId, …]}. Verified live
-        2026-09-29: two fields added to a 512k-row Account import, backfill started
-        immediately (status PENDING). No credits.
+        "displayName": "Account Owner - Manager", "dataType": "text"?}, …]. Returns
+        {"import": <import>, "created_fields": [...], "skipped": [salesforceFieldId, …],
+        "to_create": [{salesforceFieldId, displayName, dataType}, …], "dry_run": bool}.
+
+        Order of operations — everything is validated before the first write, like
+        upsert_records() / bulk_update_records():
+
+        1. Network-free: `new_fields` must be a non-empty list of dicts with a
+           salesforceFieldId; repeats collapse to one field (first-seen order; repeats that
+           disagree on displayName or dataType raise ValueError); `sync_flags`, if given, must
+           be a dict keyed like importMetadata with known keys and well-typed values.
+        2. GET imports: the import must exist, be a Salesforce import, have entityType
+           ACCOUNT/CONTACT, an importSourceSubtype (the Salesforce object) and
+           importMetadata.appAccountId (the connection). Its five sync settings are read from
+           importMetadata and never defaulted: a missing or null one raises ValueError naming
+           it and the exact `sync_flags={...}` remedy, because the mapping PATCH replaces them
+           and a guess could switch a sync on or off. (isTaskSyncEnabled was absent from a live
+           CONTACT import's importMetadata on 2026-09-29 while the ACCOUNT import had all
+           five; the UI's replay sent False.) Every EXISTING mapping entry is validated too — an
+           incomplete pair fails the call instead of being dropped, since the PATCH replaces the
+           whole list.
+        3. GET the field catalog: every new API name must be mappable; an API name already
+           mapped is skipped and reported once in `skipped`; `dataType` is inferred from the
+           Salesforce type when not given (boolean/date/number/email/url, else text) and
+           `displayName` defaults to the Salesforce label. The new fields' displayNames must be
+           distinct — the create response is paired to the request by position and checked by
+           displayName. Nothing to create, or `dry_run=True`: return the plan (`to_create`)
+           with no writes.
+        4. WRITE 1 — create_audience_fields(). The response must be a list of one dict per
+           requested field, in order, each with an id and (when echoed) the requested
+           displayName; otherwise AudienceFieldsOrphanedError with `pairing_verified=False` and
+           `mapping=None`: the fields exist and must not be mapped by position. (A server-side
+           rename of a displayName would trip this check too; the fields still exist.)
+        5. Re-read the import and compare its mapping with the one read in step 2 — one
+           zero-credit GET that closes the GET→PATCH replace race. If it changed underneath,
+           AudienceFieldsOrphanedError with `pairing_verified=True` and `mapping` = the fresh
+           pairs + the new ones; the PATCH is not sent.
+        6. WRITE 2 — the mapping PATCH via update_salesforce_import_field_mapping() with the
+           five settings from step 2. If it raises, AudienceFieldsOrphanedError carries the
+           exact `mapping` to re-send (idempotent: the PATCH is a full REPLACE) plus
+           `mapped_after_failure` from a best-effort re-read. A requests.HTTPError means Clay
+           rejected the request (fields exist, unmapped); anything else (connection reset,
+           non-JSON 2xx) means the outcome is unknown and the message says so.
+
+        The two writes are not atomic and claycast has no delete for Audiences fields (the
+        endpoint was never captured): orphans go through the official CLI
+        `clay audiences fields delete <audf_id> --entity-type people|companies` (soft,
+        idempotent) or the UI. Verified live 2026-09-29: two fields added to a 512k-row
+        Account import, backfill started immediately (status PENDING). No credits.
         """
+        where = "add_salesforce_import_fields"
+        # 1. network-free
+        to_check = _dedupe_new_salesforce_fields(new_fields)
+        overrides = _check_salesforce_sync_overrides(sync_flags, where=where)
         ws_id = self._resolve_workspace_id(workspace_id)
+
+        # 2. the import
         imports = self.list_audience_imports(workspace_id=ws_id)
-        imp = next((i for i in imports if i.get("id") == import_id), None)
+        imp = next((i for i in imports if isinstance(i, dict) and i.get("id") == import_id), None)
         if imp is None:
-            raise ValueError(f"import {import_id!r} not found in workspace {ws_id}")
+            raise ValueError(f"{where}: import {import_id!r} not found in workspace {ws_id}")
         meta = imp.get("importMetadata") or {}
-        if (imp.get("importSourceType") or meta.get("type")) != "SALESFORCE":
-            raise ValueError(f"import {import_id!r} is not a Salesforce import")
-        entity_type = imp["entityType"]
-        current = list((imp.get("fieldMapping") or {}).get("fieldMappings") or [])
+        if not isinstance(meta, dict):
+            raise ValueError(f"{where}: import {import_id!r} importMetadata is not an object ({type(meta).__name__})")
+        source_type = imp.get("importSourceType") or meta.get("type")
+        if source_type != "SALESFORCE":
+            raise ValueError(
+                f"{where}: import {import_id!r} is not a Salesforce import (importSourceType={source_type!r})"
+            )
+        entity_type = str(imp.get("entityType") or "").upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(
+                f"{where}: import {import_id!r} has entityType {imp.get('entityType')!r}; expected ACCOUNT or CONTACT"
+            )
+        object_name = imp.get("importSourceSubtype")
+        if not object_name:
+            raise ValueError(
+                f"{where}: import {import_id!r} has no importSourceSubtype (the Salesforce object name); "
+                f"cannot load its field catalog"
+            )
+        auth_account_id = meta.get("appAccountId")
+        if not auth_account_id:
+            raise ValueError(
+                f"{where}: import {import_id!r} importMetadata has no appAccountId (the Salesforce connection "
+                f"aa_...); cannot load its field catalog"
+            )
+        flags = _salesforce_import_sync_flags(import_id, meta, overrides, where=where)
+        current = _salesforce_import_current_mapping(imp, where=where)
+        _validate_salesforce_field_mapping(current, where=f"{where}: existing mapping entry fieldMappings")
         already = {m["salesforceFieldId"] for m in current}
 
+        # 3. the catalog and the plan
         catalog = {
             f["value"]: f
-            for f in self.list_salesforce_import_fields(
-                imp["importSourceSubtype"],
-                auth_account_id=meta["appAccountId"],
-                workspace_id=ws_id,
-            )
+            for f in self.list_salesforce_import_fields(object_name, auth_account_id=auth_account_id, workspace_id=ws_id)
         }
         to_create, skipped = [], []
-        for nf in new_fields:
+        for nf in to_check:
             sf_id = nf["salesforceFieldId"]
             if sf_id in already:
                 skipped.append(sf_id)
                 continue
             if sf_id not in catalog:
-                raise ValueError(f"{sf_id!r} is not a mappable field on this Salesforce connection")
+                raise ValueError(
+                    f"{where}: {sf_id!r} is not a mappable field on this Salesforce connection "
+                    f"(object {object_name!r}, connection {auth_account_id!r})"
+                )
             sf_type = catalog[sf_id].get("type", "")
             to_create.append(
                 {
@@ -3128,17 +3559,65 @@ class ClayClient:
                     "dataType": nf.get("dataType") or self._SF_TO_AUDIENCE_DATA_TYPE.get(sf_type, "text"),
                 }
             )
-        if not to_create:
-            return {"import": imp, "created_fields": [], "skipped": skipped}
+        names = [c["displayName"] for c in to_create]
+        shared = sorted({n for n in names if names.count(n) > 1})
+        if shared:
+            owners = ", ".join(c["salesforceFieldId"] for c in to_create if c["displayName"] == shared[0])
+            raise ValueError(
+                f"{where}: two new fields would share displayName {shared[0]!r} ({owners}); give distinct "
+                f"displayName values so the created ids can be paired with the request"
+            )
+        if not to_create or dry_run:
+            return {"import": imp, "created_fields": [], "skipped": skipped, "to_create": to_create, "dry_run": dry_run}
 
+        # 4. first write — create the fields, then prove the response pairs with the request
         created = self.create_audience_fields(
             entity_type,
             [{"displayName": c["displayName"], "dataType": c["dataType"]} for c in to_create],
             workspace_id=ws_id,
         )
+        delete_text = _audience_fields_delete_text(entity_type, ws_id)
+        unpaired = dict(
+            import_id=import_id, entity_type=entity_type, workspace_id=ws_id, mapping=None,
+            pairing_verified=False, sync_flags=flags,
+        )
+        unpaired_text = (
+            "The created fields exist unmapped and cannot be paired with the request, so err.mapping is None: "
+            "map them by hand after checking each field's displayName in Audiences > Settings, or delete them "
+            f"{delete_text}"
+        )
+        if not isinstance(created, list) or not all(isinstance(f, dict) for f in created):
+            raise AudienceFieldsOrphanedError(
+                f"{where}: create_audience_fields returned an unexpected shape ({repr(created)[:200]}) on import "
+                f"{import_id!r}; the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=[],
+                **unpaired,
+            )
+        ids = ", ".join(str(f.get("id")) for f in created) or "(no ids returned)"
         if len(created) != len(to_create):
-            raise RuntimeError(f"expected {len(to_create)} created fields, got {len(created)}")
-        mapping = current + [
+            raise AudienceFieldsOrphanedError(
+                f"{where}: expected {len(to_create)} created fields, got {len(created)} ({ids}) on import "
+                f"{import_id!r}; the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=created,
+                **unpaired,
+            )
+        for spec, field in zip(to_create, created):
+            got = field.get("displayName")
+            if not field.get("id"):
+                bad = f"a created field has no id: {field!r}"
+            elif got is None and len(created) > 1:
+                bad = f"the response does not echo displayName, so {len(created)} created ids cannot be paired"
+            elif got is not None and got != spec["displayName"]:
+                bad = f"expected displayName {spec['displayName']!r}, got {got!r} with id {field.get('id')!r}"
+            else:
+                continue
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created fields ({ids}) do not pair with the request ({bad}) on import {import_id!r}; "
+                f"the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=created,
+                **unpaired,
+            )
+        new_pairs = [
             {
                 "type": "SALESFORCE",
                 "audienceFieldId": field["id"],
@@ -3147,19 +3626,97 @@ class ClayClient:
             }
             for spec, field in zip(to_create, created)
         ]
-        res = self.update_salesforce_import_field_mapping(
-            import_id,
-            mapping,
-            entity_type=entity_type,
-            is_import_sync_enabled=meta.get("isImportSyncEnabled", True),
-            is_export_sync_enabled=meta.get("isExportSyncEnabled", False),
-            is_create_new_records_enabled=meta.get("isCreateNewRecordsEnabled", False),
-            create_new_records_id_mapping=meta.get("createNewRecordsIdMapping"),
-            is_task_sync_enabled=meta.get("isTaskSyncEnabled", False),
-            workspace_id=ws_id,
+        verified = dict(
+            import_id=import_id, entity_type=entity_type, workspace_id=ws_id, created_fields=created,
+            pairing_verified=True, sync_flags=flags,
         )
+        resend = (
+            "Re-send the mapping (idempotent — the PATCH is a full REPLACE): "
+            "clay.update_salesforce_import_field_mapping(err.import_id, err.mapping, entity_type=err.entity_type, "
+            "**err.sync_flag_kwargs())."
+        )
+
+        # 5. re-read: the PATCH replaces the whole list, so a pair added meanwhile would be dropped
+        try:
+            fresh = self._read_salesforce_import_mapping(import_id, workspace_id=ws_id)
+        except Exception as exc:
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids} on import {import_id!r}, but re-reading the "
+                f"import before the mapping PATCH failed ({type(exc).__name__}: {exc}); the PATCH was not sent. "
+                f"err.mapping is the mapping read at the start plus the new pairs: confirm with list_audience_imports() "
+                f"that the import's fieldMappings still match it, then re-send it. {resend} Delete the fields instead "
+                f"only {delete_text}",
+                mapping=current + new_pairs,
+                **verified,
+            ) from exc
+        if fresh is None:
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids}, but import {import_id!r} was not found (or "
+                f"its mapping is malformed) when re-read before the mapping PATCH; the PATCH was not sent and err.mapping "
+                f"is None. Check the import with list_audience_imports() before mapping or deleting anything; delete "
+                f"only {delete_text}",
+                mapping=None,
+                **verified,
+            )
+        if _salesforce_mapping_signature(fresh) != _salesforce_mapping_signature(current):
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids}, but import {import_id!r}'s mapping changed "
+                f"between the first read and the PATCH ({len(current)} -> {len(fresh)} pair(s)); the PATCH was not sent, "
+                f"so the concurrent change is not overwritten. err.mapping is the fresh mapping plus the new pairs. "
+                f"{resend} Delete the fields instead only {delete_text}",
+                mapping=fresh + new_pairs,
+                **verified,
+            )
+        mapping = current + new_pairs
+
+        # 6. second write — the PATCH
+        try:
+            res = self.update_salesforce_import_field_mapping(
+                import_id, mapping, entity_type=entity_type, sync_flags=flags, workspace_id=ws_id
+            )
+        except Exception as exc:
+            import requests as requests_module
+
+            rejected = isinstance(exc, requests_module.HTTPError)
+            try:
+                after = self._read_salesforce_import_mapping(import_id, workspace_id=ws_id)
+            except Exception:
+                after = None
+            mapped_after = None if after is None else all(
+                any(isinstance(m, dict) and m.get("audienceFieldId") == p["audienceFieldId"] for m in after)
+                for p in new_pairs
+            )
+            head = (
+                f"{where}: created {len(created)} Audiences field(s) {ids} on import {import_id!r} but the mapping "
+                f"PATCH failed ({type(exc).__name__}: {exc})"
+            )
+            if rejected:
+                state = ": Clay rejected the request, so the fields exist and are NOT mapped"
+            else:
+                state = " after it was sent, so its outcome is UNKNOWN — the server may have applied the REPLACE"
+            reread = {
+                True: " (a re-read of the import shows the created fields ARE mapped)",
+                False: " (a re-read of the import shows them NOT mapped)",
+                None: " (the import could not be re-read to confirm)",
+            }[mapped_after]
+            if mapped_after is True:
+                advice = " Nothing to re-send: verify the mapping in Audiences > Settings and do NOT delete these fields."
+            elif rejected and mapped_after is False:
+                advice = f" {resend} If you would rather not map them, delete the orphans {delete_text}"
+            else:
+                advice = (
+                    f" {resend} Do not delete the fields unless list_audience_imports() confirms they are unmapped "
+                    f"(soft-deleting fields the import is mapped to is the worst outcome); if it does and you drop "
+                    f"them, do so only {delete_text}"
+                )
+            raise AudienceFieldsOrphanedError(
+                head + state + reread + "." + advice,
+                mapping=mapping,
+                mapped_after_failure=mapped_after,
+                **verified,
+            ) from exc
         updated = (res.get("audienceImports") or [res])[0] if isinstance(res, dict) else res
-        return {"import": updated, "created_fields": created, "skipped": skipped}
+        return {"import": updated, "created_fields": created, "skipped": skipped, "to_create": to_create, "dry_run": False}
 
     # ── Audiences: segments (saved filters) and ad-hoc counts ────────────────
     # Captured live with clay_browser.py 2026-09-30 while creating a segment in the UI and

@@ -100,7 +100,7 @@ tables = clay.list_tables()
 | Credit usage / spend reporting | `get_credit_usage`, `get_table_credit_usage`, `get_default_workbook_credit_limit` |
 | Export / Documentation | `export_csv`, `fetch_all_records_full`, `export_rows`, `export_workspace`, `document_table`, `search_export_artifacts` |
 | Audience export (>50K rows) | `list_audience_segments`, `count_audience_segment`, `export_audience_segment` |
-| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields`, `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status` |
+| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields` (validates everything before its first write, `dry_run=True` returns the plan, raises `AudienceFieldsOrphanedError` if the mapping PATCH fails after the fields were created), `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status`. No delete wrapper for Audiences fields — that endpoint was never captured; orphans go through the official CLI `clay audiences fields delete <audf_id> --entity-type people` / `companies` or the UI |
 | Audiences: build, count, save and delete segments (saved filters) | `af_*` filter-AST builder, `create_audience_segment`, `update_audience_segment`, `delete_audience_segment`, `get_audience_segment`, `count_audience_records`, `count_audience_filter_stages`, `verify_audience_filter_complement` |
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
@@ -216,25 +216,73 @@ Helpers:
 The Clay UI's Audiences → Settings → Salesforce sync → "add field" has no official CLI or API
 equivalent (the `clay` CLI's `audiences fields create` makes an empty field nothing fills).
 ClayCast replays what the UI sends — create the Audiences field(s), then PATCH the import's
-whole mapping — verified live 2026-09-29:
+whole mapping — verified live 2026-09-29. The two calls are not atomic, so everything — including
+every EXISTING mapping entry — is validated before the first write, and a PATCH that still fails
+after the fields were created raises `AudienceFieldsOrphanedError` (below) instead of leaving
+unmapped fields behind silently:
 
 ```python
 imports = clay.list_audience_imports(entity_type="ACCOUNT")      # find the Salesforce import (audimp_...)
 imp = next(i for i in imports if i["importSourceType"] == "SALESFORCE")
-res = clay.add_salesforce_import_fields(imp["id"], [
+new = [
     {"salesforceFieldId": "Account_Owner_Manager__c", "displayName": "Account Owner - Manager"},
     {"salesforceFieldId": "Account_Owner_Active__c"},   # displayName defaults to the SF label; dataType inferred (boolean)
-])
+]
+plan = clay.add_salesforce_import_fields(imp["id"], new, dry_run=True)   # reads only — no field is created
+plan["to_create"], plan["skipped"]                                # [{"salesforceFieldId", "displayName", "dataType"}], [already mapped]
+res = clay.add_salesforce_import_fields(imp["id"], new)           # the write: create the fields, then PATCH the mapping
 res["created_fields"]                                             # [{"id": "audf_...", "dataType": ..., ...}]
 clay.get_audience_import_sync_status(imp["id"])                   # {"importSyncStatus": ..., "numImportRecordsSynced": ...}
 ```
 
-- `add_salesforce_import_fields` validates each API name against the connection's field
-  catalog (`list_salesforce_import_fields`), skips ones already mapped, infers `dataType` from
-  the Salesforce type (boolean / date / number / email / url, else text), and sends the
-  EXISTING mapping plus the new pairs — because the PATCH replaces the whole list.
-- Use `update_salesforce_import_field_mapping(...)` directly only to remove mappings, and pass
-  the complete list.
+- `add_salesforce_import_fields` checks everything before its first write: the import (found,
+  Salesforce, entityType / Salesforce object / connection present), every EXISTING mapping
+  entry (an incomplete pair fails the call — the PATCH replaces the whole list, so it is never
+  dropped), each new API name against the connection's field catalog
+  (`list_salesforce_import_fields`), one field per Salesforce API name (an API name already
+  mapped is skipped and reported once; repeated entries collapse; entries that disagree on
+  displayName / dataType raise before any request), distinct displayNames for the new fields
+  (the create response is paired with the request by position and checked by displayName), and
+  the five sync settings. `dataType` is inferred from the Salesforce type (boolean / date /
+  number / email / url, else text). It then sends the EXISTING mapping plus the new pairs —
+  because the PATCH replaces the whole list — after one more read of the import that aborts if
+  the mapping changed in between. `dry_run=True` stops after the checks and returns the plan.
+- Sync settings are never defaulted: the PATCH also replaces `isImportSyncEnabled`,
+  `isExportSyncEnabled`, `isCreateNewRecordsEnabled`, `createNewRecordsIdMapping` and
+  `isTaskSyncEnabled`, so `add_salesforce_import_fields` copies all five from `importMetadata`
+  and raises — naming the key and the remedy — when one is missing or null. Supply it with
+  `sync_flags={"isTaskSyncEnabled": False}` (the value the UI's Salesforce sync toggle shows).
+  isTaskSyncEnabled was absent from a live CONTACT import's importMetadata on 2026-09-29 while
+  the ACCOUNT import had all five; the UI's replay sent False.
+- If the mapping PATCH fails after the fields were created, `AudienceFieldsOrphanedError` (a
+  `RuntimeError`) carries `.created_field_ids`, `.mapping`, `.entity_type`, `.sync_flags`,
+  `.pairing_verified` and `.mapped_after_failure`. With `pairing_verified` True, re-send the
+  mapping — idempotent, the PATCH is a full REPLACE:
+  `clay.update_salesforce_import_field_mapping(err.import_id, err.mapping, entity_type=err.entity_type, **err.sync_flag_kwargs())`.
+  With it False (the create response could not be paired with the request) `.mapping` is None:
+  map the fields by hand after checking each displayName, or delete them. claycast has no
+  delete wrapper for Audiences fields (endpoint never captured): the official CLI
+  `clay audiences fields delete <audf_id> --entity-type people|companies` (soft, idempotent; run
+  `clay audiences fields segments <id>` first and confirm `clay whoami` shows the same
+  workspace) or the UI. Delete only once a re-read confirms the fields are unmapped — a
+  connection error after the PATCH was sent leaves its outcome unknown, and the error says so.
+- Use `update_salesforce_import_field_mapping(...)` directly only to remove mappings: pass the
+  complete list and all five sync settings — required keyword arguments with no defaults
+  (omitting one is a TypeError), sourced from the import, never guessed:
+
+  ```python
+  imp = next(i for i in clay.list_audience_imports() if i["id"] == import_id)
+  m = imp["importMetadata"]
+  mapping = [p for p in imp["fieldMapping"]["fieldMappings"] if p["salesforceFieldId"] != "Field_To_Drop__c"]
+  clay.update_salesforce_import_field_mapping(
+      import_id, mapping, entity_type=imp["entityType"],
+      is_import_sync_enabled=m["isImportSyncEnabled"], is_export_sync_enabled=m["isExportSyncEnabled"],
+      is_create_new_records_enabled=m["isCreateNewRecordsEnabled"],
+      create_new_records_id_mapping=m["createNewRecordsIdMapping"], is_task_sync_enabled=m["isTaskSyncEnabled"],
+  )
+  # or, equivalently: sync_flags={k: m[k] for k in ("isImportSyncEnabled", "isExportSyncEnabled",
+  #     "isCreateNewRecordsEnabled", "createNewRecordsIdMapping", "isTaskSyncEnabled")}
+  ```
 - No credits; these are workspace-config writes. Endpoint shapes and gotchas:
   `references/clay-api-reference.md` → "Audiences: Salesforce import field mapping".
 
