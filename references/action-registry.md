@@ -466,6 +466,8 @@ clay.create_action_column(rep_table, "SFDC Role (SOQL)",
 
 1. **Restricted/read-only connections silently block fields via FLS — surfaced as parse errors, not permission errors.** A read-only API user (e.g. an `API_Read_Only_*` account) frequently can't see role/profile data. `UserRole.Name` → `INVALID_FIELD "Didn't understand relationship 'UserRole'"`; `UserRoleId` → `INVALID_FIELD "No such column 'UserRoleId' on entity 'User'"` — even though both are standard. Strategy: **start with direct descriptive fields** (`Title`, `Department`, `Division`, `IsActive`), **avoid relationship traversal** (`Foo.Name`), and resolve an id→name only via a SEPARATE object query (`SELECT Id, Name FROM UserRole WHERE Id IN (...)`) — which itself needs the id to be FLS-readable. SF reports only the FIRST invalid field (read the `Column:N` caret position to see which field parsed and which broke), so peel fields off one at a time.
 
+2. **Sandbox orgs munge emails → exact match returns zero rows.** If the auth-account name contains `test` / `sandbox` / `--` (e.g. `API_Read_Only_acmetest`), it's a sandbox, and Salesforce appends a suffix like `.invalid` or `.<sandboxname>` to every User's `Email`. So `WHERE Email = 'x@co.com'` silently returns "no records found" (a clean run, not an error). Use `WHERE Email LIKE 'x@co.com%'` plus a `Name IN (...)` fallback instead of equality.
+
 3. **At most 1,000 rows per query, truncated SILENTLY** (verified 2026-09-30,
    `salesforce-lookup-via-soql`). A query the sf CLI answers with 2,000 rows (`LIMIT 2000`, 2,173
    matching) came back from the Clay action with exactly 1,000, status SUCCESS and no warning. Page
@@ -487,8 +489,6 @@ clay.create_action_column(rep_table, "SFDC Role (SOQL)",
 6. **SOQL columns run from the API:** `run_column(..., force_run=True)` executed all cells within
    ~20s, unlike `use-ai` Claygent columns. A non-forced run honored the "only run if" gate
    (`ERROR_RUN_CONDITION_NOT_MET` on gated rows). Empty results show `SUCCESS_NO_DATA`.
-
-2. **Sandbox orgs munge emails → exact match returns zero rows.** If the auth-account name contains `test` / `sandbox` / `--` (e.g. `API_Read_Only_acmetest`), it's a sandbox, and Salesforce appends a suffix like `.invalid` or `.<sandboxname>` to every User's `Email`. So `WHERE Email = 'x@co.com'` silently returns "no records found" (a clean run, not an error). Use `WHERE Email LIKE 'x@co.com%'` plus a `Name IN (...)` fallback instead of equality.
 
 ### Salesforce: Create Object / Update Object — payload shapes + duplicate rules (verified 2026-08-13)
 
