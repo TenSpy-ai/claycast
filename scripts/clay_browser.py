@@ -141,14 +141,19 @@ def _acl_warning():
     are private only through the NTFS ACL of the runtime dir — per-user when it sits under the
     profile: %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% (which %TEMP% does by default; the first two
     can be redirected off the profile drive, so all three set roots count). One line when it sits
-    under none of them; None otherwise, and None when no root is set (cannot judge)."""
+    under none of them; None otherwise, and None when no root is set (cannot judge).
+
+    Both sides go through os.path.realpath, not abspath: Windows hands many processes their %TEMP%
+    in 8.3 form (the user segment spelled like JEREMY~1) while the three profile roots carry the
+    long name, and a prefix test on the two spellings flagged the DEFAULT runtime dir as outside
+    the profile on every launch (measured 2026-09-30). realpath expands short names on Windows."""
     if not IS_WINDOWS:
         return None
     roots = [os.environ.get(v) for v in ("LOCALAPPDATA", "APPDATA", "USERPROFILE")]
-    roots = [os.path.normcase(os.path.abspath(r)).rstrip("\\/") for r in roots if r]
+    roots = [os.path.normcase(os.path.realpath(r)).rstrip("\\/") for r in roots if r]
     if not roots:
         return None
-    here = os.path.normcase(os.path.abspath(RUNTIME_DIR)).rstrip("\\/")
+    here = os.path.normcase(os.path.realpath(RUNTIME_DIR)).rstrip("\\/")
     if any(here == root or here.startswith(root + os.sep) for root in roots):
         return None
     return (

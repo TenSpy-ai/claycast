@@ -745,6 +745,44 @@ def test_acl_warning_only_on_windows_outside_profile_roots(short_dir, monkeypatc
     assert b._acl_warning() is None                      # no root known -> cannot judge, stay quiet
 
 
+@pytest.mark.skipif(os.name != "nt", reason="8.3 short names exist only on Windows")
+def test_acl_warning_expands_8dot3_short_names(tmp_path, monkeypatch):
+    """Windows hands many processes their %TEMP% in 8.3 form (the user segment spelled like
+    JEREMY~1) while %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% carry the long name, so a plain
+    prefix test on the two spellings says the DEFAULT runtime dir is outside the profile when it
+    is the profile's own Temp. Measured 2026-09-30 on a Windows 11 laptop: every launch printed
+    the WARNING under an untouched %TEMP%. Both sides have to be realpath()ed, which expands
+    short names on Windows; the test builds a real directory and asks the kernel for its 8.3 form.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    long_root = tmp_path / "ProfileWithALongName"
+    long_root.mkdir()
+    long_root = os.path.realpath(str(long_root))          # fully long-named spelling
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    k32.GetShortPathNameW.restype = wintypes.DWORD
+    buf = ctypes.create_unicode_buffer(1024)
+    assert k32.GetShortPathNameW(long_root, buf, 1024), ctypes.get_last_error()
+    short_root = buf.value                                # fully short-named spelling
+    if os.path.normcase(short_root) == os.path.normcase(long_root):
+        pytest.skip("8.3 name generation is disabled on this volume")
+
+    b = _load(str(tmp_path))
+    monkeypatch.setattr(b, "IS_WINDOWS", True)
+    for v in ("LOCALAPPDATA", "APPDATA"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("USERPROFILE", long_root)
+    monkeypatch.setattr(b, "RUNTIME_DIR", os.path.join(short_root, "AppData", "Local", "Temp", "clay-browser"))
+    assert b._acl_warning() is None                      # same directory, spelled short: inside
+    monkeypatch.setenv("USERPROFILE", short_root)        # and the other way round
+    monkeypatch.setattr(b, "RUNTIME_DIR", os.path.join(long_root, "AppData", "Local", "Temp", "clay-browser"))
+    assert b._acl_warning() is None
+    monkeypatch.setattr(b, "RUNTIME_DIR", os.path.join(os.path.dirname(long_root), "Elsewhere"))
+    assert "outside your user profile" in b._acl_warning()   # a sibling dir is still outside
+
+
 def _start_without_playwright(b, monkeypatch):
     s = b.ClayBrowserServer()
     for name in ("_setup_browser", "_setup_capture", "_serve_forever"):
