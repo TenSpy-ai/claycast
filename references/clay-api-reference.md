@@ -1709,6 +1709,71 @@ The actual parsed JSON is stored internally. Formula extractors (`?.key`) CAN ac
 
 ---
 
+## Claygent columns from code: `create_claygent_column` / `sync_claygent_column` / `verify_claygent_column` (verified 2026-09-30)
+
+A table column that runs a **saved Claygent** (`c_…`, Clay UI: Claygents) is a `use-ai` column with
+`useCase '"claygent"'`, `claygentId`, `claygentFieldMapping` (Claygent variable -> column expression),
+**plus its own copies of the Claygent's output schema (`answerSchemaType`) and `model`**. Without the
+schema copy the UI shows "Unable to parse the output schema for the column" and the column never runs.
+These methods build that binding from the Claygent itself, so nothing is hand-copied:
+
+```python
+cg = clay.get_claygent("c_...")                  # GET /workspaces/{ws}/claygents/{id} -> currentVersion
+                                                 #   (userPrompt, outputFormat, modelSettings, variables)
+col = clay.create_claygent_column(
+    table_id, "Research", "c_...",
+    {"user_message": "{{f_input}}"},             # every Claygent variable -> a formula expression
+    view_id=view_id,
+    auth_account_id="aa_...",                    # your own Anthropic/OpenAI connection
+    condition="{{f_ready}} == \"yes\"",          # optional "Only run if"
+)                                                # creates, reads back, raises on any mismatch
+fid = (col.get("field") or col)["id"]
+
+clay.verify_claygent_column(table_id, fid, var_map={"user_message": "{{f_input}}"})
+# -> {"ok": True, "problems": [], "claygent_id": "c_..."}   READ-ONLY
+
+clay.sync_claygent_column(table_id, fid)         # after editing the Claygent: re-copy schema + model,
+                                                 # keep the existing mapping and "Only run if"
+answer = ClayClient.unwrap_claygent_output(cell_value, ["score", "reason"])
+```
+
+What each check means, and what was measured behind it:
+
+- **`prompt` is rendered by Clay, not by you.** On every column create and update, Clay rebuilds the
+  `prompt` input from the bound Claygent's current prompt, with each `{{variable}}` replaced by its
+  `claygentFieldMapping` expression, and discards any prompt in the request. Measured on throwaway
+  tables: a create with a bogus literal prompt stored the Claygent's real prompt; a prompt-only update
+  was discarded; a `claygentId`-only update swapped in the other Claygent's whole prompt; a
+  mapping-only update changed the prompt's slot to match. `claygent_column_inputs` still sends a
+  rendered prompt, to match the UI's payload.
+- **The schema and model copies do NOT follow Claygent edits.** Run `sync_claygent_column` after
+  changing the Claygent. Its write also makes Clay re-render the prompt. Changing the model this way did
+  not mark finished cells out of date.
+- **`verify_claygent_column` checks:** the column is bound to a Claygent; `model` equals the Claygent's;
+  the schema copy equals the Claygent's schema exactly (it is stored double-encoded,
+  `json.dumps(json.dumps(schema))`); every literal piece of the Claygent's prompt appears in the stored
+  prompt, in order, with one `Clay.formatForAIPrompt(` per variable (stale if the Claygent was edited
+  after the column's last write; a byte-for-byte compare always fails because Clay drops the spaces
+  around `+`); the mapping covers exactly the Claygent's variables; and, with `var_map`, that each
+  variable maps to that expression. Run it after anyone opens the column's panel in the UI: opening it
+  can arm "Save", and a save re-writes the column from the UI's state.
+- **Any expression works in `var_map`,** not only a column reference. The expression is evaluated at
+  run time as the action's input and is not stored in a cell, so it is how to feed an input larger than
+  a cell's 8,192-character cap.
+- **All `use-ai` parameters are bound** (from `list_actions()`, unset ones bare). A column missing some
+  shows no inputs in the UI.
+- **`byo_key=True`** (default) sends `_metadata.modelSource '"user"'`: the column bills your own
+  provider connection (`auth_account_id`), not Clay-managed credits.
+- **Running:** a `useCase "claygent"` column runs only from the Clay UI's Run button. `run_column`
+  ACKs and never executes it. A non-force UI Run honors the "Only run if" condition; "Force run"
+  does not.
+- **`unwrap_claygent_output(value, keys)`**: Clay does not enforce a JSON Schema's shape. 2 of 7 answers
+  on one column arrived one level down (`{"body": {...}}`, `{"parameters": {...}}`) despite
+  `additionalProperties: false`. The helper returns the top level when any key is there, else the one
+  nested object holding all keys, else `{}`; it also parses a JSON string.
+
+---
+
 ## runRecords: recordIds vs viewId
 
 Always prefer `recordIds` when you have them:

@@ -102,6 +102,7 @@ tables = clay.list_tables()
 | Audience export (>50K rows) | `list_audience_segments`, `count_audience_segment`, `export_audience_segment` |
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
+| Saved Claygent columns | `get_claygent`, `claygent_column_inputs`, `create_claygent_column`, `sync_claygent_column` (re-copy schema + model after a Claygent edit), `verify_claygent_column` (read-only drift check), `unwrap_claygent_output` (static; answers can arrive wrapped in `body`/`parameters`). Clay re-renders the prompt itself on every write; see api-reference "Claygent columns from code" |
 | Registry | `list_actions`, `list_subroutines`, `get_dynamic_action_fields` |
 | Functions & tools registry | `create_function(name, inputs, entity_type, extractors, success_field, register, send_back)` — UI-style subroutine function table end-to-end (registered, publicly runnable; `send_back={output: extractor_col}` wires the write-to-cell return path + AUTO_RUN so caller cells resolve "✅ Success"); `register_tool(tool_id, tool_type, name, entity_type, ...)` — register workflows/functions in the workspace tools registry for public Routines execution; `create_function_sandbox` / `publish_function_sandbox` — edit a LIVE (caller-locked) function via Clay's sandbox flow |
 | Presets / catalog | `list_preset_categories`, `list_presets_filtered`, `list_presets_by_category`, `list_disabled_actions`, `list_starred_resources`, `get_resource_star`, `apply_preset` |
