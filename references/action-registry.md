@@ -466,6 +466,28 @@ clay.create_action_column(rep_table, "SFDC Role (SOQL)",
 
 1. **Restricted/read-only connections silently block fields via FLS — surfaced as parse errors, not permission errors.** A read-only API user (e.g. an `API_Read_Only_*` account) frequently can't see role/profile data. `UserRole.Name` → `INVALID_FIELD "Didn't understand relationship 'UserRole'"`; `UserRoleId` → `INVALID_FIELD "No such column 'UserRoleId' on entity 'User'"` — even though both are standard. Strategy: **start with direct descriptive fields** (`Title`, `Department`, `Division`, `IsActive`), **avoid relationship traversal** (`Foo.Name`), and resolve an id→name only via a SEPARATE object query (`SELECT Id, Name FROM UserRole WHERE Id IN (...)`) — which itself needs the id to be FLS-readable. SF reports only the FIRST invalid field (read the `Column:N` caret position to see which field parsed and which broke), so peel fields off one at a time.
 
+3. **At most 1,000 rows per query, truncated SILENTLY** (verified 2026-09-30,
+   `salesforce-lookup-via-soql`). A query the sf CLI answers with 2,000 rows (`LIMIT 2000`, 2,173
+   matching) came back from the Clay action with exactly 1,000, status SUCCESS and no warning. Page
+   it:
+   - page 1: `... ORDER BY CreatedDate DESC, Id DESC LIMIT 1000`
+   - page 2: `... ORDER BY CreatedDate DESC, Id DESC LIMIT 1000 OFFSET 1000` (`OFFSET` works through
+     the action; SOQL caps `OFFSET` at 2,000)
+
+   The unique `Id` tiebreaker keeps the pages from overlapping or skipping rows that share a
+   timestamp. Gate page 2 on page 1 being full, e.g.
+   `!!{{page2_query}} && ((({{page1}} || {})?.records) || []).length >= 1000`. The gate reads the
+   action cell's `records` fine. The same action inside a Workflow tool node presumably has the same
+   cap (not re-measured there).
+4. **Large results are fine in the ACTION cell:** a 1,000-row page (~204 KB JSON) and two pages
+   (407 KB) arrived whole, and formulas read all of it. This is unlike text and formula cells, which
+   drop anything over 8,192 characters (see clay-api-reference.md, Formula Syntax).
+5. **Account rows gain a `CRMLink` key** (the record's Lightning URL) that Salesforce itself does not
+   return. Strip it before comparing with another source.
+6. **SOQL columns run from the API:** `run_column(..., force_run=True)` executed all cells within
+   ~20s, unlike `use-ai` Claygent columns. A non-forced run honored the "only run if" gate
+   (`ERROR_RUN_CONDITION_NOT_MET` on gated rows). Empty results show `SUCCESS_NO_DATA`.
+
 2. **Sandbox orgs munge emails → exact match returns zero rows.** If the auth-account name contains `test` / `sandbox` / `--` (e.g. `API_Read_Only_acmetest`), it's a sandbox, and Salesforce appends a suffix like `.invalid` or `.<sandboxname>` to every User's `Email`. So `WHERE Email = 'x@co.com'` silently returns "no records found" (a clean run, not an error). Use `WHERE Email LIKE 'x@co.com%'` plus a `Name IN (...)` fallback instead of equality.
 
 ### Salesforce: Create Object / Update Object — payload shapes + duplicate rules (verified 2026-08-13)
