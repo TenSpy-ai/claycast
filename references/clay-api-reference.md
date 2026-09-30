@@ -1705,7 +1705,152 @@ When reading AI column values via `bulk-fetch-records`, the API returns:
 ```json
 {"value": "Response", "metadata": {"isPreview": true, "status": "SUCCESS"}}
 ```
-The actual parsed JSON is stored internally. Formula extractors (`?.key`) CAN access the parsed JSON from AI columns even though the API shows just `"Response"`.
+Formula extractors (`?.key`) CAN access the parsed JSON from AI columns even though the bulk read shows just `"Response"`. **To read the object from code, use the per-record endpoint** (`get_record` / `fetch_all_records_full`): it is at `cells[fid].externalContent.fullValue` (verified 2026-09-30 on Claygent columns with a JSON Schema output). A watcher that counts keys on the bulk read sees 0 keys on every finished cell.
+
+---
+
+## Saved Claygents (`c_…`): output schemas, table columns, workflow pins (verified 2026-09-30)
+
+A **saved Claygent** is a workspace resource (Clay UI: Claygents → edit), separate from any column or
+workflow node that uses it. It holds the prompt, the output format, the model settings and the input
+variables, and it is **versioned**: every save mints a new version. Tables and workflows both reference
+it, but in different ways, and the differences are where things break.
+
+### Read / write the Claygent itself
+
+```python
+path = f"/workspaces/{clay.workspace_id}/claygents/{claygent_id}"
+g = clay.get(path)["claygent"]       # id, name, currentVersionId, currentVersion, publishedAt, ...
+v = g["currentVersion"]              # userPrompt, outputFormat, modelSettings, variables, versionNumber,
+                                     # toolSettings, contextSettings, skills, externalToolIds, isPublished
+
+clay.patch(path, {
+    "userPrompt": prompt,                                   # uses {{variable}} placeholders
+    "outputFormat": {"type": "json", "jsonType": "JSONSchema",
+                     "jsonSchema": json.dumps(schema)},     # ONE json.dumps: a plain JSON string
+    "modelSettings": dict(v["modelSettings"], internetSearchEnabled=False),  # send the whole object back
+})
+# -> a new version; g["currentVersionId"] changes. Read back and compare; do not trust the 200.
+```
+
+- `outputFormat.jsonType` is `"JSONSchema"` or `"Fields"` (the UI's two output modes). On the Claygent
+  the schema is a **single-encoded** JSON string. The column-level copy (below) is a formula literal,
+  i.e. `json.dumps(json.dumps(schema))`. Same schema, two encodings.
+- `modelSettings` observed: `model`, `useCase` (a formula literal, e.g. `'"claygent"'`),
+  `internetSearchEnabled`, `peopleAndCompaniesSearchEnabled`, `peopleAndCompaniesSearchBudget`,
+  `shouldIncludeAllBusinessContext`. Always PATCH the full object back with your change; partial
+  `modelSettings` bodies were not tested.
+- `variables`: `[{name, type: "text", required: true, description}]`, one per `{{name}}` in the prompt.
+- **The UI prompt editor strips anything shaped like an HTML tag on save.** A prompt containing
+  `<external_data source="...">…</external_data>` delimiters or `<placeholder>` text came back with
+  every tag removed after a UI save, and nothing warned about it. Prompts with angle-bracket markup
+  must be written through the API and **not re-saved in the UI**. Duplicating a Claygent in the UI
+  (the copy is saved through the editor) inherits the damage.
+- The UI's **"Generate from prompt"** button on the JSON Schema output writes a plausible schema, but
+  check it before you use it: it produced **camelCase** keys for a prompt whose instructions and
+  downstream code used snake_case, and it wrote descriptions that added rules the prompt did not have.
+
+### Structured output is capped at 4,096 output tokens, and truncation still reports SUCCESS
+
+The `use-ai` action's `maxTokens` parameter reads *"Defaults to 4096, Maximum of 4096"*
+(`clay workflows actions schema` / `list_actions`), and a Claygent column cannot go above it.
+Measured 2026-09-30 on 12 cells (a ~20-key JSON Schema, `claude-opus-5`, ~26k input tokens):
+**all 12 reported `totalOutputTokens: 4096` exactly**, and on 7 of 12 the object was cut short. The
+**last keys in the answer were simply absent**. That happened even though the schema listed them in
+`required` with `additionalProperties: false`, and every one of those cells still said
+`status: SUCCESS`. The schema is a request, not a guarantee.
+
+- Treat `totalOutputTokens == 4096` as a truncation flag, and validate required keys yourself before
+  you use the object.
+- Keep a structured answer well under ~4k output tokens. Put the keys you cannot lose **first** in the
+  prompt's output instructions (the model writes in that order, so the tail is what gets cut). If the
+  answer is genuinely long, split it across two Claygents (a short scoring call and a separate copy
+  call). In the same project a four-key schema returned complete objects where the ~20-key one did not.
+- **Workflow agent nodes appear to drop a truncated answer entirely.** The same Claygent on the same
+  inputs returned `{}` as a workflow agent node, where the table column kept the partial object. This
+  is consistent with the node refusing an object that fails its own schema check, but it has not
+  been proven. If a workflow Claygent returns `{}` on long answers only, suspect the cap before the
+  prompt.
+
+### The cell value mixes your keys with Clay's metadata keys
+
+The object in `externalContent.fullValue` is **your schema's keys plus Clay's own keys, merged at the
+top level**: `reasoning` or `confidence`, `stepsTaken`, `totalInputTokens`, `totalOutputTokens`,
+`timeTakenInSeconds` (a string such as `"44.27"`), `totalCostToAIProvider` (a string such as
+`"$0.23829"`, sometimes with float noise like `"$0.23370999999999997"`) and
+`forcedToFinishEarlyBecauseOfCost`. Strip them before handing the object on. Avoid schema keys with
+those names, because a collision would be ambiguous. (That is inferred, not tested.)
+
+### Binding a table column to a saved Claygent
+
+An AI column that uses a saved Claygent is a `use-ai` column with `useCase '"claygent"'` and three
+Claygent-specific inputs. **It also needs its own copy of the prompt and the output schema.** A
+column created through the API with only the Claygent reference exists, looks right, and then
+fails in the UI with **"Unable to parse the output schema for the column"**. After that, clicking
+Run on the column or on any single cell does nothing.
+
+```python
+# prompt = the Claygent's userPrompt, with {{score_input}} replaced by the column reference
+before, after = v["userPrompt"].split("{{score_input}}")
+bindings = {
+    "useCase":   {"formulaText": '"claygent"'},
+    "claygentId": {"formulaText": json.dumps(claygent_id)},
+    "model":     {"formulaText": json.dumps(v["modelSettings"]["model"])},
+    "claygentFieldMapping": {"formulaMap": {
+        "{{score_input}}": "Clay.formatForAIPrompt({{" + input_fid + "}})"}},   # Claygent var -> column
+    # Both of these are REQUIRED even though the Claygent already has them:
+    "answerSchemaType": {"formulaMap": {"type": '"json"', "jsonType": '"JSONSchema"',
+                                        "jsonSchema": json.dumps(v["outputFormat"]["jsonSchema"])}},
+    "prompt":    {"formulaText": json.dumps(before) + " + Clay.formatForAIPrompt({{" + input_fid + "}}) + "
+                                 + json.dumps(after)},
+}
+```
+
+- Bind the action's **full** parameter list as elsewhere (unset ones bare): a UI-made Claygent column
+  carries `temperature`, `reasoningLevel`, `reasoningBudget`, `maxTokens`, `maxCostInCents`,
+  `jsonMode`, `systemPrompt`, `tableExamples`, `stopSequence`, `runBudget`, `topP`, `width`,
+  `height`, `aspectRatio`, `referenceImageURL`, `contextDocumentIds`, `mcpSettings`, `_metadata`.
+- **The column does not follow the Claygent.** Editing the Claygent later leaves the column's
+  `prompt` and `answerSchemaType` copies stale. It is not known which copy wins at run time, so
+  re-copy both from the Claygent whenever it changes, and read both back.
+- **Clay rewrites the `prompt` formula on save.** It drops the spaces around `+` and drops a trailing
+  `+ ""` when the text after the variable is empty. A byte-for-byte read-back check therefore always
+  fails. Compare meaning instead: split on the single `Clay.formatForAIPrompt({{fid}})` reference,
+  `json.loads` each literal side, and compare those to the Claygent's text.
+- **Running:** re-confirmed 2026-09-30 that neither `run_column` nor an API flip of the table's
+  `AUTO_RUN_ON` starts a `useCase "claygent"` column. The cells only ran after a click on the column's
+  Run button in the UI. Build the column by API, then have a person click Run, and watch the cells
+  from code (per-record reads, above).
+
+### Workflow agent nodes are PINNED to a Claygent version
+
+A workflow agent node stores `agentClaygentId` **and** `claygentVersionId`, both on the node record
+and inside `nodeConfig`. PATCHing the Claygent mints a new version, **and the node keeps running the
+old one**:
+
+- workflow **runs** use the pinned version;
+- single-node **tests** (`clay workflows nodes test`) use the latest version;
+- so a changed output format passes every node test and fails every real run. Observed:
+  `expected record, received string` after switching a Claygent from Fields to JSON Schema, with
+  `validate` warning `outdated_claygent_version`.
+
+Re-pin by a full-replacement node PATCH (the node PATCH replaces the whole record, see "Node
+updates" in the Terracotta section):
+
+```python
+gpath = f"/workspaces/{ws}/tc-workflows/{wf}/graph"
+rec = next(n for n in clay.get(gpath)["nodes"] if n["id"] == node_id)
+cur = clay.get(f"/workspaces/{ws}/claygents/{claygent_id}")["claygent"]["currentVersionId"]
+body = {k: v for k, v in rec.items() if k not in ("id", "workspaceId", "workflowId", "createdAt", "updatedAt")}
+body["claygentVersionId"] = cur
+body["nodeConfig"] = dict(rec["nodeConfig"], claygentVersionId=cur)
+body["nodeConfig"].pop("outputPreview", None)    # points at the old version's output shape
+clay.patch(f"/workspaces/{ws}/tc-workflows/{wf}/nodes/{node_id}", body)
+# read the graph back: both claygentVersionId fields must equal cur
+```
+
+Do this after **every** Claygent change that a workflow depends on, and re-run `validate` to see
+whether `outdated_claygent_version` clears.
 
 ---
 
