@@ -1895,7 +1895,7 @@ Required query params and body shapes are listed verbatim from the captured call
 | `GET /v3/workspaces/{ws}/audiences/segments` | `entityType=ACCOUNT\|CONTACT` | `{segments: [...], total: N}` |
 | `GET /v3/workspaces/{ws}/audiences/scheduled-searches` | none | `{scheduledSearches: [...], total: N}` |
 | `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType=ACCOUNT\|CONTACT` | `{audienceImports: [...]}` (corrected 2026-09-29 — the key is `audienceImports`, not `imports`; see the Salesforce import field mapping section) |
-| `GET /v3/workspaces/{ws}/audiences/imports/external-source-import-history/{TYPE}` | `{TYPE}` is `ACCOUNT` or `CONTACT` (path segment, not query) | bare `list[dict]` |
+| `GET /v3/workspaces/{ws}/audiences/imports/external-source-import-history/{TYPE}` | `{TYPE}` is `ACCOUNT` or `CONTACT` (path segment, not query) | bare `list[dict]` — **wrapped 2026-09-30 as `get_audience_import_history(entity_type)`**; it is the current state per import, not a log (see "Import sync state" below) |
 | `GET /v3/workspaces/{ws}/audiences/accounts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/contacts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/custom-objects/columns` | `includeSystemFields=true\|false` AND `objectType=<NAME>` (e.g. `OPPORTUNITY`) | bare `list[dict]` |
@@ -1984,7 +1984,8 @@ existing `fieldMappings` before step 1, re-reads the import between the steps, a
 | `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType` | `{"audienceImports": [...]}` — each with `id`, `entityType`, `displayName`, `importSourceType`, `importSourceSubtype`, `status`, `importedCount`, `fieldMapping.fieldMappings`, `importMetadata{appAccountId, salesforceOrgId, isImportSyncEnabled, isExportSyncEnabled, isCreateNewRecordsEnabled, createNewRecordsIdMapping, isTaskSyncEnabled, salesforceImportKind}` (the five sync keys are what the mapping PATCH replaces; observed under `importMetadata` only, never at the import's top level. Verified live 2026-09-29: the ACCOUNT import carried all five, the CONTACT import had no `isTaskSyncEnabled` — the SDK refuses to guess it and takes `sync_flags=`) |
 | `GET /v3/workspaces/{ws}/audiences/imports/salesforce-fields/{object}` | `authAccountId=aa_<id>`; `{object}` = the import's `importSourceSubtype` | `{"fields": [{"value": "<API name>", "label", "type" (string, picklist, multipicklist, boolean, double, int, currency, percent, date, datetime, reference, url, email, textarea, id), "isUpdateable", "externalId", "isAssociatedObjectField"}]}` |
 | `GET /v3/workspaces/{ws}/audiences/imports/salesforce-preview/{Object}` | `authAccountId=aa_<id>` | sample records (`Task` returned 400 on the captured connection) |
-| `GET /v3/workspaces/{ws}/audiences/imports/external-source-sync-status/SALESFORCE/{audimp_<id>}` | — | `{importSyncStatus, importSyncType ("sync_incremental"), lastSyncedTime, numImportRecordsSynced, numImportRecordsTotal, lastExportedTime, hasExportInProgress, ...}`; the UI polls this every ~5 s after a save |
+| `GET /v3/workspaces/{ws}/audiences/imports/external-source-sync-status/SALESFORCE/{audimp_<id>}` | — | `{importSyncStatus ("success" \| "in_progress"), importSyncType ("sync_incremental" \| "sync_full"), lastSyncedTime, numImportRecordsSynced, numImportRecordsTotal, lastExportedTime, hasExportInProgress, numExportRecordsSynced, numExportRecordsTotal}` — the LAST run only; the UI polls it every ~5 s after a save; a mid-run 500 is transient. Wrapped as `get_audience_import_sync_status`. Semantics: "Import sync state, cadence and the backfill caveat" below |
+| `GET /v3/workspaces/{ws}/audiences/imports/external-source-import-history/{ACCOUNT\|CONTACT}` | path segment, no query | bare list, up to one row per import feeding the entity (object import + activity import `audactimp_<id>` with `activityTypeId`): `[{importId, importSourceType, importSyncStatus, importSyncType, numImportRecordsSynced, numImportRecordsTotal, activityTypeId?}]`. Current state per import, NOT a run log (a workspace with weeks of syncs returned two rows), and rows can be missing — the ACCOUNT call answered two rows, then `[]` 80 min later after two mapping PATCHes, while sync-status kept answering for that import. `list_audience_imports` is the inventory; this is the at-a-glance state. Wrapped 2026-09-30 as `get_audience_import_history(entity_type)`; the UI calls it from Settings → Audiences → Sources |
 | `GET /v3/workspaces/{ws}/audiences/import-connections` | — | connections usable by imports |
 | `GET /v3/workspaces/{ws}/audiences/activity-imports` | optional `appAccountId=aa_<id>` | activity imports (`audactimp_<id>`) |
 | `GET /v3/workspaces/{ws}/audiences/settings` | `entityType=ACCOUNT\|CONTACT` | audience settings |
@@ -1994,9 +1995,11 @@ existing `fieldMappings` before step 1, re-reads the import between the steps, a
 
 - A Salesforce lookup (e.g. `OwnerId`-style reference fields) arrives as the 18-char record
   ID, not a name — map the companion name/formula field too if a human will read it.
-- Backfill is fast (tens of thousands of rows in the first minute on a ~500k-row import) but
-  the import's `importedCount` stays 0 and `status` stays PENDING for a while; watch the
-  sync-status endpoint or count non-null values in the new column instead.
+- Backfill CAN be fast (tens of thousands of rows in the first minute on a ~500k-row import) but
+  it is not guaranteed — see "Import sync state, cadence and the backfill caveat" below. The
+  import's `importedCount` stays 0 and `status` stays PENDING after any mapping PATCH; neither
+  tells you anything. Watch the sync-status endpoint and count non-null values in the new
+  column instead.
 - Mapping is per import: the CONTACT import is a different `audimp_<id>` with its own list.
 - No credits are spent by any of these calls; they are workspace-config writes.
 - Orphan fields: the two-call write is not atomic. Validate the existing `fieldMappings`
@@ -2014,6 +2017,40 @@ existing `fieldMappings` before step 1, re-reads the import between the steps, a
   dataType raise before any request), skips API names already mapped, and requires distinct
   displayNames among the new fields; duplicates already inside the import's current mapping are
   preserved verbatim.
+
+### Import sync state, cadence and the backfill caveat (measured 2026-09-30)
+
+Two reads, both wrapped: `get_audience_import_sync_status(import_id)` (one import, with
+timestamps) and `get_audience_import_history(entity_type)` (every import feeding People or
+Companies, current state each). Neither is a run log.
+
+**Cadence, per Clay's own docs** (university.clay.com/docs/audiences → "CRM sync cadence"):
+Salesforce and HubSpot sources re-import **incrementally** — only records new or changed since
+the last run — every **15 minutes on Enterprise**, every 24 hours on other plans; every source
+also runs a **full re-import once a week** on every plan; cadence is per workspace and changed
+only through Clay ("contact your Growth Strategist"). The docs also say that adding a mapped
+field backfills it across the records already imported.
+
+**What was measured on a ~500k-company Account import and a ~730k-person Contact import
+(workspace 12345):**
+
+| Event | What happened |
+|---|---|
+| Field added to the Account import (afternoon) | Full backfill started at once, ran ~50k companies/hour, finished in ~10 h — the new column was populated on 100 % of the records that have a value in Salesforce. |
+| 15 fields added to the Contact import ~5 h later | Backfill ran fast (~200k/hour) for ~2 h, then stopped at about 60 % of the records. The remaining records only pick the fields up as they change in Salesforce. |
+| One more field added to the Account import while the first backfill was still running | **No backfill at all.** Only `sync_incremental` runs followed (every 15 min); the column filled on exactly the records modified in Salesforce since the add (~600 of 512k after 2.5 h). |
+| Re-sending the identical mapping PATCH | Import `status` → PENDING again; next run still `sync_incremental`. |
+| Removing the field's pair and adding it back (two PATCHes) | Same — no full sync. |
+| The UI | No manual trigger anywhere: Settings → Audiences → Sources (⋮ → Settings only), the import's settings page (Import sync toggle, mappings, Save and review), the sync's menu (Rename / Remove), the source's Manage menu (Disconnect). |
+
+**So:** treat a newly mapped field as unfilled until measured. Measure with the official CLI —
+`clay audiences records search-count --query "count from companies where <audf_id> is_not_null"`
+(or `people`) — against the Salesforce count of non-null values, and poll the sync status for
+`importSyncType == "sync_full"`. If no full sync comes, the field fills on the weekly full
+re-import (day not exposed by any API) or on a full re-import Clay support / the workspace's
+Growth Strategist triggers. Do not switch a saved segment to the new field before the fill is
+complete — the segment silently shrinks to the records synced so far. Nothing in claycast can
+force a `sync_full`; that is a Clay-side gap, not a missing wrapper.
 
 ---
 

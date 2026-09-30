@@ -3492,18 +3492,70 @@ class ClayClient:
         source_type: str = "SALESFORCE",
         workspace_id: int | str | None = None,
     ) -> dict:
-        """Sync progress for one external-source import.
+        """Live sync state of one external-source import (the LAST run, not a log).
 
         GET /workspaces/{ws}/audiences/imports/external-source-sync-status/{SOURCE}/{import_id}
-        -> {importSyncStatus, importSyncType, lastSyncedTime, numImportRecordsSynced,
-        numImportRecordsTotal, …}. The UI polls this every ~5s after a mapping change.
-        Verified live 2026-09-29.
+        -> {importSyncStatus: "success" | "in_progress" | ..., importSyncType:
+        "sync_incremental" | "sync_full", lastSyncedTime, numImportRecordsSynced,
+        numImportRecordsTotal, lastExportedTime, hasExportInProgress, numExportRecordsSynced,
+        numExportRecordsTotal}. The UI polls this every ~5 s after a mapping change; Clay's
+        server occasionally answers 500 mid-run — retry, do not treat it as a failed sync.
+
+        How to read it (measured 2026-09-30 on a ~500k-company Salesforce import):
+        - `sync_incremental` runs on the plan's cadence (every ~15 min on Enterprise) and only
+          touches records changed in Salesforce since the last run. It does NOT fill a newly
+          mapped field on records that did not change.
+        - `sync_full` is the weekly full re-import, or the backfill Clay starts when a mapped
+          field is added — but that backfill is not guaranteed: a field added while a previous
+          backfill was still running never got one, and one backfill stopped at ~60 % of the
+          records. Measure the fill (count non-null values in the new column) before you build
+          on the field; see the reference ("Import sync state, cadence and the backfill caveat").
+        - `numImportRecordsSynced == numImportRecordsTotal` means the last run finished, not
+          that every mapped field is populated.
+        - The import's own `status` (from list_audience_imports) flips to PENDING after any
+          mapping PATCH and stays there; it does not mean a sync is queued.
+        - Nothing triggers a `sync_full` on demand — not this API, not re-saving the mapping,
+          not removing and re-adding a field, and the UI has no "sync now" (checked 2026-09-30).
+        Verified live 2026-09-29 and 2026-09-30.
         """
         ws_id = self._resolve_workspace_id(workspace_id)
         return self.get(
             f"/workspaces/{ws_id}/audiences/imports/external-source-sync-status/"
             f"{source_type.upper()}/{import_id}"
         )
+
+    def get_audience_import_history(
+        self,
+        entity_type: str,
+        *,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """Per-import sync state for every external-source import feeding one entity.
+
+        GET /workspaces/{ws}/audiences/imports/external-source-import-history/{ACCOUNT|CONTACT}
+        -> bare list, up to one row per import that feeds the entity — the object import plus
+        any activity import (`audactimp_…`, which also carries `activityTypeId`):
+        [{importId, importSourceType, importSyncStatus, importSyncType,
+          numImportRecordsSynced, numImportRecordsTotal, activityTypeId?}, ...].
+        Despite the name it is the CURRENT state per import, not a run log: on 2026-09-30 a
+        workspace with weeks of syncs returned two rows (the Salesforce object import and the
+        activity import), both `sync_incremental`. Rows can also be MISSING: the same ACCOUNT
+        call returned two rows at 06:00Z and an empty list 80 minutes later — after two mapping
+        PATCHes on that import — while get_audience_import_sync_status() kept answering for it.
+        Treat `[]` as "nothing to show right now", not "no imports"; list_audience_imports() is
+        the inventory. Use this for an at-a-glance view across imports and
+        get_audience_import_sync_status() for one import's timestamps. The UI calls it from
+        Settings > Audiences > Sources. Verified live 2026-09-30.
+        """
+        entity_type = str(entity_type).upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        res = self.get(f"/workspaces/{ws_id}/audiences/imports/external-source-import-history/{entity_type}")
+        if isinstance(res, dict):
+            # Defensive: the live response is a bare list; if Clay ever wraps it, return the list.
+            return next((v for v in res.values() if isinstance(v, list)), [])
+        return res or []
 
     def list_salesforce_import_fields(
         self,

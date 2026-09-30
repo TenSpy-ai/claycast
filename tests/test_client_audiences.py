@@ -130,6 +130,25 @@ def test_sync_status_path(client):
     assert c.get_audience_import_sync_status("audimp_1", source_type="salesforce") == {"importSyncStatus": "DONE"}
 
 
+def test_import_history_path_entity_and_shape(client):
+    rows = [{"importId": "audimp_1", "importSyncType": "sync_incremental"},
+            {"importId": "audactimp_1", "activityTypeId": "acttyp_1", "importSyncType": "sync_incremental"}]
+    c = client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", rows)])
+    assert c.get_audience_import_history("account") == rows          # entity upper-cased into the path
+    assert c.session.calls[-1]["params"] is None                     # path segment, not a query param
+    c = client([("GET", IMPORTS + "/external-source-import-history/CONTACT", rows[:1])])
+    assert c.get_audience_import_history("CONTACT") == rows[:1]
+    with pytest.raises(ValueError):
+        c.get_audience_import_history("deal")
+
+
+def test_import_history_tolerates_wrapped_or_empty(client):
+    # Live shape is a bare list; a wrapped dict or an empty body must still yield a list.
+    assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", {"history": [{"importId": "x"}]})]).get_audience_import_history("ACCOUNT") == [{"importId": "x"}]
+    assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", {})]).get_audience_import_history("ACCOUNT") == []
+    assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", None)]).get_audience_import_history("ACCOUNT") == []
+
+
 def test_salesforce_fields_path_and_params(client):
     c = client([("GET", IMPORTS + "/salesforce-fields/contact", {"fields": [{"value": "Email"}]})])
     assert c.list_salesforce_import_fields("contact", auth_account_id="aa_9") == [{"value": "Email"}]
