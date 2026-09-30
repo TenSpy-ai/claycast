@@ -478,19 +478,21 @@ ClayCast ports every mode of the writer deployed at Datagen UUID `71197300-6fdb-
 
 Playwright-based daemon that runs a visible or headless Chromium with your Clay session cookie injected, and auto-captures every `api.clay.com` request + response to `/tmp/clay-browser/requests.jsonl`. Use it to (a) discover real API shapes when claycast doesn't wrap an endpoint yet, (b) watch live Clay UI behavior against a live workspace, or (c) drive the UI programmatically.
 
+The runtime dir is `/tmp/clay-browser` (`%TEMP%\clay-browser` on Windows; override with `CLAY_BROWSER_DIR`). The control channel is a UNIX socket when `<dir>/server.sock` fits the AF_UNIX limit (103 bytes on macOS, 107 on Linux) and otherwise — always on Windows — a loopback TCP port recorded in `server.port`; `launch` prints a NOTE when it falls back, and the fix is a `CLAY_BROWSER_DIR` of at most 91 bytes (95 on Linux). Every command carries a per-daemon secret the client reads from `server.token` (0600, created before the socket/port is advertised); any other local process that reaches the endpoint gets `unauthorized` — this is what makes the loopback-TCP mode safe on Windows and on POSIX with a long `CLAY_BROWSER_DIR`.
+
 ### Commands
 
 | Command | Purpose |
 |---|---|
 | `launch [--headless]` | Start the daemon (forks in the background), inject session cookie, begin capture |
-| `close` | Graceful shutdown; synchronously unlinks all capture files (`requests.jsonl`, `daemon.log`, `server.{sock,pid}`) before returning |
+| `close` | Graceful shutdown; synchronously unlinks all runtime files (`requests.jsonl`, `daemon.log`, `server.{sock,port,token,pid}`) before returning |
 | `goto <url>` | Navigate the page |
 | `snapshot` | Aria-tree snapshot of the current page |
-| `screenshot [path]` | PNG (default `/tmp/clay-browser/shot.png`) |
+| `screenshot [path]` | PNG (default `<runtime dir>/screenshot.png`) |
 | `click <text> [--role <aria-role>] [--nth N]` | Click by visible text (optionally scoped to role or nth match) |
 | `click_selector <css>` | Click by CSS selector |
 | `fill <text> [--placeholder <str>]` | Type into a text input (targets `[placeholder=]` when provided) |
-| `eval <js>` | Run JS in page context — wrap multi-statement logic in an IIFE `(() => { …; return X; })()` since top-level `return` is a SyntaxError |
+| `eval <js>` | Run JS in page context — wrap multi-statement logic in an IIFE `(() => { …; return X; })()` since top-level `return` is a SyntaxError. Runs with the injected Clay session, i.e. as you, logged in — which is why every command must carry the `server.token` secret and the runtime dir is `0700` |
 | `requests [--filter <substr>] [--last N]` | Dump captured `api.clay.com` traffic (filter by URL substring, tail last N entries) |
 
 ### Action-discovery recipe
@@ -512,7 +514,12 @@ Pull the `inputsBinding` array from the real POST and mirror it in `create_actio
 
 - `fill --placeholder` cannot reliably drive React-controlled token-picker components (e.g. Clay's column picker). For those, inspect concurrent waterfall-preset responses instead.
 - `--headless` means no visible window; the daemon still captures traffic. For manual driving, launch without `--headless`.
-- Capture files have `0600` perms, but still contain your session cookie and scraped PII until `close` removes them. Don't `kill -9` the daemon mid-capture without manually deleting `/tmp/clay-browser/`.
+- Capture files have `0600` perms, but still contain your session cookie and scraped PII until `close` removes them. Don't `kill -9` the daemon mid-capture without manually deleting the runtime dir (`/tmp/clay-browser/` by default).
+- A long `CLAY_BROWSER_DIR` does not break the daemon any more: it switches the control channel to loopback TCP (see the NOTE at launch). Prefer a short dir so the socket stays a UNIX socket.
+- The control channel is authenticated in both modes: the UNIX socket lives in a `0700` dir; in TCP mode the loopback port is reachable by any local process, so access is gated by the `0600` `server.token` file — do not loosen the runtime dir's permissions or copy the token. Pre-auth reads are bounded (5 s idle timeout, 1 MiB line), so a rogue peer can stall the daemon for at most 5 s per connection; a flood of idle peers still queues behind that, and the client then reports `Daemon alive (PID n) but … is not accepting connections` — retry, or kill the PID and launch again.
+- Windows: `0600`/`0700` mean nothing there (`os.chmod` only toggles the read-only bit). `server.token`, `server.port` and `requests.jsonl` are private only because `%TEMP%` inherits the per-user NTFS ACL of your profile — do not point `CLAY_BROWSER_DIR` (or `TEMP`) at a shared folder; `launch` warns when the runtime dir is outside `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`.
+- If `server.token` disappears while the daemon runs, `close` cannot authenticate: kill the PID in `server.pid` and delete the runtime dir (the client says exactly that).
+- The client checks that the PID in `server.pid` is alive before it connects, so a stale endpoint never receives the token. It must therefore be able to signal-probe that PID: a sandbox that denies it, or Windows mixed elevation (daemon launched from an elevated prompt, client from a normal one), reads as `Daemon not running` even though the daemon is up.
 
 ---
 

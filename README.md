@@ -38,7 +38,7 @@ git clone https://github.com/TenSpy-ai/claycast.git .claude/skills/claycast
 pip install -r .claude/skills/claycast/references/requirements.txt
 ```
 
-Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+. On Windows, `clay_browser.py` uses a loopback TCP control socket and `%TEMP%\clay-browser\` instead of a UNIX socket and `/tmp` (set `CLAY_BROWSER_DIR` to override on any platform).
+Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+. On Windows, `clay_browser.py` uses a loopback TCP control socket and `%TEMP%\clay-browser\` instead of a UNIX socket and `/tmp` (set `CLAY_BROWSER_DIR` to override on any platform; on POSIX a dir long enough to push `server.sock` past the AF_UNIX limit — 103 bytes on macOS, 107 on Linux — also switches to the loopback TCP channel, with a NOTE at launch). Both channels require a per-daemon token from `server.token` (0600 in the runtime dir) on every command, so other local processes cannot drive the browser — which runs JS in your logged-in Clay session; on Windows only the NTFS ACL of `%TEMP%` protects that file.
 
 > Project-level beats global when two projects need different versions, or when you want the skill version-controlled alongside the project. Global is simplest for personal use across many projects.
 
