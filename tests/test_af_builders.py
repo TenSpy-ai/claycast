@@ -116,6 +116,17 @@ def test_owner_in():
     assert n["value"] is not ids, "list is copied"
 
 
+def test_field_copies_list_values_so_the_node_is_not_aliased_to_the_callers_list():
+    ids = ["005a", "005b"]
+    n = cc.af_field(A, "sfdc_owner_id", "ContainAny", ids)
+    assert n["value"] == ids and n["value"] is not ids
+    n["value"].append("005c")                                   # editing the built AST ...
+    assert ids == ["005a", "005b"]                              # ... never reaches the caller's rule table
+    assert cc.af_owner_in(ids)["value"] == ids and cc.af_owner_in(ids)["value"] is not ids
+    assert cc.af_field(A, "f", "ContainAny", ("x", "y"))["value"] == ["x", "y"]   # tuples/sets become JSON-able lists
+    assert cc.af_field(A, "f", "ContainAny", frozenset(["x"]))["value"] == ["x"]
+
+
 def test_none_of_rejects_operator_without_negation():
     with pytest.raises(ValueError):
         cc.af_none_of(A, "x", [("ContainAny", ["a"])])
@@ -270,6 +281,20 @@ def test_identical_rules_collapse_first_occurrence_kept():
     inc = cc.af_none_of(A, "t1", rules)
     assert [(r["operator"], r["value"]) for r in inc["items"][1]["items"]] == [("NotEqual", "a"), ("NotContain", "b")]
     assert cc.af_any_of(A, "t1", [("Empty",), ("Empty",)]) == cc.af_or(cc.af_field(A, "t1", "Empty"))
+
+
+def test_dedupe_keeps_values_of_different_types_apart():
+    """1 == True == 1.0 in Python, so the old `parts not in norm` check collapsed the three into
+    one rule; to Clay (and the caller) they are three."""
+    rules = [("Equal", 1), ("Equal", True), ("Equal", 1.0), ("Equal", 1), ("Equal", True)]
+    ex = cc.af_any_of(A, "t1", rules)
+    assert [(r["operator"], r["value"], type(r["value"]).__name__) for r in ex["items"]] == [
+        ("Equal", 1, "int"), ("Equal", True, "bool"), ("Equal", 1.0, "float")]
+    inc = cc.af_none_of(A, "t1", rules)
+    assert [(r["operator"], r["value"], type(r["value"]).__name__) for r in inc["items"][1]["items"]] == [
+        ("NotEqual", 1, "int"), ("NotEqual", True, "bool"), ("NotEqual", 1.0, "float")]
+    assert cc._af_rules("t1", [("Equal", 0), ("Equal", False), ("Equal", 0.0), ("Equal", "0")]) == [
+        ("Equal", 0, None), ("Equal", False, None), ("Equal", 0.0, None), ("Equal", "0", None)]
 
 
 def test_positive_only_tables_match_the_pr_shapes_exactly():

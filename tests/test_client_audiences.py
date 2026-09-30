@@ -510,6 +510,40 @@ def test_create_new_records_without_id_mapping_is_refused_only_when_an_override_
     assert _methods(c) == ["GET"]
 
 
+def test_id_mapping_remedy_for_an_enabled_import_is_not_none_and_none_does_not_bypass_the_refusal(client):
+    """isCreateNewRecordsEnabled=True with NO createNewRecordsIdMapping key: the remedy used to
+    suggest sync_flags={"createNewRecordsIdMapping": None}, and passing exactly that slipped past
+    the enabled-without-mapping refusal (an absent key read as the import's own null)."""
+    meta = _meta(isCreateNewRecordsEnabled=True, createNewRecordsIdMapping=...)
+    c = client(_sf_routes(_import(importMetadata=meta)))
+    with pytest.raises(ValueError, match=r"is missing sync setting\(s\) createNewRecordsIdMapping;") as ei:
+        c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}])
+    msg = str(ei.value)
+    assert "sync_flags={\"createNewRecordsIdMapping\": <the import's id-mapping dict>}" in msg
+    assert '"createNewRecordsIdMapping": None' not in msg
+    assert _methods(c) == ["GET"]
+    # following the old remedy is refused after the import read: no catalog read, no writes
+    c = client(_sf_routes(_import(importMetadata=meta)))
+    with pytest.raises(ValueError, match="isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None"):
+        c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}],
+                                       sync_flags={"createNewRecordsIdMapping": None})
+    assert _methods(c) == ["GET"]
+    # the real remedy goes through and the PATCH carries it
+    c = client(_sf_routes(_import(importMetadata=meta)))
+    c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}],
+                                   sync_flags={"createNewRecordsIdMapping": {"Id": "audf_old"}})
+    patch = _patch_import(c)
+    assert (patch["isCreateNewRecordsEnabled"], patch["createNewRecordsIdMapping"]) == (True, {"Id": "audf_old"})
+    # with create-new-records off, None stays the example — and is accepted
+    c = client(_sf_routes(_import(importMetadata=_meta(createNewRecordsIdMapping=...))))
+    with pytest.raises(ValueError) as ei:
+        c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}])
+    assert 'sync_flags={"createNewRecordsIdMapping": None}' in str(ei.value)
+    c = client(_sf_routes(_import(importMetadata=_meta(createNewRecordsIdMapping=...))))
+    c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}], sync_flags={"createNewRecordsIdMapping": None})
+    assert (_patch_import(c)["isCreateNewRecordsEnabled"], _patch_import(c)["createNewRecordsIdMapping"]) == (False, None)
+
+
 # ── F4: validate everything before the first write; orphan story after it ────
 
 def test_bad_existing_mapping_fails_before_any_write(client):
@@ -617,8 +651,9 @@ def test_patch_rejected_after_create_raises_orphan_error_with_ids_and_exact_mapp
 @pytest.mark.parametrize("boom,exc_type", [(_boom_json, json.JSONDecodeError), (_boom_conn, requests.ConnectionError)])
 def test_patch_failure_of_unknown_outcome_recommends_resend_not_delete(client, boom, exc_type):
     """A connection reset or a non-JSON 2xx after the PATCH was sent: the server may have
-    applied the REPLACE, so the message says the outcome is unknown, recommends the idempotent
-    re-send and refuses to recommend deletion."""
+    applied the REPLACE. Here the post-failure re-read shows the fields unmapped, so the message
+    says so (not "Clay rejected"), recommends the idempotent re-send and still refuses to
+    recommend deletion."""
     c = client(_sf_routes(patch=boom))
     with pytest.raises(cc.AudienceFieldsOrphanedError) as ei:
         c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}])
@@ -626,8 +661,8 @@ def test_patch_failure_of_unknown_outcome_recommends_resend_not_delete(client, b
     assert isinstance(err.__cause__, exc_type) and err.pairing_verified is True
     assert err.mapped_after_failure is False and err.created_field_ids == ["audf_new0"]
     msg = str(err)
-    assert "after it was sent, so its outcome is UNKNOWN" in msg and "NOT mapped and nothing fills them" not in msg
-    assert "Clay rejected" not in msg
+    assert "after it was sent, and the fields exist and are NOT mapped (a re-read of the import shows them NOT mapped)" in msg
+    assert "outcome is UNKNOWN" not in msg and "Clay rejected" not in msg
     assert "Re-send the mapping (idempotent" in msg
     assert "Do not delete the fields unless list_audience_imports() confirms they are unmapped" in msg
     assert "If you would rather not map them" not in msg
@@ -652,9 +687,37 @@ def test_patch_failure_when_the_reread_shows_the_mapping_landed(client):
     err = ei.value
     assert err.mapped_after_failure is True
     msg = str(err)
-    assert "a re-read of the import shows the created fields ARE mapped" in msg
-    assert "Nothing to re-send" in msg and "do NOT delete these fields" in msg
-    assert "clay audiences fields delete" not in msg
+    assert ("after it was sent, but the mapping is present (the server applied it or someone else mapped the fields) "
+            "— nothing to re-send, do NOT delete (a re-read of the import shows the created fields ARE mapped)") in msg
+    assert "Verify the mapping in Audiences > Settings" in msg
+    assert "NOT mapped" not in msg and "outcome is UNKNOWN" not in msg   # the state follows the re-read, not the exception type
+    assert "clay audiences fields delete" not in msg and "Re-send" not in msg
+
+
+def test_rejected_patch_whose_mapping_is_nevertheless_present_is_not_called_unmapped(client):
+    """An HTTPError, but the re-read shows every created id mapped (the server applied the REPLACE
+    before answering with an error, or someone else mapped the fields meanwhile): the message used
+    to assert "NOT mapped" from the exception type and contradict itself in the same sentence."""
+    reads = []
+
+    def imports(call):
+        reads.append(1)
+        imp = _import()
+        if len(reads) > 2:  # third read = after the failed PATCH
+            imp["fieldMapping"]["fieldMappings"].append(
+                {"type": "SALESFORCE", "audienceFieldId": "audf_new0", "salesforceFieldId": "Website", "mappingRule": "NEVER_WRITE"})
+        return {"audienceImports": [imp]}
+    c = client(_sf_routes(imports=imports, patch=_boom_http))
+    with pytest.raises(cc.AudienceFieldsOrphanedError) as ei:
+        c.add_salesforce_import_fields("audimp_1", [{"salesforceFieldId": "Website"}])
+    err = ei.value
+    assert err.mapped_after_failure is True and isinstance(err.__cause__, requests.HTTPError)
+    msg = str(err)
+    assert (": the request was rejected but the mapping is present (the server applied it or someone else mapped the fields) "
+            "— nothing to re-send, do NOT delete (a re-read of the import shows the created fields ARE mapped).") in msg
+    assert "NOT mapped" not in msg and "Clay rejected the request, so" not in msg
+    assert "Verify the mapping in Audiences > Settings" in msg
+    assert "clay audiences fields delete" not in msg and "Re-send" not in msg
 
 
 def test_patch_failure_when_the_reread_itself_fails(client):
@@ -671,7 +734,8 @@ def test_patch_failure_when_the_reread_itself_fails(client):
     err = ei.value
     assert err.mapped_after_failure is None and isinstance(err.__cause__, requests.HTTPError)
     msg = str(err)
-    assert "the import could not be re-read to confirm" in msg
+    assert "Clay rejected the request, but the outcome is unknown (the import could not be re-read to confirm)" in msg
+    assert "NOT mapped" not in msg   # nothing was confirmed either way
     assert "Re-send the mapping (idempotent" in msg
     assert "Do not delete the fields unless list_audience_imports() confirms they are unmapped" in msg
     assert "If you would rather not map them" not in msg  # deletion is recommended only when confirmed unmapped

@@ -9,10 +9,15 @@ Control channel: a UNIX socket at <runtime dir>/server.sock when that path fits 
 platform's AF_UNIX limit (103 bytes on macOS/BSD, 107 on Linux); otherwise -- and always
 on Windows -- a loopback TCP socket whose port is written to server.port (launch prints a
 NOTE when a long CLAY_BROWSER_DIR forces that fallback). Every command carries the
-per-daemon secret from server.token (created 0600 before the endpoint is advertised);
-anything else is answered "unauthorized", so another local process that can reach
-127.0.0.1:<port> cannot drive the logged-in browser, and pre-auth reads are bounded (5 s
-idle, 1 MiB line) so it can stall the daemon for at most 5 s per connection. The runtime
+per-daemon secret from server.token (created 0600 before the endpoint is advertised): a
+JSON object without a valid token is answered "unauthorized" (before the command name is
+even looked at), and input that is not JSON, has no newline before the connection's
+deadline or exceeds 1 MiB gets a short generic error from the accept loop ("Expecting
+value…" / "timed out" / "command too long") and the connection is closed. So another local
+process that can reach 127.0.0.1:<port> cannot drive the logged-in browser, and because
+every connection has a 5 s deadline from accept (a per-recv idle timeout would let a
+dribbling peer hold the loop until the 1 MiB cap) it can stall the daemon for at most 5 s
+per connection. The runtime
 dir is /tmp/clay-browser (POSIX) or %TEMP%\\clay-browser (Windows); set CLAY_BROWSER_DIR
 to override it. On Windows os.chmod cannot restrict access: the files are protected only
 by the NTFS ACL of the runtime dir (per-user under %TEMP% by default), so keep
@@ -72,6 +77,16 @@ USE_UNIX_SOCKET = not IS_WINDOWS and hasattr(socket, "AF_UNIX") and _SOCK_PATH_L
 
 _CONN_TIMEOUT = 5.0            # seconds a connected peer gets to deliver its one-line command
 _MAX_COMMAND_BYTES = 1 << 20   # longest accepted command line (eval JS / fill text are far smaller)
+
+
+def _send_line(conn: socket.socket, reply: dict) -> None:
+    """Send one JSON reply line with a fresh _CONN_TIMEOUT budget for the whole send (since Python
+    3.5 a socket timeout bounds sendall() as a total, not per chunk). A fresh budget rather than
+    what is left of the connection deadline, so a slow authenticated command (goto waits up to
+    30 s) still delivers its reply; a peer that never reads a large reply is cut off after
+    _CONN_TIMEOUT, and a pre-auth reply is a few dozen bytes that never block."""
+    conn.settimeout(_CONN_TIMEOUT)
+    conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
 
 
 def _control_endpoint_exists() -> bool:
@@ -388,8 +403,13 @@ class ClayBrowserServer:
     def _serve_forever(self):
         """Accept commands on the control channel (UNIX socket, or loopback TCP when AF_UNIX is
         unavailable / the path is too long). Each connection delivers one JSON line that must carry
-        the control token (see _handle); the reads are bounded so an unauthenticated peer can hold
-        the loop for at most _CONN_TIMEOUT. 0.5s timeout between accepts to let Playwright event
+        the control token (see _handle). Every connection gets a DEADLINE of _CONN_TIMEOUT from
+        accept: each recv() is given only the time left until it, so a peer that connects and
+        hangs, or dribbles bytes without ever sending a newline, holds this single-threaded loop
+        for at most _CONN_TIMEOUT (a per-recv idle timeout would let the dribbler hold it until the
+        _MAX_COMMAND_BYTES cap). The reply gets its own _CONN_TIMEOUT budget (_send_line). A line
+        that is not JSON, arrives after the deadline or exceeds the cap gets a short generic error
+        and the connection is closed. 0.5s timeout between accepts to let Playwright event
         handlers fire."""
         try:
             sock, endpoint = _bind_control_socket()
@@ -422,11 +442,18 @@ class ClayBrowserServer:
             try:
                 # accept() hands back a *blocking* socket (socket.py forces it when the listener has a
                 # timeout), so an idle or dribbling peer would otherwise stall this single-threaded
-                # loop for good; with the timeout a pre-auth stall is bounded to _CONN_TIMEOUT per
-                # connection (a flood of idle peers still serialises behind it — see the client)
-                conn.settimeout(_CONN_TIMEOUT)
+                # loop for good. The bound is a per-connection DEADLINE, not a per-recv idle timeout:
+                # every recv() gets only the time left until it, so a peer sending one byte every few
+                # seconds is cut off at _CONN_TIMEOUT too instead of holding the loop until the
+                # _MAX_COMMAND_BYTES cap (a flood of idle peers still serialises behind it — see the
+                # client)
+                deadline = time.monotonic() + _CONN_TIMEOUT
                 data = b""
                 while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("timed out")
+                    conn.settimeout(remaining)
                     chunk = conn.recv(4096)
                     if not chunk:
                         break
@@ -442,10 +469,10 @@ class ClayBrowserServer:
 
                 cmd = json.loads(line)
                 result = self._handle(cmd)
-                conn.sendall((json.dumps(result) + "\n").encode("utf-8"))
+                _send_line(conn, result)
             except Exception as e:
                 try:
-                    conn.sendall((json.dumps({"ok": False, "error": str(e)}) + "\n").encode("utf-8"))
+                    _send_line(conn, {"ok": False, "error": str(e)})
                 except Exception:
                     pass
             finally:
@@ -455,10 +482,13 @@ class ClayBrowserServer:
                 self._shutdown()
 
     def _handle(self, cmd: dict) -> dict:
-        """Dispatch to _cmd_* methods. Every command must carry the daemon's control token; anything
-        else — from a process that can reach the loopback port but not read server.token — gets one
-        generic refusal, before command names are even looked at. A payload that is not a JSON object
-        gets the same reply (no interpreter error text leaks pre-auth)."""
+        """Dispatch to _cmd_* methods. Every command must carry the daemon's control token; a JSON
+        object without a valid one — from a process that can reach the loopback port but not read
+        server.token — gets one generic refusal, before command names are even looked at, and so
+        does valid JSON that is not an object. Input that is not JSON at all, arrives without a
+        newline before the connection deadline or exceeds the line cap never reaches this method:
+        the accept loop answers it with a short generic error ("Expecting value…" / "timed out" /
+        "command too long") and closes the connection."""
         if not isinstance(cmd, dict) or not self._token_ok(cmd.get("token")):
             return {"ok": False, "error": "unauthorized: control token missing or wrong (client reads server.token)"}
         name = cmd.get("cmd", "")

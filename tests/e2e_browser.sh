@@ -51,10 +51,12 @@ cd "$REPO"   # the cookie loader walks up from the current directory
 cb() { $PY "$CB" "$@"; }
 pass=0; fail=0
 check() { if eval "$2"; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1"; fail=$((fail+1)); fi; }
-# one raw line to the control endpoint, bypassing the client: no token unless the line carries one
-raw() { $PY - "$RUNDIR" "$1" <<'EOF'
+# one raw line to the control endpoint, bypassing the client: no token unless the line carries one.
+# The line travels on STDIN, never in argv: `ps` shows every process's arguments to the other local
+# users, and two of these lines carry the real token.
+RAW_PY=$(cat <<'EOF'
 import os, socket, sys
-rundir, line = sys.argv[1], sys.argv[2]
+rundir, line = sys.argv[1], sys.stdin.readline().rstrip("\n")
 sock_path = os.path.join(rundir, "server.sock")
 if os.path.exists(sock_path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sock_path)
@@ -69,7 +71,8 @@ while b"\n" not in data:
     data += c
 print(data.decode().strip())
 EOF
-}
+)
+raw() { printf '%s\n' "$1" | $PY -c "$RAW_PY" "$RUNDIR"; }
 
 echo "== mode: $MODE  (dir $RUNDIR, $(printf %s "$RUNDIR/server.sock" | wc -c | tr -d ' ') bytes for server.sock)"
 $PY -c "import sys; sys.path.insert(0, '$(dirname "$CB")'); import clay_browser as b; print('  USE_UNIX_SOCKET =', b.USE_UNIX_SOCKET)"

@@ -28,7 +28,9 @@ from clay_client import ClayClient  # noqa: E402
 
 def client(workspace: str | int) -> ClayClient:
     """ClayClient bound to `workspace`; the constructor's login line (it prints your e-mail)
-    is swallowed so the script output can be shared as-is."""
+    is swallowed so the login e-mail never reaches the output. The rest of the output is still
+    not for sharing as-is: paste only the PASS/FAIL classifications, never raw counts or ids
+    (module docstring)."""
     with contextlib.redirect_stdout(io.StringIO()):
         return ClayClient(workspace_id=int(workspace))
 

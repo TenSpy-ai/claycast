@@ -292,6 +292,38 @@ def test_unix_bind_failure_names_the_dir_not_the_length(short_dir):
     assert "at most" not in msg   # the path fits by construction here; a length remedy would be wrong
 
 
+class _Unbindable(socket.socket):
+    """socket.socket whose bind() fails the way a busy loopback does."""
+
+    def bind(self, address):
+        raise OSError(48, "Address already in use")
+
+
+@posix_only("the AF_UNIX clause only exists on platforms that have AF_UNIX")
+def test_tcp_bind_failure_under_a_long_dir_names_the_skipped_unix_socket_and_the_byte_budget(long_dir, monkeypatch):
+    b = _load(long_dir)
+    assert not b.USE_UNIX_SOCKET
+    monkeypatch.setattr(b.socket, "socket", _Unbindable)
+    with pytest.raises(OSError) as ei:
+        b._bind_control_socket()
+    msg = str(ei.value)
+    assert "cannot bind a loopback TCP control socket" in msg and "Address already in use" in msg
+    assert "AF_UNIX was skipped" in msg and str(LIMIT - len("/server.sock")) in msg and "Free 127.0.0.1" in msg
+    assert not os.path.exists(b.PORT_PATH)   # nothing was advertised
+
+
+def test_tcp_bind_failure_on_a_short_dir_has_no_af_unix_clause(short_dir, monkeypatch):
+    b = _load(short_dir)
+    monkeypatch.setattr(b, "USE_UNIX_SOCKET", False)   # the Windows layout: TCP although the path fits
+    monkeypatch.setattr(b.socket, "socket", _Unbindable)
+    with pytest.raises(OSError) as ei:
+        b._bind_control_socket()
+    msg = str(ei.value)
+    assert msg.startswith("cannot bind a loopback TCP control socket: ") and "Address already in use" in msg
+    assert msg.endswith("Free 127.0.0.1 and launch again.")
+    assert "AF_UNIX was skipped" not in msg and "at most" not in msg   # a length remedy would be wrong here
+
+
 @pytest.mark.parametrize("content", ["", "abc", "12 34", "99999", "-5"])
 def test_malformed_port_file_is_oserror_not_valueerror(long_dir, content):
     b = _load(long_dir)
@@ -420,28 +452,51 @@ def _run_loop(b, monkeypatch):
     t = threading.Thread(target=s._serve_forever, daemon=True)
     t.start()
     for _ in range(100):
+        # server.sock / server.port appear at bind(), a moment before listen(): wait for a connect to
+        # succeed, or the first test connection can be refused. Then send an empty line — the server
+        # drops it without a reply and closes — and wait for that EOF: listen(1) on macOS AF_UNIX
+        # refuses a second connection while this one is still queued unaccepted (measured), so the
+        # test's first connection must not race the probe
         if b._control_endpoint_exists():
+            try:
+                probe = b._connect_control_socket()
+            except OSError:
+                time.sleep(0.05)
+                continue
+            probe.settimeout(5)
+            probe.sendall(b"\n")
+            assert probe.recv(1) == b"", "the server should drop an empty line and close"
+            probe.close()
             break
         time.sleep(0.05)
     return s, t
 
 
 def _raw(b, line, wait_reply=True):
+    """One raw line to the control endpoint, bypassing the client: the parsed reply, or None when
+    the server closed the connection without one. A reset counts as "no reply": when the server
+    closes with unread bytes in its receive buffer (a capped or multi-line payload) TCP answers
+    the peer with RST, which on a loaded host can arrive before — and discard — the reply."""
     sock = b._connect_control_socket()
     sock.settimeout(10)
     try:
         sock.sendall(line)
-    except (BrokenPipeError, ConnectionResetError):
-        pass  # server capped the line and closed while we were still sending (UNIX sockets EPIPE at once)
+    except OSError:
+        # the server capped the line and closed while we were still sending: EPIPE / ECONNRESET, or
+        # ENOTCONN (errno 57) when macOS tears an AF_UNIX peer down under a blocked sendall
+        pass
     data = b""
     if wait_reply:
-        while b"\n" not in data:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
+        try:
+            while b"\n" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except (BrokenPipeError, ConnectionResetError):
+            data = b""   # the reset discarded whatever the server had queued
     sock.close()
-    return json.loads(data) if data else None
+    return json.loads(data) if b"\n" in data else None
 
 
 @posix_only("binds real control sockets")
@@ -458,10 +513,14 @@ def test_serve_loop_rejects_unauthenticated_and_survives_abuse(mode, short_dir, 
     assert _raw(b, json.dumps({"cmd": "requests", "args": {}, "token": "f" * 64}).encode() + b"\n")["error"] == UNAUTH["error"]
     assert _raw(b, b"[1,2]\n")["error"] == UNAUTH["error"]
     assert _raw(b, b"5\n")["error"] == UNAUTH["error"]
-    # 2. garbage and HTTP request lines (a web page hitting the port) do not crash the loop
-    assert _raw(b, b"POST / HTTP/1.1\r\nHost: x\r\n\r\n")["ok"] is False
-    # 3. oversized line without newline -> capped, generic error
-    assert _raw(b, b"x" * 10000)["error"] == "command too long"
+    # 2. garbage and HTTP request lines (a web page hitting the port) do not crash the loop — the
+    #    bytes after the first newline stay unread, so the close may reach the peer as a reset
+    #    (see _raw): either a reply or a reset, and step 5 proves the loop is still serving
+    r = _raw(b, b"POST / HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert r is None or r["ok"] is False, r
+    # 3. oversized line without newline -> capped, generic error (or a reset, same reason)
+    r = _raw(b, b"x" * 10000)
+    assert r is None or r["error"] == "command too long", r
     # 4. connect-and-hang peer -> recv times out, loop continues
     hang = b._connect_control_socket()
     time.sleep(0.8)
@@ -476,6 +535,79 @@ def test_serve_loop_rejects_unauthenticated_and_survives_abuse(mode, short_dir, 
     assert s._shutdown_requested is True
     assert not any(os.path.exists(p) for p in b.RUNTIME_FILES)
     assert b.ClayBrowserClient().send("requests")["error"].startswith("Daemon not running")  # pid file gone
+
+
+@posix_only("binds real control sockets")
+@pytest.mark.parametrize("mode", ["unix", "tcp"])
+def test_dribbling_peer_is_cut_off_at_the_deadline(mode, short_dir, long_dir, monkeypatch):
+    """The bound is a per-connection deadline, not a per-recv idle timeout: a peer sending one byte
+    every 0.15 s and never a newline kept every recv() inside the old 5 s idle timeout and held the
+    single-threaded loop until the 1 MiB cap; now it is cut off _CONN_TIMEOUT after accept and the
+    client queued behind it is served."""
+    b = _load(short_dir if mode == "unix" else long_dir)
+    monkeypatch.setattr(b, "_CONN_TIMEOUT", 0.5)
+    s, t = _run_loop(b, monkeypatch)
+    with open(b.PID_PATH, "w") as f:
+        f.write(str(os.getpid()))
+    res = {}
+    t0 = time.monotonic()
+
+    def dribble():
+        peer = b._connect_control_socket()
+        peer.settimeout(0.05)
+        outcome = None
+        while time.monotonic() - t0 < 4.0:   # far past the 0.5 s deadline; the old code let it run to here
+            try:
+                peer.sendall(b"x")
+                chunk = peer.recv(65536)
+            except socket.timeout:
+                time.sleep(0.1)               # one byte every ~0.15 s
+                continue
+            except OSError:
+                outcome = "closed"            # reset while sending or reading
+                break
+            outcome = "closed" if not chunk else chunk
+            break
+        res["outcome"], res["cut_at"] = outcome, time.monotonic() - t0
+        peer.close()
+
+    th = threading.Thread(target=dribble, daemon=True)
+    th.start()
+    time.sleep(0.2)                           # the dribbler has been accepted and is in the read loop
+    t1 = time.monotonic()
+    r = b.ClayBrowserClient().send("requests")   # queues behind the dribbler
+    served_after = time.monotonic() - t1
+    th.join(6)
+    assert r["ok"] is True and r["count"] == 0
+    assert served_after < 1.5, served_after   # ~0.3 s: the deadline, not the dribbler's 4 s
+    assert res["cut_at"] < 2.0, res           # cut off at the deadline, not at the 1 MiB cap
+    assert res["outcome"] == "closed" or b"timed out" in res["outcome"], res
+    assert b.ClayBrowserClient().send("close")["ok"] is True
+
+
+@posix_only("binds real control sockets")
+@pytest.mark.parametrize("mode", ["unix", "tcp"])
+def test_peer_that_never_reads_its_reply_is_cut_off(mode, short_dir, long_dir, monkeypatch):
+    """The reply is bounded too (_send_line): an authenticated peer that asks for a reply larger
+    than the socket buffers and never reads it holds the loop for at most _CONN_TIMEOUT."""
+    b = _load(short_dir if mode == "unix" else long_dir)
+    monkeypatch.setattr(b, "_CONN_TIMEOUT", 0.5)
+    s, t = _run_loop(b, monkeypatch)
+    with open(b.PID_PATH, "w") as f:
+        f.write(str(os.getpid()))
+    with open(b.REQUESTS_PATH, "w") as f:   # a 16 MiB capture: no loopback buffer holds the `requests` reply
+        for _ in range(256):
+            f.write(json.dumps({"url": "https://api.clay.com/v3/x", "resp_body": "y" * 65536}) + "\n")
+    lazy = b._connect_control_socket()
+    lazy.sendall(json.dumps({"cmd": "requests", "args": {}, "token": b._read_token()}).encode() + b"\n")
+    time.sleep(0.2)                           # ... and never reads the reply
+    t1 = time.monotonic()
+    r = b.ClayBrowserClient().send("requests", last=1)
+    served_after = time.monotonic() - t1
+    lazy.close()
+    assert r["ok"] is True and r["count"] == 1
+    assert served_after < 2.0, served_after   # ~1 s: the reply budget plus the error reply's, not forever
+    assert b.ClayBrowserClient().send("close")["ok"] is True
 
 
 def test_client_reports_alive_daemon_with_missing_token(short_dir):
@@ -498,13 +630,18 @@ def test_client_reports_alive_daemon_whose_endpoint_refuses(mode, short_dir, lon
     if mode == "unix":
         open(b.SOCK_PATH, "w").close()   # a path with no listener behind it
     else:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("127.0.0.1", 0))
-        free_port = probe.getsockname()[1]
-        probe.close()   # nothing listens there now
+        # bound but never listen()ed: the kernel refuses every connect to it while it is open, and
+        # holding it open keeps another process from taking the port (bind, close and hope the
+        # port stays free was a race on a busy host)
+        unlistened = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        unlistened.bind(("127.0.0.1", 0))
         with open(b.PORT_PATH, "w") as f:
-            f.write(str(free_port))
-    r = b.ClayBrowserClient().send("eval", js="1")
+            f.write(str(unlistened.getsockname()[1]))
+    try:
+        r = b.ClayBrowserClient().send("eval", js="1")
+    finally:
+        if mode == "tcp":
+            unlistened.close()
     assert r["ok"] is False
     assert r["error"].startswith(f"Daemon alive (PID {os.getpid()}) but ") and "is not accepting connections" in r["error"]
     assert "kill the PID and launch again" in r["error"] and "Daemon not running" not in r["error"]

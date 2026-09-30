@@ -853,9 +853,11 @@ def format_json_body(mapping: dict) -> str:
 #      Contain/NotContain, True/False, Empty/NotEmpty, WithinLast/NotWithinLast,
 #      WithinNext/NotWithinNext). af_exclusion_pair() enforces that and decides blank cells per
 #      field: a blank counts as "matches none" (not excluded) unless the field has an ("Empty",)
-#      rule, which excludes it. Negative text/date operators DO match blank cells, so on the
-#      excluded side they are pinned under And(NotEmpty, ...); boolean rules are exact without a
-#      pin because a blank boolean IS False; a ("NotEmpty",) rule makes the included side
+#      rule, which excludes it. NotEqual and NotContain (verified live 2026-09-29) and False match
+#      blank cells; NotWithinLast/NotWithinNext are assumed to (unmeasured — the probed date field
+#      had no blanks) and are pinned the same way, so on the excluded side the text/date negatives
+#      are pinned under And(NotEmpty, ...); boolean rules are exact without a pin because a blank
+#      boolean IS False; a ("NotEmpty",) rule makes the included side
 #      And(Empty). The partition rests on four assumptions, verified live 2026-09-29 (one
 #      production workspace, ACCOUNT entity, read-only counts):
 #        A1 Empty and NotEmpty are exact complements (Empty + NotEmpty = total); Equal "" matches
@@ -973,7 +975,9 @@ def af_field(entity_type: str, field_id: str, operator: str, value: Any = None, 
     unit = _af_time_unit(operator, time_unit, where="af_field")
     node = {"type": "BinOp", "key": field_id, "dataPath": [AUDIENCE_ENTITY_PATHS[et], "field", field_id], "operator": operator, "entityType": et}
     if value is not None:
-        node["value"] = value
+        # a list (ContainAny) is copied, so editing the node never leaks into the caller's rule
+        # table; a tuple/set becomes the JSON-able list Clay expects
+        node["value"] = list(value) if isinstance(value, (list, tuple, set, frozenset)) else value
     if unit is not None:
         node["timeUnit"] = unit
     return node
@@ -1083,18 +1087,23 @@ def af_rule(rule: Any) -> tuple[str, Any, str | None]:
 
 def _af_rules(field_id: Any, rules: Any) -> list[tuple[str, Any, str | None]]:
     """One field's rules through af_rule(): validated, identical rules collapsed (first occurrence
-    kept), never empty; every error names the field."""
+    kept; identical means the same operator, value TYPE, value and unit — 1 == True == 1.0 in
+    Python, but ("Equal", 1), ("Equal", True) and ("Equal", 1.0) are three rules), never empty;
+    every error names the field."""
     if not isinstance(field_id, str) or not field_id:
         raise ValueError(f"field id must be a non-empty string, got {field_id!r}")
     if isinstance(rules, (str, bytes, dict)) or not hasattr(rules, "__iter__"):
         raise ValueError(f"field {field_id!r}: rules must be a list of rules, got {rules!r}")
     norm: list[tuple[str, Any, str | None]] = []
+    seen: list[tuple] = []   # (op, value type name, value, unit) — a list, not a set: values may be lists
     for rule in rules:
         try:
             parts = af_rule(rule)
         except ValueError as e:
             raise ValueError(f"field {field_id!r}: {e}") from None
-        if parts not in norm:
+        key = (parts[0], type(parts[1]).__name__, parts[1], parts[2])
+        if key not in seen:
+            seen.append(key)
             norm.append(parts)
     if not norm:
         raise ValueError(f"field {field_id!r} has no rules; drop the field from the table instead")
@@ -1117,8 +1126,9 @@ def _af_any_of(et: str, field_id: str, norm: list[tuple[str, Any, str | None]]) 
     if ops & _AF_BOOLEAN_OPERATORS and AUDIENCE_BOOLEAN_BLANK_IS_FALSE:
         return group  # a blank boolean IS False: the bare rules already decide blank cells exactly
     if "Empty" not in ops and ops & AUDIENCE_BLANK_UNKNOWN_OPERATORS:
-        # NotEqual/NotContain/... match blank cells (verified live 2026-09-29): without this pin a
-        # blank record would be excluded here AND included by the Empty guard of _af_none_of().
+        # NotEqual/NotContain match blank cells (verified live 2026-09-29; NotWithinLast/NotWithinNext
+        # are assumed to): without this pin a blank record would be excluded here AND included by the
+        # Empty guard of _af_none_of().
         return af_and(af_field(et, field_id, "NotEmpty"), group)
     return group
 
@@ -1139,8 +1149,10 @@ def af_any_of(entity_type: str, field_id: str, rules: list) -> dict:
     """Or of one BinOp per rule — the 'excluded' side of a pair for one field. A rule is (op,),
     (op, value), (op, value, time_unit) or a dict (see af_rule(); identical rules collapse, an
     empty list raises). Any operator is passed through (ContainAny, like af_owner_in). Blank cells:
-    NotEqual/NotContain/False/NotWithinLast/NotWithinNext match them (verified live 2026-09-29),
-    so a field with one of those and no ("Empty",) rule is pinned — And(NotEmpty, Or(rules)), one
+    NotEqual and NotContain (verified live 2026-09-29) and False match blank cells;
+    NotWithinLast/NotWithinNext are assumed to (unmeasured — the probed date field had no blanks)
+    and are pinned the same way, so a field with one of those and no ("Empty",) rule is pinned —
+    And(NotEmpty, Or(rules)), one
     extra UI row — and a blank is never excluded; that pin is what keeps the pair exact, not
     insurance. Exception: True/False rules are emitted bare, because a blank boolean IS False and
     a NotEmpty pin would make ("False",) match nothing (AUDIENCE_BOOLEAN_BLANK_IS_FALSE)."""
@@ -1350,8 +1362,10 @@ def _salesforce_import_sync_flags(
     because the PATCH replaces the settings and a guessed value would switch a sync on or off.
     Problems are attributed to their source: "importMetadata is missing …" / "has sync
     setting(s) of an unexpected type" versus "sync_flags[k] must be True or False, got …".
-    isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None is refused only when an
-    override introduced that combination; the import's own state passes through. Verified live
+    isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None is refused unless
+    importMetadata itself already holds exactly that (the key PRESENT with null): an absent key is
+    not a null, so supplying None for a missing key does not get past the check either — for an
+    enabled import the remedy names <the import's id-mapping dict> instead. Verified live
     2026-09-29: an ACCOUNT import carried all five keys; a CONTACT import had no
     isTaskSyncEnabled (the UI's replay sent False) — the operator supplies it via sync_flags."""
     overrides = _check_salesforce_sync_overrides(overrides, where=where)
@@ -1381,8 +1395,13 @@ def _salesforce_import_sync_flags(
             problems.append(f"is missing sync setting(s) {', '.join(missing)}")
         if wrong:
             problems.append(f"has sync setting(s) of an unexpected type: {', '.join(wrong)}")
+        # None is a sensible createNewRecordsIdMapping example only while create-new-records is off;
+        # with it on, None would just trip the refusal below, so the example names the real remedy
+        id_mapping_example = (
+            "<the import's id-mapping dict>" if flags.get("isCreateNewRecordsEnabled") is True else "None"
+        )
         example = ", ".join(
-            f'"{k}": {"None" if k == "createNewRecordsIdMapping" else "False"}'
+            f'"{k}": {id_mapping_example if k == "createNewRecordsIdMapping" else "False"}'
             for k in _SF_IMPORT_SYNC_KEYS if k in missing or k in wrong_keys
         )
         raise ValueError(
@@ -1393,11 +1412,16 @@ def _salesforce_import_sync_flags(
             f"(isTaskSyncEnabled was absent from a live CONTACT import's importMetadata on 2026-09-29 while "
             f"the ACCOUNT import had all five; the UI's replay sent False.)"
         )
-    if (
-        flags["isCreateNewRecordsEnabled"] is True
-        and flags["createNewRecordsIdMapping"] is None
-        and not (meta.get("isCreateNewRecordsEnabled") is True and meta.get("createNewRecordsIdMapping") is None)
-    ):
+    # "create new records on, no id mapping" passes only when the import itself already holds exactly
+    # that — isCreateNewRecordsEnabled True and a createNewRecordsIdMapping KEY holding null. An absent
+    # key is not a null: sync_flags={"createNewRecordsIdMapping": None} for a missing key is refused
+    # like any other override that lands on this combination
+    import_already_has_it = (
+        meta.get("isCreateNewRecordsEnabled") is True
+        and "createNewRecordsIdMapping" in meta
+        and meta["createNewRecordsIdMapping"] is None
+    )
+    if flags["isCreateNewRecordsEnabled"] is True and flags["createNewRecordsIdMapping"] is None and not import_already_has_it:
         raise ValueError(
             f"{where}: sync_flags would set isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None "
             f"on import {import_id!r} (create-new-records enabled without an id mapping); pass both settings, "
@@ -3265,8 +3289,8 @@ class ClayClient:
         Which endpoint is paged (/audiences/accounts or /audiences/contacts) comes from the
         fetched segment's own `entityType` (one GET first, no credits). `entity_type` is
         optional; an explicit value that disagrees with the segment raises ValueError after that
-        GET, before any row is fetched or a file written. Before 2026-09-29 it defaulted to
-        CONTACT, so an ACCOUNT segment exported without it silently paged the contacts endpoint.
+        GET, before any row is fetched or a file written. Before this fix (the PR head) it defaulted
+        to CONTACT, so an ACCOUNT segment exported without it silently paged the contacts endpoint.
         """
         if entity_type is not None:
             entity_type = str(entity_type).upper()
@@ -3388,8 +3412,8 @@ class ClayClient:
         returned the size of the whole entity. Now delegates to count_audience_records(), which
         fetches the saved `filterAst` and sends both. `entity_type` is optional and defaults to
         the segment's own entityType (an explicit value that disagrees raises ValueError); before
-        2026-09-29 it defaulted to CONTACT, so an ACCOUNT segment counted without it was sent as
-        CONTACT — a default that predates the segment fix.
+        this fix (the PR head) it defaulted to CONTACT, so an ACCOUNT segment counted without it
+        was sent as CONTACT.
         """
         return self.count_audience_records(entity_type, segment_id=segment_id, workspace_id=workspace_id)
 
@@ -3724,8 +3748,10 @@ class ClayClient:
            five settings from step 2. If it raises, AudienceFieldsOrphanedError carries the
            exact `mapping` to re-send (idempotent: the PATCH is a full REPLACE) plus
            `mapped_after_failure` from a best-effort re-read. A requests.HTTPError means Clay
-           rejected the request (fields exist, unmapped); anything else (connection reset,
-           non-JSON 2xx) means the outcome is unknown and the message says so.
+           rejected the request; anything else (connection reset, non-JSON 2xx) means it may
+           have been applied. Either way the message states what the re-read found — mapped
+           (nothing to re-send, do not delete), not mapped, or unknown when the re-read failed
+           — rather than inferring the state from the exception type.
 
         The two writes are not atomic and claycast has no delete for Audiences fields (the
         endpoint was never captured): orphans go through the official CLI
@@ -3929,8 +3955,22 @@ class ClayClient:
                 f"{where}: created {len(created)} Audiences field(s) {ids} on import {import_id!r} but the mapping "
                 f"PATCH failed ({type(exc).__name__}: {exc})"
             )
-            if rejected:
-                state = ": Clay rejected the request, so the fields exist and are NOT mapped"
+            # The state clause follows the post-failure re-read, not the exception type: a rejected
+            # PATCH whose mapping is nevertheless present (the server applied it, or someone else
+            # mapped the fields meanwhile) must not be described as "NOT mapped"
+            if mapped_after is True:
+                state = (
+                    (": the request was rejected but" if rejected else " after it was sent, but")
+                    + " the mapping is present (the server applied it or someone else mapped the fields) — "
+                    "nothing to re-send, do NOT delete"
+                )
+            elif mapped_after is False:
+                state = (
+                    ": Clay rejected the request, so the fields exist and are NOT mapped" if rejected
+                    else " after it was sent, and the fields exist and are NOT mapped"
+                )
+            elif rejected:
+                state = ": Clay rejected the request, but the outcome is unknown"
             else:
                 state = " after it was sent, so its outcome is UNKNOWN — the server may have applied the REPLACE"
             reread = {
@@ -3939,7 +3979,7 @@ class ClayClient:
                 None: " (the import could not be re-read to confirm)",
             }[mapped_after]
             if mapped_after is True:
-                advice = " Nothing to re-send: verify the mapping in Audiences > Settings and do NOT delete these fields."
+                advice = " Verify the mapping in Audiences > Settings."
             elif rejected and mapped_after is False:
                 advice = f" {resend} If you would rather not map them, delete the orphans {delete_text}"
             else:

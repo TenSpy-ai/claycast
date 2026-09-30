@@ -6,7 +6,7 @@ what the segment editor calls while you type; no credits, no writes). DRY RUN by
 every AST it would send. --live sends them (needs CLAY_SESSION resolvable: run from the claycast
 repo root, or pass clay_session=...).
 
-  python3 live_probe.py --entity ACCOUNT --text-field audf_xxx --bool-field audf_yyy \
+  python tests/live/blank_semantics_probe.py --entity ACCOUNT --text-field audf_xxx --bool-field audf_yyy \
       [--date-field audf_zzz] [--value "Retail"] --workspace <id> [--live]
 
 Read-only: only POST /audiences/count is called. --workspace is the id to probe (the
@@ -26,7 +26,7 @@ ap.add_argument("--date-field")
 ap.add_argument("--value", help="a REAL value of --text-field (from fields list-values) for the A2/A3 checks")
 ap.add_argument("--scripts-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
 ap.add_argument("--live", action="store_true")
-ap.add_argument("--workspace", help="workspace id to probe (default: the cookie's first workspace — usually NOT what you want)")
+ap.add_argument("--workspace", required=True, help="workspace id to probe (the cookie's first workspace is ClayClient's default and is usually NOT what you want)")
 args = ap.parse_args()
 
 sys.path.insert(0, args.scripts_dir)
@@ -74,16 +74,19 @@ if V is not None:
         "CASE_NEQ_UPPER":  F("NotEqual", V.upper()),                 # T-shape check: NotEqual folds the same way as Equal
     })
 if d:
+    # af_field refuses a timeUnit outside day/week/month and a time node without one (the very
+    # nodes the last two probes send to Clay), so both are raw dict copies of a valid node
+    base = D("WithinLast", 30, time_unit="day")
     probes.update({
         "ED":           D("Empty"),
         "NED":          D("NotEmpty"),
         "NWL":          D("NotWithinLast", 30, time_unit="day"),   # == NED sql / == T loose
         "PIN_NWL":      af_and(D("NotEmpty"), D("NotWithinLast", 30, time_unit="day")),
-        "WL_DAY":       D("WithinLast", 30, time_unit="day"),
+        "WL_DAY":       base,
         "WL_WEEK":      D("WithinLast", 4, time_unit="week"),
         "WL_MONTH":     D("WithinLast", 1, time_unit="month"),
-        "WL_YEAR":      D("WithinLast", 1, time_unit="year"),      # expect HTTPError (enum has no year)
-        "WL_NOUNIT":    {k: v for k, v in D("WithinLast", 30).items()},  # no timeUnit: 400? or silent default? (F6)
+        "WL_YEAR":      dict(base, value=1, timeUnit="year"),                  # expect HTTPError (enum has no year)
+        "WL_NOUNIT":    {k: v for k, v in base.items() if k != "timeUnit"},    # no timeUnit: 400? or silent default? (F6)
     })
 
 def classify(neg, populated, total):
@@ -98,7 +101,7 @@ if not args.live:
 
 import requests, io, contextlib
 with contextlib.redirect_stdout(io.StringIO()):   # the constructor prints the login email
-    clay = cc.ClayClient(workspace_id=int(args.workspace) if args.workspace else None)
+    clay = cc.ClayClient(workspace_id=int(args.workspace))
 print(json.dumps({"probing_workspace": clay.workspace_id, "entity": ET, "text_field": f, "bool_field": b, "date_field": d}))
 res, err = {}, {}
 for name, ast in probes.items():
