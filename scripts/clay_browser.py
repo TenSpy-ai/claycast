@@ -63,6 +63,21 @@ def _connect_control_socket() -> socket.socket:
     return s
 
 
+def _force_exit_tree() -> None:
+    """Kill this process together with its children (the Playwright driver and the browser).
+    The daemon is spawned as a session/process-group leader (start_new_session on POSIX,
+    CREATE_NEW_PROCESS_GROUP on Windows), so the group/tree is exactly the daemon's own."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(os.getpid())], capture_output=True)
+        else:
+            import signal
+
+            os.killpg(os.getpgid(0), signal.SIGKILL)
+    finally:
+        os._exit(0)
+
+
 def _pid_alive(pid: int) -> bool:
     """True if a process with this PID is running. NOT os.kill(pid, 0) on Windows: CPython maps
     any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so the 'liveness check' would
@@ -427,7 +442,15 @@ class ClayBrowserServer:
 
     def _shutdown(self):
         """Clean shutdown — called after close response is sent. Capture
-        files were already unlinked synchronously in _cmd_close()."""
+        files were already unlinked synchronously in _cmd_close().
+
+        Playwright teardown can hang (seen on Windows after interacting with a modal dialog),
+        which left the daemon, its driver and the browser alive and holding daemon.log open.
+        A watchdog kills the whole process tree if the polite path has not finished within
+        10 seconds — plain os._exit would orphan the driver and browser (observed)."""
+        import threading
+
+        threading.Timer(10.0, _force_exit_tree).start()
         try:
             self.page.close()
         except Exception:
