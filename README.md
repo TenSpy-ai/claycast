@@ -56,9 +56,11 @@ claycast/                      # ~/.claude/skills/claycast/  (or  <project>/.cla
 │   ├── feature-gaps.md        # roadmap: what's missing / what to build next
 │   ├── requirements.txt       # Python dependencies
 │   └── .env.example           # CLAY_SESSION placeholder
-└── scripts/
-    ├── clay_client.py         # the ClayClient SDK (authenticated REST client)
-    └── clay_browser.py        # Playwright daemon for request-capture / discovery
+├── requirements-dev.txt       # pytest, for the offline test suite
+├── scripts/
+│   ├── clay_client.py         # the ClayClient SDK (authenticated REST client)
+│   └── clay_browser.py        # Playwright daemon for request-capture / discovery
+└── tests/                     # offline pytest suite + e2e_browser.sh + tools/check_partition.py
 ```
 
 ## Authentication
@@ -110,6 +112,20 @@ clay.create_formula_column(table["tableId"], name="Domain", formula='...')
 | [`references/action-registry.md`](references/action-registry.md) | Action-column input shapes and integration gotchas. |
 | [`references/cookie-setup.md`](references/cookie-setup.md) | Getting and configuring `CLAY_SESSION`. |
 | [`references/feature-gaps.md`](references/feature-gaps.md) | **Roadmap** — capabilities not yet built, tiered by impact. Start here if you want to contribute a feature. |
+
+## Running the tests
+
+The offline suite under `tests/` needs no Clay cookie, makes no network calls and spends no credits: it drives `ClayClient` through a recording fake session and asserts the exact request each method sends, checks the `af_*` filter builders, and probes `clay_browser.py`'s helpers in subprocesses.
+
+```bash
+pip install -r requirements-dev.txt   # pytest
+python -m pytest tests -q
+```
+
+The tests that bind a UNIX socket, assert the `/tmp` defaults or send POSIX signals skip on Windows. Two more tools live next to the suite and are not run by `pytest`:
+
+- **`tests/e2e_browser.sh [unix|tcp]`** — the macOS-only live harness for `scripts/clay_browser.py` (it uses `stat -f %Lp` and `lsof`). It launches headless Chromium through the daemon, drives it and checks the teardown; `tcp` runs a temp copy with `USE_UNIX_SOCKET` forced off to exercise the Windows control channel on a Mac. Needs Playwright and a `CLAY_SESSION` value that resolves, but not a working cookie — the only page it opens is a local `data:` URL.
+- **`python tests/tools/check_partition.py scripts/clay_client.py`** — the exclusion-pair partition checker: for every rule table in its battery it evaluates both sides of `af_exclusion_pair()` over a small record domain under all 32 blank-value models and reports whether each record lands on exactly one side (`--json` for machine-readable output). Any `af_*` candidate module can be checked the same way.
 
 ## Contributing
 
