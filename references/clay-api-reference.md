@@ -1849,10 +1849,19 @@ those names, because a collision would be ambiguous. (That is inferred, not test
 ### Binding a table column to a saved Claygent
 
 An AI column that uses a saved Claygent is a `use-ai` column with `useCase '"claygent"'` and three
-Claygent-specific inputs. **It also needs its own copy of the prompt and the output schema.** A
+Claygent-specific inputs. **It also needs its own copy of the output schema (and the model).** A
 column created through the API with only the Claygent reference exists, looks right, and then
 fails in the UI with **"Unable to parse the output schema for the column"**. After that, clicking
 Run on the column or on any single cell does nothing.
+
+**The `prompt` input is NOT yours to set** (corrected 2026-09-30, after this section first said it
+was). On every column create and update, Clay rebuilds `prompt` server-side from the bound
+Claygent's current prompt, with each `{{variable}}` replaced by its `claygentFieldMapping`
+expression. Measured on throwaway tables: a create that sent a bogus literal prompt stored the
+Claygent's real prompt; an update that changed only the prompt was discarded; an update that changed
+only `claygentId` replaced the whole prompt with the other Claygent's; an update that changed only a
+mapping expression changed the prompt's slot to match. Sending the rendered prompt (below) is harmless
+and matches what the UI sends.
 
 ```python
 # prompt = the Claygent's userPrompt, with {{score_input}} replaced by the column reference
@@ -1863,9 +1872,10 @@ bindings = {
     "model":     {"formulaText": json.dumps(v["modelSettings"]["model"])},
     "claygentFieldMapping": {"formulaMap": {
         "{{score_input}}": "Clay.formatForAIPrompt({{" + input_fid + "}})"}},   # Claygent var -> column
-    # Both of these are REQUIRED even though the Claygent already has them:
+    # REQUIRED even though the Claygent already has it:
     "answerSchemaType": {"formulaMap": {"type": '"json"', "jsonType": '"JSONSchema"',
                                         "jsonSchema": json.dumps(v["outputFormat"]["jsonSchema"])}},
+    # Optional: Clay replaces it with its own rendering (see above).
     "prompt":    {"formulaText": json.dumps(before) + " + Clay.formatForAIPrompt({{" + input_fid + "}}) + "
                                  + json.dumps(after)},
 }
@@ -1875,13 +1885,14 @@ bindings = {
   carries `temperature`, `reasoningLevel`, `reasoningBudget`, `maxTokens`, `maxCostInCents`,
   `jsonMode`, `systemPrompt`, `tableExamples`, `stopSequence`, `runBudget`, `topP`, `width`,
   `height`, `aspectRatio`, `referenceImageURL`, `contextDocumentIds`, `mcpSettings`, `_metadata`.
-- **The column does not follow the Claygent.** Editing the Claygent later leaves the column's
-  `prompt` and `answerSchemaType` copies stale. It is not known which copy wins at run time, so
-  re-copy both from the Claygent whenever it changes, and read both back.
-- **Clay rewrites the `prompt` formula on save.** It drops the spaces around `+` and drops a trailing
-  `+ ""` when the text after the variable is empty. A byte-for-byte read-back check therefore always
-  fails. Compare meaning instead: split on the single `Clay.formatForAIPrompt({{fid}})` reference,
-  `json.loads` each literal side, and compare those to the Claygent's text.
+- **The schema and model copies do not follow the Claygent.** Editing the Claygent later leaves the
+  column's `answerSchemaType` and `model` stale. Re-copy both whenever the Claygent changes, and read
+  them back. That column write also makes Clay re-render the prompt. Whether the stored prompt follows
+  a Claygent edit with no column write at all is untested, so check it on read-back too.
+- **Clay's rendering of `prompt` differs from a hand-built one.** It drops the spaces around `+` and
+  drops a trailing `+ ""` when the text after the variable is empty. A byte-for-byte read-back check
+  therefore always fails. Compare meaning instead: find each literal piece of the Claygent's prompt
+  (as a JSON string literal) in order, and count one `Clay.formatForAIPrompt(` per variable.
 - **Running:** re-confirmed 2026-09-30 that neither `run_column` nor an API flip of the table's
   `AUTO_RUN_ON` starts a `useCase "claygent"` column. The cells only ran after a click on the column's
   Run button in the UI. Build the column by API, then have a person click Run, and watch the cells
