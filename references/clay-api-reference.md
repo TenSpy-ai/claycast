@@ -1886,7 +1886,7 @@ Required query params and body shapes are listed verbatim from the captured call
 |---|---|---|
 | `POST /v3/workspaces/{ws}/audiences/accounts` | `{limit, offset, includeDeleted, isArchived, shouldInjectDraftFilter, segmentType}` | `{accounts: [...], pagination: {limit, offset, total, hasMore}}` |
 | `POST /v3/workspaces/{ws}/audiences/contacts` | `{limit, offset, includeDeleted, isArchived, shouldInjectDraftFilter, segmentType, includeData: {accountIds: bool}}` — note the extra `includeData` key vs `/accounts` | `{contacts: [...], pagination: {...}}` |
-| `POST /v3/workspaces/{ws}/audiences/count` | `{entityType: "ACCOUNT"\|"CONTACT", isArchived, shouldInjectDraftFilter, segmentType}` | `{count: N}` |
+| `POST /v3/workspaces/{ws}/audiences/count` | see the count row under "Audiences: segments" below — a segment count needs `filters` (the saved `filterAst`) as well as `segmentId`, and claycast takes `entityType` from the fetched segment | `{count: N}` |
 
 ### GETs (with required query params)
 
@@ -2032,7 +2032,7 @@ Companies audience, then replayed through the SDK (workspace 12345). SDK:
 | `PUT /v3/workspaces/{ws}/audiences/segments/{id}` | partial — any of `name`, `description`, `filterAst` | the full segment; `estimatedSize` is recomputed immediately. The UI's Rename sends just `{"name"}`. `PATCH` and `DELETE` on this URL are 404 `NoMatchingURL`. |
 | `POST /v3/workspaces/{ws}/audiences/segments/{id}/delete` | `{}` | `{"success": true, "segmentId"}`. HARD delete: `GET …/segments/{id}` is then 404 `Segment not found` and the segment is gone from the list — no undo. |
 | `GET /v3/workspaces/{ws}/audiences/segments/{id}` | — | the segment object; `filterAst` is the saved filter (the official CLI names the same object `filter`). |
-| `POST /v3/workspaces/{ws}/audiences/count` | `{"entityType", "isArchived": false, "shouldInjectDraftFilter": true, "segmentType": null, "filters": <AST>}` | `{"count"}`. **`segmentId` alone does NOT apply the segment's filter** — the editor keeps the filter client-side and sends it as `filters`; a body with only `segmentId` returns the size of the whole entity (a latent bug in `count_audience_segment`, fixed 2026-09-30 by fetching `filterAst` first). |
+| `POST /v3/workspaces/{ws}/audiences/count` | `{"entityType", "isArchived": false, "shouldInjectDraftFilter": true, "segmentType": null, "filters": <AST>}` | `{"count"}`. **`segmentId` alone does NOT apply the segment's filter** — the editor keeps the filter client-side and sends it as `filters`; a body with only `segmentId` returns the size of the whole entity (a latent bug in `count_audience_segment`, fixed 2026-09-30 by fetching `filterAst` first; it also sent `entityType: "CONTACT"` for ACCOUNT segments unless the caller passed one). Since 2026-09-29 claycast reads `entityType` from the fetched segment for segment counts (`export_audience_segment` does the same before paging `/audiences/{accounts\|contacts}`) and rejects a contradicting explicit value; whole-entity and ad-hoc counts still take `entityType` from the caller. Server precedence when both `segmentId` and `filters` are present (AND, `filters` wins, or `segmentId` ignored) is unverified. |
 | `POST /v3/workspaces/{ws}/audiences/{ACCOUNT\|CONTACT}/signals` | `{"segmentId"}` | signal summaries for the segment (and `"ALL"`). |
 
 ### The filter AST (what the UI writes; the `af_*` helpers produce exactly these shapes)

@@ -8,6 +8,7 @@ import copy
 import json
 import pickle
 import sys
+from pathlib import Path
 
 import pytest
 import requests
@@ -869,14 +870,137 @@ def test_count_rejects_filter_and_segment_together(client):
         client().count_audience_records("ACCOUNT", filter_ast=cc.af_and(), segment_id="s")
 
 
-def test_FINDING_count_segment_ignores_the_segments_own_entity_type(client):
-    """count_audience_segment defaults entity_type to CONTACT and never checks the fetched
-    segment's entityType, so an ACCOUNT segment counted without entity_type is sent as CONTACT
-    with an account-field filter. (Same default existed before the PR.)"""
-    c = client([("GET", SEG + "/audseg_1", {"id": "audseg_1", "entityType": "ACCOUNT", "filterAst": SAVED_AST}),
-                ("POST", COUNT, {"count": 0})])
-    c.count_audience_segment("audseg_1")
+def _segment(entity_type="ACCOUNT", **over):
+    seg = {"id": "audseg_1", "entityType": entity_type, "filterAst": SAVED_AST}
+    seg.update(over)
+    return seg
+
+
+def test_count_segment_uses_the_segments_own_entity_type(client):
+    """count_audience_segment reads entityType from the fetched segment: an ACCOUNT segment
+    counted without entity_type is sent as ACCOUNT with its own filter. (Before 2026-09-29 the
+    default was CONTACT — a default that predates the PR — so the count was of the wrong entity.)"""
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", COUNT, {"count": 214})])
+    assert c.count_audience_segment("audseg_1") == 214
+    body = c.session.calls[-1]["json"]
+    assert body["entityType"] == "ACCOUNT" and body["segmentId"] == "audseg_1" and body["filters"] == SAVED_AST
+
+
+def test_count_records_segment_without_entity_type(client):
+    c = client([("GET", SEG + "/audseg_1", _segment("CONTACT")), ("POST", COUNT, {"count": 3})])
+    assert c.count_audience_records(segment_id="audseg_1") == 3
     assert c.session.calls[-1]["json"]["entityType"] == "CONTACT"
+    assert _methods(c) == ["GET", "POST"]
+
+
+def test_count_segment_explicit_matching_entity_type_still_works(client):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", COUNT, {"count": 214})])
+    assert c.count_audience_records("account", segment_id="audseg_1") == 214
+    assert c.count_audience_segment("audseg_1", entity_type="ACCOUNT") == 214
+    assert [x["json"]["entityType"] for x in c.session.calls if x["method"] == "POST"] == ["ACCOUNT", "ACCOUNT"]
+
+
+def test_count_segment_explicit_mismatch_raises_without_counting(client):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", COUNT, {"count": 214})])
+    with pytest.raises(ValueError, match="count_audience_records: segment 'audseg_1' is ACCOUNT, but entity_type='CONTACT' was passed"):
+        c.count_audience_segment("audseg_1", entity_type="CONTACT")
+    assert _methods(c) == ["GET"]
+
+
+def test_count_segment_unsupported_entity_type_raises(client):
+    c = client([("GET", SEG + "/audseg_1", _segment("CUSTOM")), ("POST", COUNT, {"count": 1})])
+    with pytest.raises(ValueError, match="segment 'audseg_1' has entityType 'CUSTOM'; only ACCOUNT and CONTACT segments can be counted"):
+        c.count_audience_segment("audseg_1")
+    assert _methods(c) == ["GET"]
+
+
+def test_count_segment_lacking_entity_type_needs_an_explicit_one(client):
+    seg = {"id": "audseg_1", "filterAst": SAVED_AST}                      # no entityType key at all
+    c = client([("GET", SEG + "/audseg_1", seg), ("POST", COUNT, {"count": 214})])
+    with pytest.raises(ValueError, match="segment 'audseg_1' has no entityType; pass entity_type="):
+        c.count_audience_segment("audseg_1")
+    assert _methods(c) == ["GET"]
+    assert c.count_audience_segment("audseg_1", entity_type="ACCOUNT") == 214
+    assert c.session.calls[-1]["json"]["entityType"] == "ACCOUNT"
+
+
+def test_count_segment_invalid_explicit_entity_type_is_rejected_before_the_get(client):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", COUNT, {"count": 214})])
+    with pytest.raises(ValueError, match="entity_type must be ACCOUNT or CONTACT"):
+        c.count_audience_records("deal", segment_id="audseg_1")
+    assert c.session.calls == []
+
+
+def test_whole_entity_and_adhoc_counts_still_require_entity_type(client):
+    c = client()
+    with pytest.raises(ValueError, match="entity_type is required unless segment_id is given"):
+        c.count_audience_records()
+    with pytest.raises(ValueError, match="entity_type is required unless segment_id is given"):
+        c.count_audience_records(filter_ast=cc.af_and())
+    with pytest.raises(ValueError, match="not both"):
+        c.count_audience_records("ACCOUNT", filter_ast=cc.af_and(), segment_id="s")
+    with pytest.raises(ValueError, match="not both"):
+        c.count_audience_records(filter_ast=cc.af_and(), segment_id="s")
+    assert c.session.calls == []
+
+
+# ── export (entity type from the segment, like count) ────────────────────────
+
+ACCOUNTS = f"/workspaces/{WS}/audiences/accounts"
+CONTACTS = f"/workspaces/{WS}/audiences/contacts"
+
+
+def _page(key, rows):
+    return {key: rows, "pagination": {"hasMore": False}}
+
+
+def test_export_segment_derives_the_entity_from_the_segment(client, tmp_path):
+    row = {"entity": {"id": "aa_1", "fields": [{"field_id": "org_name", "value": "Acme"}]}}
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", ACCOUNTS, _page("accounts", [row]))])
+    out = c.export_audience_segment("audseg_1", format="json", output_dir=str(tmp_path))
+    assert [(x["method"], x["path"]) for x in c.session.calls] == [("GET", SEG + "/audseg_1"), ("POST", ACCOUNTS)]
+    body = c.session.calls[-1]["json"]
+    assert body["segmentId"] == "audseg_1" and "includeData" not in body
+    assert out["entity_type"] == "ACCOUNT" and out["row_count"] == 1 and out["content"]["entity_type"] == "ACCOUNT"
+    assert Path(out["path"]).parent == tmp_path.resolve()
+
+
+def test_export_segment_explicit_matching_entity_type_pages_contacts(client, tmp_path):
+    row = {"entity": {"id": "aa_1", "fields": [{"field_id": "name", "value": "Test Person"}]}}
+    c = client([("GET", SEG + "/audseg_1", _segment("CONTACT")), ("POST", CONTACTS, _page("contacts", [row]))])
+    out = c.export_audience_segment("audseg_1", entity_type="contact", output_dir=str(tmp_path))
+    assert c.session.calls[-1]["path"] == CONTACTS and c.session.calls[-1]["json"]["includeData"] == {"accountIds": True}
+    assert out["entity_type"] == "CONTACT" and out["format"] == "csv"
+    assert Path(out["path"]).read_text(encoding="utf-8").splitlines()[0] == "name"
+
+
+def test_export_segment_explicit_mismatch_raises_before_the_post(client, tmp_path):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", ACCOUNTS, _page("accounts", []))])
+    with pytest.raises(ValueError, match="export_audience_segment: segment 'audseg_1' is ACCOUNT, but entity_type='CONTACT' was passed"):
+        c.export_audience_segment("audseg_1", entity_type="CONTACT", output_dir=str(tmp_path))
+    assert _methods(c) == ["GET"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_export_segment_unsupported_entity_type_raises_before_the_post(client, tmp_path):
+    c = client([("GET", SEG + "/audseg_1", _segment("CUSTOM")), ("POST", ACCOUNTS, _page("accounts", []))])
+    with pytest.raises(ValueError, match="only ACCOUNT and CONTACT segments can be exported"):
+        c.export_audience_segment("audseg_1", output_dir=str(tmp_path))
+    assert _methods(c) == ["GET"]
+
+
+def test_export_segment_invalid_explicit_entity_type_is_rejected_before_the_get(client, tmp_path):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT"))])
+    with pytest.raises(ValueError, match="entity_type must be CONTACT or ACCOUNT"):
+        c.export_audience_segment("audseg_1", entity_type="deal", output_dir=str(tmp_path))
+    assert c.session.calls == []
+
+
+def test_export_segment_custom_objects_are_refused_for_an_account_segment_after_the_get(client, tmp_path):
+    c = client([("GET", SEG + "/audseg_1", _segment("ACCOUNT")), ("POST", ACCOUNTS, _page("accounts", []))])
+    with pytest.raises(ValueError, match="include_custom_objects is CONTACT-only"):
+        c.export_audience_segment("audseg_1", include_custom_objects=True, output_dir=str(tmp_path))
+    assert _methods(c) == ["GET"]
 
 
 def test_filter_stages_are_cumulative(client):

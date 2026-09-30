@@ -870,6 +870,27 @@ def _af_entity(entity_type: str) -> str:
     return et
 
 
+def _audience_segment_entity(method: str, verb: str, segment_id: str, segment: dict, explicit: str | None) -> str:
+    """Entity type for a fetched segment: its own `entityType` when it carries one (it must be
+    ACCOUNT or CONTACT and must agree with `explicit`, the caller's already-normalised
+    `entity_type`), otherwise `explicit`; neither -> ValueError asking for one. `method` and
+    `verb` name the caller in the messages ("count_audience_records", "counted")."""
+    seg_et = segment.get("entityType")
+    if seg_et is None:
+        if explicit is None:
+            raise ValueError(f"{method}: segment {segment_id!r} has no entityType; pass entity_type=")
+        return explicit
+    seg_et = str(seg_et).upper()
+    if seg_et not in AUDIENCE_ENTITY_PATHS:
+        raise ValueError(
+            f"{method}: segment {segment_id!r} has entityType {seg_et!r}; "
+            f"only ACCOUNT and CONTACT segments can be {verb}"
+        )
+    if explicit is not None and explicit != seg_et:
+        raise ValueError(f"{method}: segment {segment_id!r} is {seg_et}, but entity_type={explicit!r} was passed")
+    return seg_et
+
+
 def af_and(*items: dict) -> dict:
     """GroupOp with combinationMode And."""
     return {"type": "GroupOp", "combinationMode": "And", "items": list(items)}
@@ -3019,7 +3040,7 @@ class ClayClient:
         self,
         segment_id: str,
         *,
-        entity_type: str = "CONTACT",
+        entity_type: str | None = None,
         format: str = "csv",
         limit: int | None = None,
         page_size: int = 300,
@@ -3034,11 +3055,18 @@ class ClayClient:
 
         Uses Clay's audience pagination surface directly, which is the only
         path to export segments larger than the UI's 50K table-export cap.
+
+        Which endpoint is paged (/audiences/accounts or /audiences/contacts) comes from the
+        fetched segment's own `entityType` (one GET first, no credits). `entity_type` is
+        optional; an explicit value that disagrees with the segment raises ValueError after that
+        GET, before any row is fetched or a file written. Before 2026-09-29 it defaulted to
+        CONTACT, so an ACCOUNT segment exported without it silently paged the contacts endpoint.
         """
-        entity_type = str(entity_type).upper()
+        if entity_type is not None:
+            entity_type = str(entity_type).upper()
+            if entity_type not in {"CONTACT", "ACCOUNT"}:
+                raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
         fmt = str(format).lower()
-        if entity_type not in {"CONTACT", "ACCOUNT"}:
-            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
         if fmt not in {"csv", "json"}:
             raise ValueError(f"format must be csv or json, got {format!r}")
         if limit is not None:
@@ -3048,10 +3076,12 @@ class ClayClient:
         page_size = int(page_size)
         if page_size < 1 or page_size > 300:
             raise ValueError("page_size must be between 1 and 300 inclusive")
-        if include_custom_objects and entity_type != "CONTACT":
-            raise ValueError("include_custom_objects is CONTACT-only")
 
         ws_id = self._resolve_workspace_id(workspace_id)
+        segment = self.get_audience_segment(segment_id, workspace_id=ws_id)
+        entity_type = _audience_segment_entity("export_audience_segment", "exported", segment_id, segment, entity_type)
+        if include_custom_objects and entity_type != "CONTACT":
+            raise ValueError("include_custom_objects is CONTACT-only")
         endpoint_seg = "contacts" if entity_type == "CONTACT" else "accounts"
         all_rows: list[dict] = []
         offset = 0
@@ -3142,7 +3172,7 @@ class ClayClient:
         self,
         segment_id: str,
         *,
-        entity_type: str = "CONTACT",
+        entity_type: str | None = None,
         workspace_id: int | str | None = None,
     ) -> int:
         """Count rows in an audience segment without fetching them.
@@ -3150,7 +3180,10 @@ class ClayClient:
         Fixed 2026-09-30: `segmentId` alone does not apply the segment's filter — Clay's count
         endpoint expects the filter in `filters` (the UI keeps it client-side), so the old body
         returned the size of the whole entity. Now delegates to count_audience_records(), which
-        fetches the saved `filterAst` and sends both.
+        fetches the saved `filterAst` and sends both. `entity_type` is optional and defaults to
+        the segment's own entityType (an explicit value that disagrees raises ValueError); before
+        2026-09-29 it defaulted to CONTACT, so an ACCOUNT segment counted without it was sent as
+        CONTACT — a default that predates the segment fix.
         """
         return self.count_audience_records(entity_type, segment_id=segment_id, workspace_id=workspace_id)
 
@@ -3790,7 +3823,7 @@ class ClayClient:
 
     def count_audience_records(
         self,
-        entity_type: str,
+        entity_type: str | None = None,
         *,
         filter_ast: dict | None = None,
         segment_id: str | None = None,
@@ -3800,20 +3833,32 @@ class ClayClient:
         """Server-side count of people/companies matching an ad-hoc filter AST, a saved segment,
         or (neither) the whole entity. POST /workspaces/{ws}/audiences/count with
         {"entityType", "isArchived", "shouldInjectDraftFilter": true, "segmentType": null} plus
-        "filters": <AST> or "segmentId". This is what the segment editor calls while you edit, so
-        an ad-hoc count equals the segment the same AST would save. Verified live 2026-09-30.
+        "filters": <AST> or "segmentId" + "filters". This is what the segment editor calls while
+        you edit, so an ad-hoc count equals the segment the same AST would save. Verified live
+        2026-09-30.
+
+        With `segment_id`, `entity_type` is optional: it is read from the fetched segment's own
+        `entityType`, and an explicit value that disagrees raises ValueError after that GET
+        (before the count). A whole-entity or ad-hoc (`filter_ast`) count still requires
+        `entity_type`. Only ACCOUNT and CONTACT segments can be counted here.
         """
-        et = _af_entity(entity_type)
         if filter_ast is not None and segment_id is not None:
-            raise ValueError("pass filter_ast or segment_id, not both")
+            raise ValueError("count_audience_records: pass filter_ast or segment_id, not both")
+        if entity_type is None and segment_id is None:
+            raise ValueError("count_audience_records: entity_type is required unless segment_id is given")
+        et = _af_entity(entity_type) if entity_type is not None else None
         ws_id = self._resolve_workspace_id(workspace_id)
-        body = {"entityType": et, "isArchived": archived, "shouldInjectDraftFilter": True, "segmentType": None}
         if segment_id is not None:
             # `segmentId` alone does NOT apply the segment's filter — the UI keeps the filter
             # client-side and sends it as `filters` (verified 2026-09-30: segmentId-only returned the
-            # whole entity). Fetch the saved AST and send both.
+            # whole entity). Fetch the saved AST and send both; the same object says which entity
+            # the segment belongs to, so an ACCOUNT segment is no longer counted as CONTACT.
+            segment = self.get_audience_segment(segment_id, workspace_id=ws_id)
+            et = _audience_segment_entity("count_audience_records", "counted", segment_id, segment, et)
+            filter_ast = segment.get("filterAst") or af_and()
+        body = {"entityType": et, "isArchived": archived, "shouldInjectDraftFilter": True, "segmentType": None}
+        if segment_id is not None:
             body["segmentId"] = segment_id
-            filter_ast = self.get_audience_segment(segment_id, workspace_id=ws_id).get("filterAst") or af_and()
         if filter_ast is not None:
             body["filters"] = af_root(filter_ast)
         res = self.post(f"/workspaces/{ws_id}/audiences/count", body)
