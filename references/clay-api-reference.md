@@ -1442,7 +1442,25 @@ clay.session.patch(
 
 ### Formula Syntax — What Clay Actually Supports
 
-Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key rules:
+Clay formulas are **expression-only JavaScript**: nearly the whole standard library works, but
+statements do not. **Re-measured 2026-09-30** with 22 probe columns (expected values checked in
+Node first, one row, all probes on the same table). **20/22 matched Node exactly:**
+
+- **Arrays:** `.map`, `.filter`, `.reduce`, `.some`, `.every`, `.find`, `.findIndex`, `.includes`,
+  `.indexOf`, and `Array.from({length: 2000}, fn).reduce(...)` over 2,000 items.
+- **Strings:** `.startsWith`, `.endsWith`, `.normalize('NFD')`.
+- **Regex:** `\b` word boundaries, lookahead `(?!...)`, `matchAll`, and a
+  combining-accent range class written with `\u` escapes inside a REGEX literal (allowed there,
+  though `\u` escapes in STRING literals are rejected, see below).
+- **Math:** `Math.round` (2.5 -> 3), `Math.log2`, `Math.min`, `Math.max`, `Math.floor`.
+- **Dates:** `Date.UTC` with month rollover (`Date.UTC(2026, -10, 30)` -> 2025-03-30), `Date.parse`
+  with `+0000`, `Date.now()`.
+- **Objects:** `Object.entries` + `.sort`, `Object.assign`, `Array.from(new Set(...))`.
+- **Functions:** nested arrow IIFEs, which also make parameters usable as local variables.
+
+**The 2 failures are both spread syntax, and both failed SILENTLY (no cell at all):** `{...obj}`
+and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. Some entries in the
+"Does NOT work" list below were written earlier and are corrected there. Key rules:
 
 **Works:**
 - Ternary expressions: `condition ? "yes" : "no"`
@@ -1501,13 +1519,19 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
   (Evidence: side-by-side columns — statement forms produced no cells, expression forms
   returned SUCCESS.) This refines the older entries: IIFEs as such are fine; it's the
   statement BODY that kills them.
-- `.includes()`, `.indexOf()` — may cause "Error evaluating formula" on some Clay versions
-- `.some()`, `.filter()`, `.map()`, `.find()` — parse error
+- **Spread syntax fails SILENTLY (verified 2026-09-30):** `{...obj}` and `[...iterable]` both
+  produced no cell. Use `Object.assign({}, a, b)` and `Array.from(iterable)`.
 - `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
-- Regex word boundaries `\b` — causes parse error
-- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost
+- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost.
+  To name an intermediate value, pass it into an arrow IIFE: `((x) => x.a + x.b)(JSON.parse(s))`.
+- ~~`.includes()`, `.indexOf()`, `.some()`, `.filter()`, `.map()`, `.find()`, regex `\b`~~: all
+  **WORK** as of 2026-09-30 (probe above). These entries dated from earlier testing; either Clay's
+  evaluator changed or the original failures had another cause, such as a statement body in the
+  same formula.
 
-**Pattern for complex formulas:** Use pure nested ternaries with inline expressions. Repeat the field reference rather than trying to store in a variable:
+**Pattern for complex formulas:** Nested ternaries with inline expressions still work and stay
+readable for short rules. For anything longer, bind values once through an arrow IIFE and use the
+array methods (both verified 2026-09-30) instead of repeating the field reference. The older style:
 
 ```python
 # ✅ CORRECT — pure nested ternary, inline everything
