@@ -16,11 +16,13 @@ import csv
 import datetime
 import io
 import json
+import math
 import os
 import random
 import re
 import string
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -826,6 +828,705 @@ def format_json_body(mapping: dict) -> str:
         return '"' + raw.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
     return " + ".join(_enc(v) if kind == "lit" else v for kind, v in pieces if not (kind == "lit" and v == ""))
+
+# ── Audiences: filter AST builder ────────────────────────────────────────────
+# Audiences segments are saved as a filter AST (`filterAst` on POST/PATCH /audiences/segments;
+# the official `clay` CLI calls the same object `filter`). These helpers build the exact node
+# shapes the Clay UI writes, so segments built from code stay readable and editable in the UI:
+#   GroupOp  {"type": "GroupOp", "combinationMode": "And"|"Or", "items": [...]}
+#   BinOp    {"type": "BinOp", "key": <fieldId>, "dataPath": ["<entity>_entity_field_values", "field", <fieldId>],
+#             "operator": ..., "value"?: ..., "entityType": "ACCOUNT"|"CONTACT"}
+#   activity {"type": "BinOp", "key": "<fieldId>::<activityTypeId>",
+#             "dataPath": ["activities", "fields", <fieldId>, <activityTypeId>], "operator": ..., "value"?: ...}
+#   ColOp    {"type": "ColOp", "dataPath": ["activities", <activityTypeId>], "operator": "AnyItems"|"NoItems",
+#             "entityType": ..., "condition": <GroupOp of BinOps that must hold on the SAME activity>}
+# Verified live 2026-09-29/30 (workspace 12345): each shape counts via POST /audiences/count and
+# saves via POST/PATCH /audiences/segments.
+#
+# Two traps these helpers encode:
+#   1. Sibling activity conditions are evaluated independently ("type = X" AND "date within 30d"
+#      as two rows = "ever had type X" AND "any activity within 30d"). Conditions that must
+#      describe the same activity go inside one ColOp — but the Clay UI renders a ColOp row as
+#      "deleted field", so prefer af_activity() when a segment needs only ONE activity condition.
+#   2. An exclusion segment and the "everything else" segment must be exact complements, which
+#      requires every rule to use an operator with a single-operator negation (Equal/NotEqual,
+#      Contain/NotContain, True/False, Empty/NotEmpty, WithinLast/NotWithinLast,
+#      WithinNext/NotWithinNext). af_exclusion_pair() enforces that and decides blank cells per
+#      field: a blank counts as "matches none" (not excluded) unless the field has an ("Empty",)
+#      rule, which excludes it. NotEqual and NotContain (verified live 2026-09-29) and False match
+#      blank cells; NotWithinLast/NotWithinNext are assumed to (unmeasured — the probed date field
+#      had no blanks) and are pinned the same way, so on the excluded side the text/date negatives
+#      are pinned under And(NotEmpty, ...); boolean rules are exact without a pin because a blank
+#      boolean IS False; a ("NotEmpty",) rule makes the included side
+#      And(Empty). The partition rests on four assumptions, verified live 2026-09-29 (one
+#      production workspace, ACCOUNT entity, read-only counts):
+#        A1 Empty and NotEmpty are exact complements (Empty + NotEmpty = total); Equal "" matches
+#           blank cells, so "" is refused as a rule value.
+#        A2 An operator and its negation are exact complements on populated cells (Equal/NotEqual
+#           are case-insensitive).
+#        A3 Positive operators (Equal, Contain, True, WithinLast, WithinNext) never match a blank.
+#        A4 Nested And/Or groups evaluate as ordinary conjunction/disjunction.
+#      UI: verified 2026-09-30 in the segment editor — the pinned And(NotEmpty, Or(...)) and the
+#      guarded Or(Empty, And(...)) render as ordinary editable rows and groups (no "deleted
+#      field"), the editor's count equals the API count, and the saved AST round-trips with its
+#      nesting intact.
+
+AUDIENCE_ENTITY_PATHS = {"ACCOUNT": "account_entity_field_values", "CONTACT": "contact_entity_field_values"}
+# The negation map: operator -> the operator that is its exact complement on a POPULATED cell
+# (Empty/NotEmpty are complements on every cell). It is NOT the rule-table allow-list by itself:
+# af_none_of()/af_exclusion_pair() accept exactly its keys, while af_any_of() also passes other
+# operators through (ContainAny, like af_owner_in). The WithinLast-family entries need `timeUnit`,
+# which a rule carries as its third element — (op, value, time_unit), see af_rule().
+AUDIENCE_NEGATED_OPERATOR = {
+    "Equal": "NotEqual", "NotEqual": "Equal",
+    "Contain": "NotContain", "NotContain": "Contain",
+    "True": "False", "False": "True",
+    "Empty": "NotEmpty", "NotEmpty": "Empty",
+    "WithinLast": "NotWithinLast", "NotWithinLast": "WithinLast",
+    "WithinNext": "NotWithinNext", "NotWithinNext": "WithinNext",
+}
+# Operators that take a numeric value plus "timeUnit". Verified live 2026-09-29: day/week/month are
+# accepted, "year" is rejected (400) and a time node WITHOUT timeUnit is a server error (500) — so
+# every builder here refuses to emit one (_af_time_unit).
+AUDIENCE_TIME_OPERATORS = frozenset({"WithinLast", "NotWithinLast", "WithinNext", "NotWithinNext"})
+AUDIENCE_TIME_UNITS = ("day", "week", "month")
+# Negations of positive operators that, unlike the positive operators, also match a BLANK cell.
+# Verified live 2026-09-29 (one production workspace, ACCOUNT entity): NotEqual and NotContain
+# matched every blank text cell and False matched every blank boolean; NotWithinLast/NotWithinNext
+# could not be measured (the probed date field had no blanks) and are treated the same way. A bare
+# one on the excluded side of a pair would put blank records on BOTH sides, so af_any_of() pins the
+# group under NotEmpty — the pin is the correctness mechanism, not insurance.
+AUDIENCE_BLANK_UNKNOWN_OPERATORS = frozenset({"NotEqual", "NotContain", "False", "NotWithinLast", "NotWithinNext"})
+# Boolean fields: an unset checkbox is stored blank and Clay's False matches it — True + False = total
+# on all 5 boolean fields checked (verified live 2026-09-29, one production workspace). So True/False
+# rules use the plain unpinned pair — excluded Or(rules), included And(negations) with no Empty guard
+# — and a NotEmpty pin would make a ("False",) rule match nothing (And(NotEmpty, False) matched no
+# record live). Flip this only if a workspace is measured the other way.
+AUDIENCE_BOOLEAN_BLANK_IS_FALSE = True
+_AF_NO_VALUE_OPERATORS = frozenset({"Empty", "NotEmpty", "True", "False"})
+_AF_BOOLEAN_OPERATORS = frozenset({"True", "False"})
+_AF_SCALAR_VALUE_OPERATORS = frozenset({"Equal", "NotEqual", "Contain", "NotContain"})
+_AF_RULE_DICT_KEYS = frozenset({"operator", "op", "value", "time_unit", "timeUnit"})
+
+
+def _af_entity(entity_type: str) -> str:
+    et = str(entity_type).upper()
+    if et not in AUDIENCE_ENTITY_PATHS:
+        raise ValueError(f"entity_type must be ACCOUNT or CONTACT, got {entity_type!r}")
+    return et
+
+
+def _audience_segment_entity(method: str, verb: str, segment_id: str, segment: dict, explicit: str | None) -> str:
+    """Entity type for a fetched segment: its own `entityType` when it carries one (it must be
+    ACCOUNT or CONTACT and must agree with `explicit`, the caller's already-normalised
+    `entity_type`), otherwise `explicit`; neither -> ValueError asking for one. `method` and
+    `verb` name the caller in the messages ("count_audience_records", "counted")."""
+    seg_et = segment.get("entityType")
+    if seg_et is None:
+        if explicit is None:
+            raise ValueError(f"{method}: segment {segment_id!r} has no entityType; pass entity_type=")
+        return explicit
+    seg_et = str(seg_et).upper()
+    if seg_et not in AUDIENCE_ENTITY_PATHS:
+        raise ValueError(
+            f"{method}: segment {segment_id!r} has entityType {seg_et!r}; "
+            f"only ACCOUNT and CONTACT segments can be {verb}"
+        )
+    if explicit is not None and explicit != seg_et:
+        raise ValueError(f"{method}: segment {segment_id!r} is {seg_et}, but entity_type={explicit!r} was passed")
+    return seg_et
+
+
+def af_and(*items: dict) -> dict:
+    """GroupOp with combinationMode And."""
+    return {"type": "GroupOp", "combinationMode": "And", "items": list(items)}
+
+
+def af_or(*items: dict) -> dict:
+    """GroupOp with combinationMode Or."""
+    return {"type": "GroupOp", "combinationMode": "Or", "items": list(items)}
+
+
+def _af_time_unit(operator: str, time_unit: Any, *, where: str) -> str | None:
+    """Enforce the timeUnit contract for one node and return the unit to stamp (None for a
+    non-time operator). Verified live 2026-09-29: a WithinLast-family node without timeUnit is a
+    server error (500) and timeUnit "year" is rejected (400) — both are ValueErrors here, as is a
+    time_unit on any other operator (Clay would silently carry it)."""
+    units = "/".join(AUDIENCE_TIME_UNITS)
+    if operator in AUDIENCE_TIME_OPERATORS:
+        if time_unit is None:
+            raise ValueError(f"{where}: {operator} needs time_unit ({units}); a time node without timeUnit is a Clay server error")
+        if time_unit not in AUDIENCE_TIME_UNITS:
+            raise ValueError(f"{where}: time_unit must be one of {units}, got {time_unit!r}")
+        return time_unit
+    if time_unit is not None:
+        raise ValueError(f"{where}: time_unit only applies to {'/'.join(sorted(AUDIENCE_TIME_OPERATORS))}, got {time_unit!r} on {operator!r}")
+    return None
+
+
+def af_field(entity_type: str, field_id: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """BinOp on an Audiences field of a company (ACCOUNT) or person (CONTACT).
+
+    `field_id` is a built-in id (`org_name`, `domain`, `sfdc_owner_id`, `email`, `title`, ...) or a
+    custom `audf_...` id. A people segment may test company fields by passing entity_type="ACCOUNT"
+    (Clay evaluates them on the linked company). `value` is omitted for Empty/NotEmpty/True/False;
+    WithinLast/NotWithinLast/WithinNext/NotWithinNext take a number plus time_unit
+    ("day"|"week"|"month") and raise ValueError without it (a unit-less time node is a Clay server
+    error, verified live 2026-09-29) or when a time_unit is given for any other operator;
+    ContainAny takes a list.
+    """
+    et = _af_entity(entity_type)
+    unit = _af_time_unit(operator, time_unit, where="af_field")
+    node = {"type": "BinOp", "key": field_id, "dataPath": [AUDIENCE_ENTITY_PATHS[et], "field", field_id], "operator": operator, "entityType": et}
+    if value is not None:
+        # a list (ContainAny) is copied, so editing the node never leaks into the caller's rule
+        # table; a tuple/set becomes the JSON-able list Clay expects
+        node["value"] = list(value) if isinstance(value, (list, tuple, set, frozenset)) else value
+    if unit is not None:
+        node["timeUnit"] = unit
+    return node
+
+
+def af_activity(activity_type_id: str, field_id: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """UI-native single condition on an imported activity (e.g. a CRM custom object).
+
+    `activity_type_id` is the `acttyp_...` id (from `activities get/summary` or the Audiences settings);
+    `field_id` is "title", "created_at" or a custom `actf_...` field on that activity type. Renders and
+    edits in the Clay UI. Two of these as siblings do NOT bind to the same activity — see
+    af_activity_same_event(). Same time_unit contract as af_field() (ValueError without a unit on
+    a WithinLast-family operator, or with one on any other).
+    """
+    unit = _af_time_unit(operator, time_unit, where="af_activity")
+    node = {"type": "BinOp", "key": f"{field_id}::{activity_type_id}", "dataPath": ["activities", "fields", field_id, activity_type_id], "operator": operator}
+    if value is not None:
+        node["value"] = value
+    if unit is not None:
+        node["timeUnit"] = unit
+    return node
+
+
+def af_activity_timestamp(entity_type: str, operator: str, value: Any = None, *, time_unit: str | None = None) -> dict:
+    """Recency of an activity, for use INSIDE af_activity_same_event() (dataPath ["activities",
+    "activity_timestamp"]). Same time_unit contract as af_field() (ValueError without a unit on a
+    WithinLast-family operator, or with one on any other)."""
+    unit = _af_time_unit(operator, time_unit, where="af_activity_timestamp")
+    node = {"type": "BinOp", "dataPath": ["activities", "activity_timestamp"], "operator": operator, "entityType": _af_entity(entity_type)}
+    if value is not None:
+        node["value"] = value
+    if unit is not None:
+        node["timeUnit"] = unit
+    return node
+
+
+def af_activity_same_event(activity_type_id: str, entity_type: str, *conditions: dict, operator: str = "AnyItems") -> dict:
+    """ColOp: the record has (AnyItems) / lacks (NoItems) an activity of this type on which ALL
+    `conditions` hold at once. Use for "type X within 30 days" style rules. The Clay UI cannot
+    render this node (it shows "deleted field") — the segment still evaluates correctly.
+    """
+    et = _af_entity(entity_type)
+    if operator not in {"AnyItems", "NoItems"}:
+        raise ValueError("operator must be AnyItems or NoItems (AllItems is not supported by Clay)")
+    items = [dict(c, entityType=et) for c in conditions]
+    return {"type": "ColOp", "dataPath": ["activities", activity_type_id], "operator": operator, "entityType": et, "condition": af_and(*items)}
+
+
+def af_owner_in(owner_ids: list[str], entity_type: str = "ACCOUNT") -> dict:
+    """Company owned by any of these Salesforce users (18-char User IDs). ContainAny on the
+    built-in `sfdc_owner_id` is exact for IDs and renders as ONE row in the UI (verified equal to
+    an Or of 125 Equal rows)."""
+    return af_field(entity_type, "sfdc_owner_id", "ContainAny", list(owner_ids))
+
+
+def af_rule(rule: Any) -> tuple[str, Any, str | None]:
+    """Normalise one exclusion-pair rule to (operator, value, time_unit) and validate it — pure, so
+    a rule table can be checked before any HTTP call. Accepted forms: (op,), (op, value),
+    (op, value, time_unit), a list in place of a tuple, or a dict {"operator"|"op", "value",
+    "time_unit"|"timeUnit"}. Per operator: Empty/NotEmpty/True/False take no value and no unit;
+    WithinLast/NotWithinLast/WithinNext/NotWithinNext take a finite number >= 0 plus a unit in
+    AUDIENCE_TIME_UNITS (a unit-less time node is a server error, verified live 2026-09-29);
+    Equal/NotEqual/Contain/NotContain take one scalar value — not None, not "" (Equal "" matches
+    blank cells, verified live 2026-09-29: write ("Empty",) instead) and not a list (one rule per
+    value; ContainAny has no exact negation); any other operator takes a value and no unit
+    (af_any_of() passes it through, af_none_of() rejects it). Everything else is a ValueError."""
+    if isinstance(rule, dict):
+        unknown = set(rule) - _AF_RULE_DICT_KEYS
+        if unknown:
+            raise ValueError(f"rule {rule!r}: unknown keys {sorted(unknown)}; a rule dict has operator (or op), value, time_unit (or timeUnit)")
+        if "operator" in rule and "op" in rule:
+            raise ValueError(f"rule {rule!r}: give 'operator' or 'op', not both")
+        if "time_unit" in rule and "timeUnit" in rule:
+            raise ValueError(f"rule {rule!r}: give 'time_unit' or 'timeUnit', not both")
+        if "operator" not in rule and "op" not in rule:
+            raise ValueError(f"rule {rule!r} needs an 'operator' key")
+        op = rule["operator"] if "operator" in rule else rule["op"]
+        value = rule.get("value")
+        time_unit = rule["time_unit"] if "time_unit" in rule else rule.get("timeUnit")
+    elif isinstance(rule, (tuple, list)):
+        if not 1 <= len(rule) <= 3:
+            raise ValueError(f"a rule is (op,), (op, value) or (op, value, time_unit), got {rule!r}")
+        op = rule[0]
+        value = rule[1] if len(rule) > 1 else None
+        time_unit = rule[2] if len(rule) > 2 else None
+    else:
+        raise ValueError(f"a rule is (op,), (op, value), (op, value, time_unit) or a dict, got {rule!r}")
+    if not isinstance(op, str) or not op:
+        raise ValueError(f"rule {rule!r}: operator must be a non-empty string")
+    unit = _af_time_unit(op, time_unit, where=f"rule {rule!r}")
+    if op in _AF_NO_VALUE_OPERATORS:
+        if value is not None:
+            raise ValueError(f"rule {rule!r}: {op} takes no value; write ({op!r},)")
+        return op, None, None
+    if op in AUDIENCE_TIME_OPERATORS:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"rule {rule!r}: {op} needs a finite number >= 0 as value, e.g. ({op!r}, 30, 'day')")
+        return op, value, unit
+    if value is None:
+        raise ValueError(f"rule {rule!r}: {op} needs a value")
+    if isinstance(value, str) and value == "":
+        raise ValueError(f"rule {rule!r}: an empty-string value is ambiguous on blank cells (Equal \"\" matches them); use ('Empty',) or ('NotEmpty',)")
+    if op in _AF_SCALAR_VALUE_OPERATORS and isinstance(value, (list, tuple, set, frozenset, dict)):
+        raise ValueError(f"rule {rule!r}: {op} takes one scalar value; write one rule per value (ContainAny has no exact negation)")
+    return op, value, None
+
+
+def _af_rules(field_id: Any, rules: Any) -> list[tuple[str, Any, str | None]]:
+    """One field's rules through af_rule(): validated, identical rules collapsed (first occurrence
+    kept; identical means the same operator, value TYPE, value and unit — 1 == True == 1.0 in
+    Python, but ("Equal", 1), ("Equal", True) and ("Equal", 1.0) are three rules), never empty;
+    every error names the field."""
+    if not isinstance(field_id, str) or not field_id:
+        raise ValueError(f"field id must be a non-empty string, got {field_id!r}")
+    if isinstance(rules, (str, bytes, dict)) or not hasattr(rules, "__iter__"):
+        raise ValueError(f"field {field_id!r}: rules must be a list of rules, got {rules!r}")
+    norm: list[tuple[str, Any, str | None]] = []
+    seen: list[tuple] = []   # (op, value type name, value, unit) — a list, not a set: values may be lists
+    for rule in rules:
+        try:
+            parts = af_rule(rule)
+        except ValueError as e:
+            raise ValueError(f"field {field_id!r}: {e}") from None
+        key = (parts[0], type(parts[1]).__name__, parts[1], parts[2])
+        if key not in seen:
+            seen.append(key)
+            norm.append(parts)
+    if not norm:
+        raise ValueError(f"field {field_id!r} has no rules; drop the field from the table instead")
+    return norm
+
+
+def _af_check_negatable(field_id: str, norm: list[tuple[str, Any, str | None]]) -> None:
+    """Every rule of an exclusion pair needs an operator with a single-operator negation."""
+    for op, _, _ in norm:
+        if op not in AUDIENCE_NEGATED_OPERATOR:
+            raise ValueError(
+                f"field {field_id!r}: operator {op!r} is unknown or has no exact negation; "
+                f"exclusion tables accept only {', '.join(sorted(AUDIENCE_NEGATED_OPERATOR))}"
+            )
+
+
+def _af_any_of(et: str, field_id: str, norm: list[tuple[str, Any, str | None]]) -> dict:
+    group = af_or(*[af_field(et, field_id, op, value, time_unit=tu) for op, value, tu in norm])
+    ops = {op for op, _, _ in norm}
+    if ops & _AF_BOOLEAN_OPERATORS and AUDIENCE_BOOLEAN_BLANK_IS_FALSE:
+        return group  # a blank boolean IS False: the bare rules already decide blank cells exactly
+    if "Empty" not in ops and ops & AUDIENCE_BLANK_UNKNOWN_OPERATORS:
+        # NotEqual/NotContain match blank cells (verified live 2026-09-29; NotWithinLast/NotWithinNext
+        # are assumed to): without this pin a blank record would be excluded here AND included by the
+        # Empty guard of _af_none_of().
+        return af_and(af_field(et, field_id, "NotEmpty"), group)
+    return group
+
+
+def _af_none_of(et: str, field_id: str, norm: list[tuple[str, Any, str | None]]) -> dict:
+    negated = [af_field(et, field_id, AUDIENCE_NEGATED_OPERATOR[op], value, time_unit=tu) for op, value, tu in norm]
+    ops = {op for op, _, _ in norm}
+    if ops & _AF_BOOLEAN_OPERATORS and AUDIENCE_BOOLEAN_BLANK_IS_FALSE:
+        return af_and(*negated)  # no Empty guard: True/False already partition blank cells
+    if "Empty" in ops:
+        return af_and(*negated)  # the Empty rule excludes blanks; NotEmpty (its negation) is in here
+    if "NotEmpty" in ops:
+        return af_and(af_field(et, field_id, "Empty"))  # every populated record is excluded
+    return af_or(af_field(et, field_id, "Empty"), af_and(*negated))
+
+
+def af_any_of(entity_type: str, field_id: str, rules: list) -> dict:
+    """Or of one BinOp per rule — the 'excluded' side of a pair for one field. A rule is (op,),
+    (op, value), (op, value, time_unit) or a dict (see af_rule(); identical rules collapse, an
+    empty list raises). Any operator is passed through (ContainAny, like af_owner_in). Blank cells:
+    NotEqual and NotContain (verified live 2026-09-29) and False match blank cells;
+    NotWithinLast/NotWithinNext are assumed to (unmeasured — the probed date field had no blanks)
+    and are pinned the same way, so a field with one of those and no ("Empty",) rule is pinned —
+    And(NotEmpty, Or(rules)), one
+    extra UI row — and a blank is never excluded; that pin is what keeps the pair exact, not
+    insurance. Exception: True/False rules are emitted bare, because a blank boolean IS False and
+    a NotEmpty pin would make ("False",) match nothing (AUDIENCE_BOOLEAN_BLANK_IS_FALSE)."""
+    et = _af_entity(entity_type)
+    return _af_any_of(et, field_id, _af_rules(field_id, rules))
+
+
+def af_none_of(entity_type: str, field_id: str, rules: list) -> dict:
+    """The exact complement of af_any_of() for the same rules. Every operator must be a key of
+    AUDIENCE_NEGATED_OPERATOR (ValueError otherwise, naming the field and the allowed operators).
+    Without an ("Empty",) rule: blank OR none of the rules match -> Or(Empty, And(negated)). With
+    one, the blank is excluded by that rule, so the guard is dropped -> And(negated), where
+    NotEmpty is the negation of the Empty rule. A ("NotEmpty",) rule excludes every populated
+    record, so the complement is And(Empty). True/False rules: And(negated) with no guard (a blank
+    boolean is False)."""
+    et = _af_entity(entity_type)
+    norm = _af_rules(field_id, rules)
+    _af_check_negatable(field_id, norm)
+    return _af_none_of(et, field_id, norm)
+
+
+def af_exclusion_pair(entity_type: str, rule_table: list[tuple[str, list]]) -> tuple[list[dict], list[dict]]:
+    """From [(field_id, rules), ...] return (excluded_items, included_items): the record is excluded
+    if ANY field matches any of its rules (Or the first list), included if EVERY field matches none
+    (And the second) — a blank cell counts as "matches none" unless that field has an ("Empty",)
+    rule — or, on a boolean field, a ("False",) rule, since a blank checkbox is False — which
+    excludes it. A rule is (op,), (op, value) or (op, value, time_unit) — see af_rule()
+    for the grammar — using only the operators in AUDIENCE_NEGATED_OPERATOR. The whole table is
+    validated before anything is built (entity type, (field_id, rules) entries, every rule; an
+    empty table or a field with no rules is a ValueError). Fields with a negative operator are
+    pinned under NotEmpty on the excluded side, boolean rules are exact unpinned, and a
+    ("NotEmpty",) rule makes the included side And(Empty). Count both plus the total to prove they
+    partition the entity — see ClayClient.verify_audience_filter_complement()."""
+    et = _af_entity(entity_type)
+    if isinstance(rule_table, (str, bytes, dict)) or not hasattr(rule_table, "__iter__"):
+        raise ValueError(f"rule_table must be a list of (field_id, rules) entries, got {rule_table!r}")
+    entries = list(rule_table)
+    if not entries:
+        raise ValueError("rule_table is empty; an exclusion pair needs at least one (field_id, rules) entry")
+    normalised = []
+    for entry in entries:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+            raise ValueError(f"rule_table entry {entry!r}: expected (field_id, rules)")
+        field_id, rules = entry
+        norm = _af_rules(field_id, rules)
+        _af_check_negatable(field_id, norm)
+        normalised.append((field_id, norm))
+    excluded = [_af_any_of(et, f, norm) for f, norm in normalised]
+    included = [_af_none_of(et, f, norm) for f, norm in normalised]
+    return excluded, included
+
+
+def af_with_ids(node: dict) -> dict:
+    """Return a copy of the AST with a UUID `id` on EVERY node (GroupOp, BinOp, ColOp and each
+    ColOp condition). The internal segments endpoint validates them — a node without an `id`
+    fails with 400 "filterAst.items.N - Invalid input" (verified 2026-09-30); the public API
+    documents the same ids as optional editor bookkeeping. Existing ids are kept."""
+    out = dict(node)
+    out.setdefault("id", str(uuid.uuid4()))
+    if isinstance(out.get("items"), list):
+        out["items"] = [af_with_ids(x) for x in out["items"]]
+    if isinstance(out.get("condition"), dict):
+        out["condition"] = af_with_ids(out["condition"])
+    return out
+
+
+def af_root(ast: dict) -> dict:
+    """Wrap a node in a root GroupOp (Clay rejects a bare BinOp/ColOp) and stamp UUID ids on every
+    node, which is what the UI editor writes and what the internal API requires."""
+    root = ast if ast.get("type") == "GroupOp" else af_and(ast)
+    return af_with_ids(root)
+
+
+# ── Audiences: Salesforce import mapping — module-level helpers ───────────────
+# The five import-level sync settings the mapping PATCH replaces. They live in the import's
+# `importMetadata` (verified live 2026-09-29 — there and nowhere else, not at the import's top
+# level). Four are booleans, the fifth is a dict or None.
+_SF_IMPORT_SYNC_BOOL_KEYS = (
+    "isImportSyncEnabled",
+    "isExportSyncEnabled",
+    "isCreateNewRecordsEnabled",
+    "isTaskSyncEnabled",
+)
+_SF_IMPORT_SYNC_KEYS = _SF_IMPORT_SYNC_BOOL_KEYS + ("createNewRecordsIdMapping",)
+# importMetadata key -> the matching update_salesforce_import_field_mapping() keyword argument.
+_SF_IMPORT_SYNC_KWARGS = {
+    "isImportSyncEnabled": "is_import_sync_enabled",
+    "isExportSyncEnabled": "is_export_sync_enabled",
+    "isCreateNewRecordsEnabled": "is_create_new_records_enabled",
+    "createNewRecordsIdMapping": "create_new_records_id_mapping",
+    "isTaskSyncEnabled": "is_task_sync_enabled",
+}
+# "Not passed" marker for the five sync-flag kwargs of update_salesforce_import_field_mapping().
+# They have no usable default on purpose (the PATCH replaces them on the import), and a sentinel
+# rather than None lets the method tell an omitted flag from an explicit None.
+_REQUIRED_SYNC_FLAG: Any = object()
+
+
+class AudienceFieldsOrphanedError(RuntimeError):
+    """add_salesforce_import_fields() created Audiences fields but did not map them.
+
+    Raised after the first write (POST /audiences/field) when the second — the mapping PATCH —
+    was not sent or did not succeed, so `audf_…` fields exist that nothing fills. A RuntimeError
+    subclass: a post-write contract violation, like the rest of the module.
+
+    Attributes: `import_id`, `entity_type` (ACCOUNT / CONTACT), `workspace_id`,
+    `created_fields` (the create response), `created_field_ids`, `sync_flags` (the five sync
+    settings keyed like importMetadata), `mapping`, `pairing_verified` and `mapped_after_failure`.
+
+    * `pairing_verified=True`: every created field echoed the requested displayName in request
+      order, so `mapping` is the exact list the PATCH should carry (existing pairs + new pairs,
+      or the freshly re-read pairs + new pairs when the import changed underneath) and
+      re-sending it is safe — the PATCH is a full REPLACE, so the retry is idempotent. One
+      exception: if the import was not found (or its mapping was malformed) when re-read before
+      the PATCH, `mapping` is None and the message says so — check the import first:
+          clay.update_salesforce_import_field_mapping(err.import_id, err.mapping,
+              entity_type=err.entity_type, **err.sync_flag_kwargs())
+    * `pairing_verified=False`: the create response could not be paired with the request (wrong
+      shape, wrong count, or a displayName that did not match), `mapping` is None, and the
+      created ids must NOT be mapped by position — check each field's displayName in the UI or
+      delete the orphans.
+    * `mapped_after_failure`: after a failed PATCH the import is re-read once (best effort):
+      True = every created id is now in `fieldMapping.fieldMappings`, False = not all are,
+      None = the re-read did not succeed. Only a confirmed False justifies a delete.
+
+    claycast has no wrapper for deleting an Audiences field (that endpoint was never captured);
+    the official CLI `clay audiences fields delete <audf_id> --entity-type people|companies`
+    (soft, idempotent) or the UI does it. Picklable (`__reduce__`), so it crosses process pools.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        import_id: str | None = None,
+        entity_type: str | None = None,
+        workspace_id: int | str | None = None,
+        created_fields: list[dict] | None = None,
+        mapping: list[dict] | None = None,
+        pairing_verified: bool = False,
+        sync_flags: dict | None = None,
+        mapped_after_failure: bool | None = None,
+    ):
+        super().__init__(message)
+        self.import_id = import_id
+        self.entity_type = entity_type
+        self.workspace_id = workspace_id
+        self.created_fields = list(created_fields or [])
+        self.created_field_ids = [f.get("id") if isinstance(f, dict) else None for f in self.created_fields]
+        self.mapping = mapping
+        self.pairing_verified = pairing_verified
+        self.sync_flags = dict(sync_flags or {})
+        self.mapped_after_failure = mapped_after_failure
+
+    def sync_flag_kwargs(self) -> dict:
+        """`sync_flags` translated to update_salesforce_import_field_mapping() keyword arguments
+        (isImportSyncEnabled -> is_import_sync_enabled, …), so the retry in the message runs as
+        written."""
+        return {_SF_IMPORT_SYNC_KWARGS[k]: self.sync_flags[k] for k in _SF_IMPORT_SYNC_KEYS if k in self.sync_flags}
+
+    def __reduce__(self):
+        return (self.__class__, (str(self),), self.__dict__)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+
+def _check_salesforce_sync_overrides(overrides: dict | None, *, where: str) -> dict:
+    """Shape-check a `sync_flags` dict before any request: it must be a dict keyed like
+    importMetadata — isImportSyncEnabled / isExportSyncEnabled / isCreateNewRecordsEnabled /
+    isTaskSyncEnabled (True or False) and createNewRecordsIdMapping (a dict or None). Unknown keys
+    (snake_case typos) and wrong types raise ValueError that names sync_flags, not the import.
+    Returns a copy; None -> {}."""
+    if overrides is None:
+        return {}
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"{where}: sync_flags must be a dict keyed like importMetadata "
+            f"({', '.join(_SF_IMPORT_SYNC_KEYS)}), got {type(overrides).__name__}"
+        )
+    unknown = sorted(str(k) for k in overrides if k not in _SF_IMPORT_SYNC_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown sync_flags key(s) {', '.join(unknown)}; "
+            f"expected any of {', '.join(_SF_IMPORT_SYNC_KEYS)}"
+        )
+    for key in _SF_IMPORT_SYNC_BOOL_KEYS:
+        if key in overrides and not isinstance(overrides[key], bool):
+            raise ValueError(f"{where}: sync_flags[{key!r}] must be True or False, got {overrides[key]!r}")
+    if "createNewRecordsIdMapping" in overrides:
+        val = overrides["createNewRecordsIdMapping"]
+        if val is not None and not isinstance(val, dict):
+            raise ValueError(
+                f"{where}: sync_flags['createNewRecordsIdMapping'] must be a dict or None, got {val!r}"
+            )
+    return dict(overrides)
+
+
+def _salesforce_import_sync_flags(
+    import_id: str, meta: dict, overrides: dict | None, *, where: str = "add_salesforce_import_fields"
+) -> dict:
+    """The five sync settings for the mapping PATCH, read from the import's importMetadata with
+    `overrides` (a sync_flags dict, shape-checked here) winning.
+
+    Fails closed. A setting that is absent or null in importMetadata and not overridden raises
+    ValueError naming every such key and the exact `sync_flags={...}` remedy — never a default,
+    because the PATCH replaces the settings and a guessed value would switch a sync on or off.
+    Problems are attributed to their source: "importMetadata is missing …" / "has sync
+    setting(s) of an unexpected type" versus "sync_flags[k] must be True or False, got …".
+    isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None is refused unless
+    importMetadata itself already holds exactly that (the key PRESENT with null): an absent key is
+    not a null, so supplying None for a missing key does not get past the check either — for an
+    enabled import the remedy names <the import's id-mapping dict> instead. Verified live
+    2026-09-29: an ACCOUNT import carried all five keys; a CONTACT import had no
+    isTaskSyncEnabled (the UI's replay sent False) — the operator supplies it via sync_flags."""
+    overrides = _check_salesforce_sync_overrides(overrides, where=where)
+    flags: dict = {}
+    wrong: list[str] = []
+    for key in _SF_IMPORT_SYNC_BOOL_KEYS:
+        val = meta.get(key)
+        if val is None:
+            continue  # absent or null: missing unless overridden
+        if isinstance(val, bool):
+            flags[key] = val
+        else:
+            wrong.append(f"{key}={val!r} (expected True or False)")
+    if "createNewRecordsIdMapping" in meta:
+        val = meta["createNewRecordsIdMapping"]
+        if val is None or isinstance(val, dict):
+            flags["createNewRecordsIdMapping"] = val
+        else:
+            wrong.append(f"createNewRecordsIdMapping={val!r} (expected a dict or None)")
+    wrong = [w for w in wrong if w.split("=", 1)[0] not in overrides]  # an override replaces a bad value
+    wrong_keys = [w.split("=", 1)[0] for w in wrong]
+    flags.update(overrides)
+    missing = [k for k in _SF_IMPORT_SYNC_KEYS if k not in flags and k not in wrong_keys]
+    if missing or wrong:
+        problems = []
+        if missing:
+            problems.append(f"is missing sync setting(s) {', '.join(missing)}")
+        if wrong:
+            problems.append(f"has sync setting(s) of an unexpected type: {', '.join(wrong)}")
+        # None is a sensible createNewRecordsIdMapping example only while create-new-records is off;
+        # with it on, None would just trip the refusal below, so the example names the real remedy
+        id_mapping_example = (
+            "<the import's id-mapping dict>" if flags.get("isCreateNewRecordsEnabled") is True else "None"
+        )
+        example = ", ".join(
+            f'"{k}": {id_mapping_example if k == "createNewRecordsIdMapping" else "False"}'
+            for k in _SF_IMPORT_SYNC_KEYS if k in missing or k in wrong_keys
+        )
+        raise ValueError(
+            f"{where}: import {import_id!r} importMetadata {' and '.join(problems)}; refusing to guess "
+            f"(the mapping PATCH replaces them, so a default could switch a sync on or off). Read the import "
+            f"with list_audience_imports() to see what Clay put there, then pass the setting(s) explicitly, "
+            f"e.g. sync_flags={{{example}}}, using the value the UI's Salesforce sync toggle shows. "
+            f"(isTaskSyncEnabled was absent from a live CONTACT import's importMetadata on 2026-09-29 while "
+            f"the ACCOUNT import had all five; the UI's replay sent False.)"
+        )
+    # "create new records on, no id mapping" passes only when the import itself already holds exactly
+    # that — isCreateNewRecordsEnabled True and a createNewRecordsIdMapping KEY holding null. An absent
+    # key is not a null: sync_flags={"createNewRecordsIdMapping": None} for a missing key is refused
+    # like any other override that lands on this combination
+    import_already_has_it = (
+        meta.get("isCreateNewRecordsEnabled") is True
+        and "createNewRecordsIdMapping" in meta
+        and meta["createNewRecordsIdMapping"] is None
+    )
+    if flags["isCreateNewRecordsEnabled"] is True and flags["createNewRecordsIdMapping"] is None and not import_already_has_it:
+        raise ValueError(
+            f"{where}: sync_flags would set isCreateNewRecordsEnabled=True with createNewRecordsIdMapping=None "
+            f"on import {import_id!r} (create-new-records enabled without an id mapping); pass both settings, "
+            f"leave the import's own values in place, or send the PATCH yourself with "
+            f"update_salesforce_import_field_mapping()"
+        )
+    return flags
+
+
+def _validate_salesforce_field_mapping(field_mapping: list[dict], *, where: str) -> None:
+    """Every mapping entry must be a dict with a non-empty audienceFieldId and salesforceFieldId.
+    Shared by update_salesforce_import_field_mapping (its own input, where=
+    "update_salesforce_import_field_mapping: field_mapping") and add_salesforce_import_fields
+    (the import's EXISTING entries, checked before anything is written — the PATCH replaces the
+    whole list, so an incomplete pair fails the call rather than being dropped)."""
+    if not isinstance(field_mapping, list):
+        raise ValueError(f"{where} must be a list of mapping entries, got {type(field_mapping).__name__}")
+    for i, m in enumerate(field_mapping):
+        if not isinstance(m, dict):
+            raise ValueError(f"{where}[{i}] is not a mapping entry: {m!r}")
+        for key in ("audienceFieldId", "salesforceFieldId"):
+            if not m.get(key):
+                raise ValueError(f"{where}[{i}] missing {key}: {m!r}")
+
+
+def _salesforce_import_current_mapping(imp: dict, *, where: str) -> list[dict]:
+    """An import's existing pairs: `fieldMapping.fieldMappings` (the shape the GET returns) or a
+    bare list (the shape the PATCH is sent); None -> []. Any other shape is a ValueError, raised
+    before anything is written."""
+    fm = imp.get("fieldMapping")
+    if fm is None:
+        return []
+    if isinstance(fm, list):
+        return list(fm)
+    if isinstance(fm, dict):
+        entries = fm.get("fieldMappings")
+        if entries is None:
+            return []
+        if isinstance(entries, list):
+            return list(entries)
+        raise ValueError(
+            f"{where}: import {imp.get('id')!r} fieldMapping.fieldMappings is not a list "
+            f"({type(entries).__name__})"
+        )
+    raise ValueError(
+        f"{where}: import {imp.get('id')!r} fieldMapping has an unexpected shape ({type(fm).__name__}); "
+        f"expected {{'fieldMappings': [...]}} or a list"
+    )
+
+
+def _salesforce_mapping_signature(entries: list[dict]) -> list[str]:
+    """Order-independent fingerprint of a mapping list, for the drift check between the import
+    read at the start of add_salesforce_import_fields() and the re-read before its PATCH."""
+    return sorted(json.dumps(m, sort_keys=True, default=str) for m in entries)
+
+
+def _dedupe_new_salesforce_fields(new_fields: list[dict]) -> list[dict]:
+    """One spec per salesforceFieldId, first-seen order kept — the endpoints do not dedupe (a
+    repeated id would create a second field and map it twice). Repeats merge: a displayName /
+    dataType that one entry gives and another leaves out (None or "") is not a conflict — the
+    to_create builder treats "" as absent too; two explicit values that disagree are ambiguous
+    and raise. Every entry must be a dict with a non-empty salesforceFieldId; an empty list
+    raises. Network-free, so it runs before any read."""
+    if not isinstance(new_fields, (list, tuple)):
+        raise ValueError(
+            f"add_salesforce_import_fields: new_fields must be a list of {{'salesforceFieldId': ...}} dicts, "
+            f"got {type(new_fields).__name__}"
+        )
+    if not new_fields:
+        raise ValueError("add_salesforce_import_fields: new_fields is empty")
+    merged: dict[str, dict] = {}
+    for i, nf in enumerate(new_fields):
+        if not isinstance(nf, dict) or not nf.get("salesforceFieldId"):
+            raise ValueError(f"add_salesforce_import_fields: new_fields[{i}] missing salesforceFieldId: {nf!r}")
+        sf_id = nf["salesforceFieldId"]
+        spec = merged.setdefault(sf_id, {"salesforceFieldId": sf_id})
+        for key in ("displayName", "dataType"):
+            val = nf.get(key)
+            if val is None or val == "":
+                continue
+            if key in spec and spec[key] != val:
+                raise ValueError(
+                    f"add_salesforce_import_fields: new_fields has conflicting entries for "
+                    f"salesforceFieldId {sf_id!r}: {key} {spec[key]!r} vs {val!r}; give one entry per "
+                    f"Salesforce field"
+                )
+            spec[key] = val
+    return list(merged.values())
+
+
+def _audience_fields_delete_text(entity_type: str, ws_id: int | str | None) -> str:
+    """The only path for removing orphaned Audiences fields, spelled out for error messages:
+    claycast wraps no delete (endpoint never captured), the official CLI does a soft delete."""
+    cli_entity = "companies" if entity_type == "ACCOUNT" else "people"
+    return (
+        f"after confirming 'clay whoami' reports workspace {ws_id}; claycast has no delete wrapper for "
+        f"Audiences fields (endpoint never captured): official CLI clay audiences fields delete <audf_id> "
+        f"--entity-type {cli_entity} (soft, idempotent; run 'clay audiences fields segments <id>' first) "
+        f"or the UI."
+    )
+
 
 class ClayClient:
     def __init__(self, workspace_id: int = None, clay_session: str | None = None):
@@ -2573,7 +3274,7 @@ class ClayClient:
         self,
         segment_id: str,
         *,
-        entity_type: str = "CONTACT",
+        entity_type: str | None = None,
         format: str = "csv",
         limit: int | None = None,
         page_size: int = 300,
@@ -2588,11 +3289,18 @@ class ClayClient:
 
         Uses Clay's audience pagination surface directly, which is the only
         path to export segments larger than the UI's 50K table-export cap.
+
+        Which endpoint is paged (/audiences/accounts or /audiences/contacts) comes from the
+        fetched segment's own `entityType` (one GET first, no credits). `entity_type` is
+        optional; an explicit value that disagrees with the segment raises ValueError after that
+        GET, before any row is fetched or a file written. Before this fix (the PR head) it defaulted
+        to CONTACT, so an ACCOUNT segment exported without it silently paged the contacts endpoint.
         """
-        entity_type = str(entity_type).upper()
+        if entity_type is not None:
+            entity_type = str(entity_type).upper()
+            if entity_type not in {"CONTACT", "ACCOUNT"}:
+                raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
         fmt = str(format).lower()
-        if entity_type not in {"CONTACT", "ACCOUNT"}:
-            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
         if fmt not in {"csv", "json"}:
             raise ValueError(f"format must be csv or json, got {format!r}")
         if limit is not None:
@@ -2602,10 +3310,12 @@ class ClayClient:
         page_size = int(page_size)
         if page_size < 1 or page_size > 300:
             raise ValueError("page_size must be between 1 and 300 inclusive")
-        if include_custom_objects and entity_type != "CONTACT":
-            raise ValueError("include_custom_objects is CONTACT-only")
 
         ws_id = self._resolve_workspace_id(workspace_id)
+        segment = self.get_audience_segment(segment_id, workspace_id=ws_id)
+        entity_type = _audience_segment_entity("export_audience_segment", "exported", segment_id, segment, entity_type)
+        if include_custom_objects and entity_type != "CONTACT":
+            raise ValueError("include_custom_objects is CONTACT-only")
         endpoint_seg = "contacts" if entity_type == "CONTACT" else "accounts"
         all_rows: list[dict] = []
         offset = 0
@@ -2696,23 +3406,20 @@ class ClayClient:
         self,
         segment_id: str,
         *,
-        entity_type: str = "CONTACT",
+        entity_type: str | None = None,
         workspace_id: int | str | None = None,
     ) -> int:
-        """Count rows in an audience segment without fetching them."""
-        entity_type = str(entity_type).upper()
-        if entity_type not in {"CONTACT", "ACCOUNT"}:
-            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
-        ws_id = self._resolve_workspace_id(workspace_id)
-        body = {
-            "entityType": entity_type,
-            "segmentId": segment_id,
-            "isArchived": False,
-            "shouldInjectDraftFilter": True,
-            "segmentType": None,
-        }
-        res = self.post(f"/workspaces/{ws_id}/audiences/count", body)
-        return int(res.get("count", 0))
+        """Count rows in an audience segment without fetching them.
+
+        Fixed 2026-09-30: `segmentId` alone does not apply the segment's filter — Clay's count
+        endpoint expects the filter in `filters` (the UI keeps it client-side), so the old body
+        returned the size of the whole entity. Now delegates to count_audience_records(), which
+        fetches the saved `filterAst` and sends both. `entity_type` is optional and defaults to
+        the segment's own entityType (an explicit value that disagrees raises ValueError); before
+        this fix (the PR head) it defaulted to CONTACT, so an ACCOUNT segment counted without it
+        was sent as CONTACT.
+        """
+        return self.count_audience_records(entity_type, segment_id=segment_id, workspace_id=workspace_id)
 
     def list_audience_segments(
         self,
@@ -2730,6 +3437,717 @@ class ClayClient:
             params={"entityType": entity_type},
         )
         return res.get("segments", res) if isinstance(res, dict) else res
+
+    # ── Audiences: Salesforce import field mapping ───────────────────────────
+    # Captured live with clay_browser.py on 2026-09-29 while adding one field in the
+    # Audiences > Salesforce sync settings UI. The UI does two calls: POST /audiences/field
+    # (bulk-creates the Audiences field definitions) and PATCH /audiences/salesforce-imports
+    # (REPLACES the import's whole field mapping). Neither spends credits; both are
+    # workspace-config writes. There is no official CLI/API surface for this mapping.
+
+    # Salesforce field `type` (from /imports/salesforce-fields/{object}) -> Audiences dataType.
+    _SF_TO_AUDIENCE_DATA_TYPE = {
+        "boolean": "boolean",
+        "date": "date",
+        "datetime": "date",
+        "double": "number",
+        "int": "number",
+        "currency": "number",
+        "percent": "number",
+        "email": "email",
+        "url": "url",
+    }
+
+    def list_audience_imports(
+        self,
+        *,
+        entity_type: str | None = None,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """List the Audiences imports (Salesforce object syncs, CPJ imports, …).
+
+        GET /workspaces/{ws}/audiences/imports[?entityType=ACCOUNT|CONTACT]. Each item
+        carries `id` (audimp_…), `entityType`, `displayName`, `importSourceType`
+        (e.g. SALESFORCE), `importSourceSubtype` (the Salesforce object, e.g. `account`),
+        `status`, `importedCount`, `fieldMapping.fieldMappings` (the current mapping)
+        and `importMetadata` (appAccountId `aa_…`, sync flags). Verified live
+        2026-09-29 against workspace 12345: 3 imports, 2 of them Salesforce.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        params = {}
+        if entity_type:
+            entity_type = str(entity_type).upper()
+            if entity_type not in {"CONTACT", "ACCOUNT"}:
+                raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+            params["entityType"] = entity_type
+        res = self.get(f"/workspaces/{ws_id}/audiences/imports", params=params or None)
+        if isinstance(res, dict):
+            return res.get("audienceImports") or res.get("imports") or []
+        return res
+
+    def get_audience_import_sync_status(
+        self,
+        import_id: str,
+        *,
+        source_type: str = "SALESFORCE",
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Sync progress for one external-source import.
+
+        GET /workspaces/{ws}/audiences/imports/external-source-sync-status/{SOURCE}/{import_id}
+        -> {importSyncStatus, importSyncType, lastSyncedTime, numImportRecordsSynced,
+        numImportRecordsTotal, …}. The UI polls this every ~5s after a mapping change.
+        Verified live 2026-09-29.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.get(
+            f"/workspaces/{ws_id}/audiences/imports/external-source-sync-status/"
+            f"{source_type.upper()}/{import_id}"
+        )
+
+    def list_salesforce_import_fields(
+        self,
+        object_name: str,
+        *,
+        auth_account_id: str,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """The Salesforce fields Clay can map for one object on one connection.
+
+        GET /workspaces/{ws}/audiences/imports/salesforce-fields/{object}?authAccountId=aa_…
+        -> {"fields": [{value (API name), label, type, isUpdateable, externalId,
+        isAssociatedObjectField}, …]}. `object_name` is the import's
+        `importSourceSubtype` (`account`, `contact`); `auth_account_id` is
+        `importMetadata.appAccountId`. Verified live 2026-09-29 (842 mappable fields on a
+        large Account object).
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        res = self.get(
+            f"/workspaces/{ws_id}/audiences/imports/salesforce-fields/{object_name}",
+            params={"authAccountId": auth_account_id},
+        )
+        return res.get("fields", res) if isinstance(res, dict) else res
+
+    def create_audience_fields(
+        self,
+        entity_type: str,
+        fields: list[dict],
+        *,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """Bulk-create Audiences field definitions (the "columns" of People / Companies).
+
+        POST /workspaces/{ws}/audiences/field with
+        {"entityType": "ACCOUNT"|"CONTACT", "audienceFields": [{"displayName", "fieldType":
+        "SCALAR", "dataType": "text"|"number"|"boolean"|"date"|"email"|"url"}, …]}
+        -> list of the created fields, each with its `id` (audf_…). Returns an array even
+        for one field. Verified live 2026-09-29. No credits.
+        """
+        entity_type = str(entity_type).upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+        if not fields:
+            return []
+        payload = [
+            {
+                "displayName": f["displayName"],
+                "fieldType": f.get("fieldType", "SCALAR"),
+                "dataType": f.get("dataType", "text"),
+            }
+            for f in fields
+        ]
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.post(
+            f"/workspaces/{ws_id}/audiences/field",
+            {"entityType": entity_type, "audienceFields": payload},
+        )
+
+    def update_salesforce_import_field_mapping(
+        self,
+        import_id: str,
+        field_mapping: list[dict],
+        *,
+        entity_type: str,
+        is_import_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        is_export_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        is_create_new_records_enabled: bool = _REQUIRED_SYNC_FLAG,
+        create_new_records_id_mapping: dict | None = _REQUIRED_SYNC_FLAG,
+        is_task_sync_enabled: bool = _REQUIRED_SYNC_FLAG,
+        sync_flags: dict | None = None,
+        reconcile_opportunity_import_dependencies: bool = True,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """REPLACE a Salesforce import's field mapping (what the UI's Save button sends).
+
+        PATCH /workspaces/{ws}/audiences/salesforce-imports. `field_mapping` is the COMPLETE
+        list — anything you leave out stops syncing — of
+        {"type": "SALESFORCE", "audienceFieldId": "audf_…"|built-in id such as "org_name",
+        "salesforceFieldId": "<API name>", "mappingRule": "NEVER_WRITE"}; every entry is
+        validated (a dict, both ids non-empty) before anything is sent.
+
+        The five sync settings are REQUIRED and have no defaults, because the body REPLACES
+        them on the import: pass `is_import_sync_enabled`, `is_export_sync_enabled`,
+        `is_create_new_records_enabled`, `create_new_records_id_mapping` (a dict or None —
+        None is a real value and must still be passed) and `is_task_sync_enabled` from a fresh
+        list_audience_imports() read of `importMetadata`, or pass them together as
+        `sync_flags={...}` keyed like importMetadata (the shape AudienceFieldsOrphanedError
+        hands back). Omitting them is a TypeError naming the missing kwargs; a boolean flag
+        that is None or a string is a ValueError; giving both forms is a ValueError.
+        `reconcile_opportunity_import_dependencies` is a request option (captured as true),
+        not import state, and keeps its default.
+
+        Shape trap: you send `fieldMapping: [...]`, the response nests it as
+        `fieldMapping.fieldMappings`. The response `status` flips to PENDING and the import
+        backfills the new fields (~11k rows took a few minutes). Prefer
+        add_salesforce_import_fields() unless you need to remove mappings. Verified live
+        2026-09-29. No credits.
+        """
+        where = "update_salesforce_import_field_mapping"
+        given = {
+            "is_import_sync_enabled": is_import_sync_enabled,
+            "is_export_sync_enabled": is_export_sync_enabled,
+            "is_create_new_records_enabled": is_create_new_records_enabled,
+            "create_new_records_id_mapping": create_new_records_id_mapping,
+            "is_task_sync_enabled": is_task_sync_enabled,
+        }
+        omitted = [name for name, val in given.items() if val is _REQUIRED_SYNC_FLAG]
+        if sync_flags is not None:
+            if len(omitted) < len(given):
+                raise ValueError(
+                    f"{where}: pass either sync_flags= or the five sync-flag kwargs ({', '.join(given)}), not both"
+                )
+            flags = _check_salesforce_sync_overrides(sync_flags, where=where)
+            missing = [k for k in _SF_IMPORT_SYNC_KEYS if k not in flags]
+            if missing:
+                raise ValueError(
+                    f"{where}: sync_flags is missing {', '.join(missing)}; it must carry all five settings "
+                    f"({', '.join(_SF_IMPORT_SYNC_KEYS)}) — copy them from the import's importMetadata"
+                )
+            given = {_SF_IMPORT_SYNC_KWARGS[k]: flags[k] for k in _SF_IMPORT_SYNC_KEYS}
+        elif omitted:
+            # Same wording as Python's own error for required keyword-only arguments: the five
+            # have no usable default (a guess would switch a sync on or off) and sync_flags= is
+            # the only alternative to passing them all.
+            if len(omitted) == 1:
+                listing = repr(omitted[0])
+            elif len(omitted) == 2:
+                listing = f"{omitted[0]!r} and {omitted[1]!r}"
+            else:
+                listing = ", ".join(repr(n) for n in omitted[:-1]) + f", and {omitted[-1]!r}"
+            raise TypeError(
+                f"{where}() missing {len(omitted)} required keyword-only argument{'s' if len(omitted) > 1 else ''}: "
+                f"{listing} (pass all five, or sync_flags={{...}} keyed like importMetadata)"
+            )
+        entity_type = str(entity_type).upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
+        for name in (
+            "is_import_sync_enabled",
+            "is_export_sync_enabled",
+            "is_create_new_records_enabled",
+            "is_task_sync_enabled",
+        ):
+            if not isinstance(given[name], bool):
+                raise ValueError(f"{where}: {name} must be True or False, got {given[name]!r}")
+        id_mapping = given["create_new_records_id_mapping"]
+        if id_mapping is not None and not isinstance(id_mapping, dict):
+            raise ValueError(f"{where}: create_new_records_id_mapping must be a dict or None, got {id_mapping!r}")
+        _validate_salesforce_field_mapping(field_mapping, where=f"{where}: field_mapping")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        body = {
+            "audienceImports": [
+                {
+                    "audienceImportId": import_id,
+                    "fieldMapping": [
+                        {
+                            "type": m.get("type", "SALESFORCE"),
+                            "audienceFieldId": m["audienceFieldId"],
+                            "salesforceFieldId": m["salesforceFieldId"],
+                            "mappingRule": m.get("mappingRule", "NEVER_WRITE"),
+                        }
+                        for m in field_mapping
+                    ],
+                    "isImportSyncEnabled": given["is_import_sync_enabled"],
+                    "isExportSyncEnabled": given["is_export_sync_enabled"],
+                    "isCreateNewRecordsEnabled": given["is_create_new_records_enabled"],
+                    "createNewRecordsIdMapping": id_mapping,
+                    "entityType": entity_type,
+                    "isTaskSyncEnabled": given["is_task_sync_enabled"],
+                }
+            ],
+            "reconcileOpportunityImportDependencies": reconcile_opportunity_import_dependencies,
+        }
+        return self.patch(f"/workspaces/{ws_id}/audiences/salesforce-imports", body)
+
+    def _read_salesforce_import_mapping(
+        self, import_id: str, *, workspace_id: int | str | None = None
+    ) -> list[dict] | None:
+        """One GET of the imports list -> the import's current `fieldMapping.fieldMappings`, or
+        None when the import is not there or its mapping is malformed. Network errors propagate.
+        Used by add_salesforce_import_fields() before its PATCH (drift check) and after a failed
+        one (did the REPLACE land?)."""
+        imports = self.list_audience_imports(workspace_id=workspace_id)
+        imp = next((i for i in imports if isinstance(i, dict) and i.get("id") == import_id), None)
+        if imp is None:
+            return None
+        try:
+            entries = _salesforce_import_current_mapping(imp, where="add_salesforce_import_fields")
+            _validate_salesforce_field_mapping(
+                entries, where="add_salesforce_import_fields: re-read mapping entry fieldMappings"
+            )
+        except ValueError:
+            return None
+        return entries
+
+    def add_salesforce_import_fields(
+        self,
+        import_id: str,
+        new_fields: list[dict],
+        *,
+        sync_flags: dict | None = None,
+        dry_run: bool = False,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Map more Salesforce fields into an existing Audiences import — the safe way.
+
+        `new_fields` = [{"salesforceFieldId": "Account_Owner_Manager__c",
+        "displayName": "Account Owner - Manager", "dataType": "text"?}, …]. Returns
+        {"import": <import>, "created_fields": [...], "skipped": [salesforceFieldId, …],
+        "to_create": [{salesforceFieldId, displayName, dataType}, …], "dry_run": bool}.
+
+        Order of operations — everything is validated before the first write, like
+        upsert_records() / bulk_update_records():
+
+        1. Network-free: `new_fields` must be a non-empty list of dicts with a
+           salesforceFieldId; repeats collapse to one field (first-seen order; repeats that
+           disagree on displayName or dataType raise ValueError); `sync_flags`, if given, must
+           be a dict keyed like importMetadata with known keys and well-typed values.
+        2. GET imports: the import must exist, be a Salesforce import, have entityType
+           ACCOUNT/CONTACT, an importSourceSubtype (the Salesforce object) and
+           importMetadata.appAccountId (the connection). Its five sync settings are read from
+           importMetadata and never defaulted: a missing or null one raises ValueError naming
+           it and the exact `sync_flags={...}` remedy, because the mapping PATCH replaces them
+           and a guess could switch a sync on or off. (isTaskSyncEnabled was absent from a live
+           CONTACT import's importMetadata on 2026-09-29 while the ACCOUNT import had all
+           five; the UI's replay sent False.) Every EXISTING mapping entry is validated too — an
+           incomplete pair fails the call instead of being dropped, since the PATCH replaces the
+           whole list.
+        3. GET the field catalog: every new API name must be mappable; an API name already
+           mapped is skipped and reported once in `skipped`; `dataType` is inferred from the
+           Salesforce type when not given (boolean/date/number/email/url, else text) and
+           `displayName` defaults to the Salesforce label. The new fields' displayNames must be
+           distinct — the create response is paired to the request by position and checked by
+           displayName. Nothing to create, or `dry_run=True`: return the plan (`to_create`)
+           with no writes.
+        4. WRITE 1 — create_audience_fields(). The response must be a list of one dict per
+           requested field, in order, each with an id and (when echoed) the requested
+           displayName; otherwise AudienceFieldsOrphanedError with `pairing_verified=False` and
+           `mapping=None`: the fields exist and must not be mapped by position. (A server-side
+           rename of a displayName would trip this check too; the fields still exist.)
+        5. Re-read the import and compare its mapping with the one read in step 2 — one
+           zero-credit GET that closes the GET→PATCH replace race. If it changed underneath,
+           AudienceFieldsOrphanedError with `pairing_verified=True` and `mapping` = the fresh
+           pairs + the new ones; the PATCH is not sent.
+        6. WRITE 2 — the mapping PATCH via update_salesforce_import_field_mapping() with the
+           five settings from step 2. If it raises, AudienceFieldsOrphanedError carries the
+           exact `mapping` to re-send (idempotent: the PATCH is a full REPLACE) plus
+           `mapped_after_failure` from a best-effort re-read. A requests.HTTPError means Clay
+           rejected the request; anything else (connection reset, non-JSON 2xx) means it may
+           have been applied. Either way the message states what the re-read found — mapped
+           (nothing to re-send, do not delete), not mapped, or unknown when the re-read failed
+           — rather than inferring the state from the exception type.
+
+        The two writes are not atomic and claycast has no delete for Audiences fields (the
+        endpoint was never captured): orphans go through the official CLI
+        `clay audiences fields delete <audf_id> --entity-type people|companies` (soft,
+        idempotent) or the UI. Verified live 2026-09-29: two fields added to a 512k-row
+        Account import, backfill started immediately (status PENDING). No credits.
+        """
+        where = "add_salesforce_import_fields"
+        # 1. network-free
+        to_check = _dedupe_new_salesforce_fields(new_fields)
+        overrides = _check_salesforce_sync_overrides(sync_flags, where=where)
+        ws_id = self._resolve_workspace_id(workspace_id)
+
+        # 2. the import
+        imports = self.list_audience_imports(workspace_id=ws_id)
+        imp = next((i for i in imports if isinstance(i, dict) and i.get("id") == import_id), None)
+        if imp is None:
+            raise ValueError(f"{where}: import {import_id!r} not found in workspace {ws_id}")
+        meta = imp.get("importMetadata") or {}
+        if not isinstance(meta, dict):
+            raise ValueError(f"{where}: import {import_id!r} importMetadata is not an object ({type(meta).__name__})")
+        source_type = imp.get("importSourceType") or meta.get("type")
+        if source_type != "SALESFORCE":
+            raise ValueError(
+                f"{where}: import {import_id!r} is not a Salesforce import (importSourceType={source_type!r})"
+            )
+        entity_type = str(imp.get("entityType") or "").upper()
+        if entity_type not in {"CONTACT", "ACCOUNT"}:
+            raise ValueError(
+                f"{where}: import {import_id!r} has entityType {imp.get('entityType')!r}; expected ACCOUNT or CONTACT"
+            )
+        object_name = imp.get("importSourceSubtype")
+        if not object_name:
+            raise ValueError(
+                f"{where}: import {import_id!r} has no importSourceSubtype (the Salesforce object name); "
+                f"cannot load its field catalog"
+            )
+        auth_account_id = meta.get("appAccountId")
+        if not auth_account_id:
+            raise ValueError(
+                f"{where}: import {import_id!r} importMetadata has no appAccountId (the Salesforce connection "
+                f"aa_...); cannot load its field catalog"
+            )
+        flags = _salesforce_import_sync_flags(import_id, meta, overrides, where=where)
+        current = _salesforce_import_current_mapping(imp, where=where)
+        _validate_salesforce_field_mapping(current, where=f"{where}: existing mapping entry fieldMappings")
+        already = {m["salesforceFieldId"] for m in current}
+
+        # 3. the catalog and the plan
+        catalog = {
+            f["value"]: f
+            for f in self.list_salesforce_import_fields(object_name, auth_account_id=auth_account_id, workspace_id=ws_id)
+        }
+        to_create, skipped = [], []
+        for nf in to_check:
+            sf_id = nf["salesforceFieldId"]
+            if sf_id in already:
+                skipped.append(sf_id)
+                continue
+            if sf_id not in catalog:
+                raise ValueError(
+                    f"{where}: {sf_id!r} is not a mappable field on this Salesforce connection "
+                    f"(object {object_name!r}, connection {auth_account_id!r})"
+                )
+            sf_type = catalog[sf_id].get("type", "")
+            to_create.append(
+                {
+                    "salesforceFieldId": sf_id,
+                    "displayName": nf.get("displayName") or catalog[sf_id].get("label") or sf_id,
+                    "dataType": nf.get("dataType") or self._SF_TO_AUDIENCE_DATA_TYPE.get(sf_type, "text"),
+                }
+            )
+        names = [c["displayName"] for c in to_create]
+        shared = sorted({n for n in names if names.count(n) > 1})
+        if shared:
+            owners = ", ".join(c["salesforceFieldId"] for c in to_create if c["displayName"] == shared[0])
+            raise ValueError(
+                f"{where}: two new fields would share displayName {shared[0]!r} ({owners}); give distinct "
+                f"displayName values so the created ids can be paired with the request"
+            )
+        if not to_create or dry_run:
+            return {"import": imp, "created_fields": [], "skipped": skipped, "to_create": to_create, "dry_run": dry_run}
+
+        # 4. first write — create the fields, then prove the response pairs with the request
+        created = self.create_audience_fields(
+            entity_type,
+            [{"displayName": c["displayName"], "dataType": c["dataType"]} for c in to_create],
+            workspace_id=ws_id,
+        )
+        delete_text = _audience_fields_delete_text(entity_type, ws_id)
+        unpaired: dict[str, Any] = dict(
+            import_id=import_id, entity_type=entity_type, workspace_id=ws_id, mapping=None,
+            pairing_verified=False, sync_flags=flags,
+        )
+        unpaired_text = (
+            "The created fields exist unmapped and cannot be paired with the request, so err.mapping is None: "
+            "map them by hand after checking each field's displayName in Audiences > Settings, or delete them "
+            f"{delete_text}"
+        )
+        if not isinstance(created, list) or not all(isinstance(f, dict) for f in created):
+            raise AudienceFieldsOrphanedError(
+                f"{where}: create_audience_fields returned an unexpected shape ({repr(created)[:200]}) on import "
+                f"{import_id!r}; the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=[],
+                **unpaired,
+            )
+        ids = ", ".join(str(f.get("id")) for f in created) or "(no ids returned)"
+        if len(created) != len(to_create):
+            raise AudienceFieldsOrphanedError(
+                f"{where}: expected {len(to_create)} created fields, got {len(created)} ({ids}) on import "
+                f"{import_id!r}; the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=created,
+                **unpaired,
+            )
+        for spec, field in zip(to_create, created):
+            got = field.get("displayName")
+            if not field.get("id"):
+                bad = f"a created field has no id: {field!r}"
+            elif got is None and len(created) > 1:
+                bad = f"the response does not echo displayName, so {len(created)} created ids cannot be paired"
+            elif got is not None and got != spec["displayName"]:
+                bad = f"expected displayName {spec['displayName']!r}, got {got!r} with id {field.get('id')!r}"
+            else:
+                continue
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created fields ({ids}) do not pair with the request ({bad}) on import {import_id!r}; "
+                f"the mapping PATCH was not sent. {unpaired_text}",
+                created_fields=created,
+                **unpaired,
+            )
+        new_pairs = [
+            {
+                "type": "SALESFORCE",
+                "audienceFieldId": field["id"],
+                "salesforceFieldId": spec["salesforceFieldId"],
+                "mappingRule": "NEVER_WRITE",
+            }
+            for spec, field in zip(to_create, created)
+        ]
+        verified: dict[str, Any] = dict(
+            import_id=import_id, entity_type=entity_type, workspace_id=ws_id, created_fields=created,
+            pairing_verified=True, sync_flags=flags,
+        )
+        resend = (
+            "Re-send the mapping (idempotent — the PATCH is a full REPLACE): "
+            "clay.update_salesforce_import_field_mapping(err.import_id, err.mapping, entity_type=err.entity_type, "
+            "**err.sync_flag_kwargs())."
+        )
+
+        # 5. re-read: the PATCH replaces the whole list, so a pair added meanwhile would be dropped
+        try:
+            fresh = self._read_salesforce_import_mapping(import_id, workspace_id=ws_id)
+        except Exception as exc:
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids} on import {import_id!r}, but re-reading the "
+                f"import before the mapping PATCH failed ({type(exc).__name__}: {exc}); the PATCH was not sent. "
+                f"err.mapping is the mapping read at the start plus the new pairs: confirm with list_audience_imports() "
+                f"that the import's fieldMappings still match it, then re-send it. {resend} Delete the fields instead "
+                f"only {delete_text}",
+                mapping=current + new_pairs,
+                **verified,
+            ) from exc
+        if fresh is None:
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids}, but import {import_id!r} was not found (or "
+                f"its mapping is malformed) when re-read before the mapping PATCH; the PATCH was not sent and err.mapping "
+                f"is None. Check the import with list_audience_imports() before mapping or deleting anything; delete "
+                f"only {delete_text}",
+                mapping=None,
+                **verified,
+            )
+        if _salesforce_mapping_signature(fresh) != _salesforce_mapping_signature(current):
+            raise AudienceFieldsOrphanedError(
+                f"{where}: created {len(created)} Audiences field(s) {ids}, but import {import_id!r}'s mapping changed "
+                f"between the first read and the PATCH ({len(current)} -> {len(fresh)} pair(s)); the PATCH was not sent, "
+                f"so the concurrent change is not overwritten. err.mapping is the fresh mapping plus the new pairs. "
+                f"{resend} Delete the fields instead only {delete_text}",
+                mapping=fresh + new_pairs,
+                **verified,
+            )
+        mapping = current + new_pairs
+
+        # 6. second write — the PATCH
+        try:
+            res = self.update_salesforce_import_field_mapping(
+                import_id, mapping, entity_type=entity_type, sync_flags=flags, workspace_id=ws_id
+            )
+        except Exception as exc:
+            import requests as requests_module
+
+            rejected = isinstance(exc, requests_module.HTTPError)
+            try:
+                after = self._read_salesforce_import_mapping(import_id, workspace_id=ws_id)
+            except Exception:
+                after = None
+            mapped_after = None if after is None else all(
+                any(isinstance(m, dict) and m.get("audienceFieldId") == p["audienceFieldId"] for m in after)
+                for p in new_pairs
+            )
+            head = (
+                f"{where}: created {len(created)} Audiences field(s) {ids} on import {import_id!r} but the mapping "
+                f"PATCH failed ({type(exc).__name__}: {exc})"
+            )
+            # The state clause follows the post-failure re-read, not the exception type: a rejected
+            # PATCH whose mapping is nevertheless present (the server applied it, or someone else
+            # mapped the fields meanwhile) must not be described as "NOT mapped"
+            if mapped_after is True:
+                state = (
+                    (": the request was rejected but" if rejected else " after it was sent, but")
+                    + " the mapping is present (the server applied it or someone else mapped the fields) — "
+                    "nothing to re-send, do NOT delete"
+                )
+            elif mapped_after is False:
+                state = (
+                    ": Clay rejected the request, so the fields exist and are NOT mapped" if rejected
+                    else " after it was sent, and the fields exist and are NOT mapped"
+                )
+            elif rejected:
+                state = ": Clay rejected the request, but the outcome is unknown"
+            else:
+                state = " after it was sent, so its outcome is UNKNOWN — the server may have applied the REPLACE"
+            reread = {
+                True: " (a re-read of the import shows the created fields ARE mapped)",
+                False: " (a re-read of the import shows them NOT mapped)",
+                None: " (the import could not be re-read to confirm)",
+            }[mapped_after]
+            if mapped_after is True:
+                advice = " Verify the mapping in Audiences > Settings."
+            elif rejected and mapped_after is False:
+                advice = f" {resend} If you would rather not map them, delete the orphans {delete_text}"
+            else:
+                advice = (
+                    f" {resend} Do not delete the fields unless list_audience_imports() confirms they are unmapped "
+                    f"(soft-deleting fields the import is mapped to is the worst outcome); if it does and you drop "
+                    f"them, do so only {delete_text}"
+                )
+            raise AudienceFieldsOrphanedError(
+                head + state + reread + "." + advice,
+                mapping=mapping,
+                mapped_after_failure=mapped_after,
+                **verified,
+            ) from exc
+        updated = (res.get("audienceImports") or [res])[0] if isinstance(res, dict) else res
+        return {"import": updated, "created_fields": created, "skipped": skipped, "to_create": to_create, "dry_run": False}
+
+    # ── Audiences: segments (saved filters) and ad-hoc counts ────────────────
+    # Captured live with clay_browser.py 2026-09-30 while creating a segment in the UI and
+    # replayed via the SDK (workspace 12345). No credits; workspace-config writes. Build the
+    # filter with the af_* helpers above.
+
+    def get_audience_segment(self, segment_id: str, *, workspace_id: int | str | None = None) -> dict:
+        """GET /workspaces/{ws}/audiences/segments/{id} -> {id, name, description, filterAst,
+        entityType, estimatedSize, ownerId, order, createdAt, updatedAt, deletedAt, ...}.
+        `estimatedSize` is Clay's cached member count. Verified live 2026-09-30."""
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.get(f"/workspaces/{ws_id}/audiences/segments/{segment_id}")
+
+    def create_audience_segment(
+        self,
+        entity_type: str,
+        name: str,
+        filter_ast: dict | None = None,
+        *,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Create a saved segment. POST /workspaces/{ws}/audiences/segments with
+        {"name", "filterAst": <root GroupOp>, "entityType": "ACCOUNT"|"CONTACT"} -> the segment
+        object (see get_audience_segment). An empty filter (the default) matches every record —
+        that is exactly what the UI's "Create segment" button sends. Set a description with
+        update_audience_segment(). Verified live 2026-09-30. No credits.
+        """
+        et = _af_entity(entity_type)
+        ws_id = self._resolve_workspace_id(workspace_id)
+        body = {"name": name, "filterAst": af_root(filter_ast if filter_ast is not None else af_and()), "entityType": et}
+        return self.post(f"/workspaces/{ws_id}/audiences/segments", body)
+
+    def update_audience_segment(
+        self,
+        segment_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        filter_ast: dict | None = None,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Rename, describe or re-filter a saved segment. PUT /workspaces/{ws}/audiences/segments/{id}
+        with a PARTIAL body — only the keys you pass change (the UI's Rename sends just {"name"}).
+        Returns the full segment object. PATCH and DELETE on this URL are 404 (NoMatchingURL).
+        Verified live 2026-09-30 (UI capture for name; SDK for description and filterAst). No credits.
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if filter_ast is not None:
+            body["filterAst"] = af_root(filter_ast)
+        if not body:
+            raise ValueError("pass at least one of name, description, filter_ast")
+        ws_id = self._resolve_workspace_id(workspace_id)
+        r = self.session.put(self._url(f"/workspaces/{ws_id}/audiences/segments/{segment_id}"), json=body)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_audience_segment(self, segment_id: str, *, workspace_id: int | str | None = None) -> dict:
+        """Delete a saved segment (the UI's "Delete segment"). POST
+        /workspaces/{ws}/audiences/segments/{id}/delete -> {"success": true, "segmentId": ...}.
+        Verified live 2026-09-30 (UI capture and SDK). HARD delete: afterwards GET returns 404
+        "Segment not found" and the segment is gone from the list — there is no undo, so confirm
+        before calling it on anything you did not create. (Whether the official CLI's `archive`
+        maps to this or to a soft archive was not verified.) No credits.
+        """
+        ws_id = self._resolve_workspace_id(workspace_id)
+        return self.post(f"/workspaces/{ws_id}/audiences/segments/{segment_id}/delete", {})
+
+    def count_audience_records(
+        self,
+        entity_type: str | None = None,
+        *,
+        filter_ast: dict | None = None,
+        segment_id: str | None = None,
+        archived: bool = False,
+        workspace_id: int | str | None = None,
+    ) -> int:
+        """Server-side count of people/companies matching an ad-hoc filter AST, a saved segment,
+        or (neither) the whole entity. POST /workspaces/{ws}/audiences/count with
+        {"entityType", "isArchived", "shouldInjectDraftFilter": true, "segmentType": null} plus
+        "filters": <AST> or "segmentId" + "filters". This is what the segment editor calls while
+        you edit, so an ad-hoc count equals the segment the same AST would save. Verified live
+        2026-09-30.
+
+        With `segment_id`, `entity_type` is optional: it is read from the fetched segment's own
+        `entityType`, and an explicit value that disagrees raises ValueError after that GET
+        (before the count). A whole-entity or ad-hoc (`filter_ast`) count still requires
+        `entity_type`. Only ACCOUNT and CONTACT segments can be counted here.
+        """
+        if filter_ast is not None and segment_id is not None:
+            raise ValueError("count_audience_records: pass filter_ast or segment_id, not both")
+        if entity_type is None and segment_id is None:
+            raise ValueError("count_audience_records: entity_type is required unless segment_id is given")
+        et = _af_entity(entity_type) if entity_type is not None else None
+        ws_id = self._resolve_workspace_id(workspace_id)
+        if segment_id is not None:
+            # `segmentId` alone does NOT apply the segment's filter — the UI keeps the filter
+            # client-side and sends it as `filters` (verified 2026-09-30: segmentId-only returned the
+            # whole entity). Fetch the saved AST and send both; the same object says which entity
+            # the segment belongs to, so an ACCOUNT segment is no longer counted as CONTACT.
+            segment = self.get_audience_segment(segment_id, workspace_id=ws_id)
+            et = _audience_segment_entity("count_audience_records", "counted", segment_id, segment, et)
+            filter_ast = segment.get("filterAst") or af_and()
+        body = {"entityType": et, "isArchived": archived, "shouldInjectDraftFilter": True, "segmentType": None}
+        if segment_id is not None:
+            body["segmentId"] = segment_id
+        if filter_ast is not None:
+            body["filters"] = af_root(filter_ast)
+        res = self.post(f"/workspaces/{ws_id}/audiences/count", body)
+        return int(res.get("count", 0))
+
+    def count_audience_filter_stages(
+        self,
+        entity_type: str,
+        stages: list[dict],
+        *,
+        workspace_id: int | str | None = None,
+    ) -> list[dict]:
+        """Count a filter one rule at a time: stage k counts And(stages[0..k]). Returns
+        [{"stage": k, "count": n}, ...] — the funnel that shows what each rule removes. Use it
+        before saving a segment so a rule that removes nothing (a value that does not exist, a
+        dead predicate) is caught. Each stage is one count call."""
+        out = []
+        for k in range(len(stages)):
+            out.append({"stage": k + 1, "count": self.count_audience_records(entity_type, filter_ast=af_and(*stages[: k + 1]), workspace_id=workspace_id)})
+        return out
+
+    def verify_audience_filter_complement(
+        self,
+        entity_type: str,
+        exclusion_ast: dict,
+        inclusion_ast: dict,
+        *,
+        workspace_id: int | str | None = None,
+    ) -> dict:
+        """Prove two filters partition the entity: total == excluded + included and nothing is in
+        both. Returns {total, excluded, included, both, neither, exact}. `neither` > 0 with
+        `both` == 0 usually means a field is being back-filled between counts (re-run) or that
+        records lack the related object the rules test (people with no linked company)."""
+        total = self.count_audience_records(entity_type, workspace_id=workspace_id)
+        excluded = self.count_audience_records(entity_type, filter_ast=exclusion_ast, workspace_id=workspace_id)
+        included = self.count_audience_records(entity_type, filter_ast=inclusion_ast, workspace_id=workspace_id)
+        both = self.count_audience_records(entity_type, filter_ast=af_and(exclusion_ast, inclusion_ast), workspace_id=workspace_id)
+        neither = total - excluded - included + both
+        return {"total": total, "excluded": excluded, "included": included, "both": both, "neither": neither, "exact": both == 0 and neither == 0}
 
     def search_export_artifacts(
         self,

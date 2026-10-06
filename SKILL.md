@@ -100,6 +100,8 @@ tables = clay.list_tables()
 | Credit usage / spend reporting | `get_credit_usage`, `get_table_credit_usage`, `get_default_workbook_credit_limit` |
 | Export / Documentation | `export_csv`, `fetch_all_records_full`, `export_rows`, `export_workspace`, `document_table`, `search_export_artifacts` |
 | Audience export (>50K rows) | `list_audience_segments`, `count_audience_segment`, `export_audience_segment` |
+| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields` (validates everything before its first write, `dry_run=True` returns the plan, raises `AudienceFieldsOrphanedError` if the mapping PATCH fails after the fields were created), `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status`. No delete wrapper for Audiences fields — that endpoint was never captured; orphans go through the official CLI `clay audiences fields delete <audf_id> --entity-type people` / `companies` or the UI |
+| Audiences: build, count, save and delete segments (saved filters) | `af_*` filter-AST builder, `create_audience_segment`, `update_audience_segment`, `delete_audience_segment`, `get_audience_segment`, `count_audience_records`, `count_audience_filter_stages`, `verify_audience_filter_complement` |
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
 | Saved Claygent columns | `get_claygent`, `claygent_column_inputs`, `create_claygent_column`, `sync_claygent_column` (re-copy schema + model after a Claygent edit), `verify_claygent_column` (read-only drift check), `unwrap_claygent_output` (static; answers can arrive wrapped in `body`/`parameters`). Clay re-renders the prompt itself on every write; see api-reference "Claygent columns from code" |
@@ -202,13 +204,152 @@ The audience layer is the only ClayCast export path that scales beyond Clay's 50
 ```python
 segments = clay.list_audience_segments(entity_type="CONTACT")
 segment_id = segments[0]["id"]
-artifact = clay.export_audience_segment(segment_id, entity_type="CONTACT", format="csv")
+artifact = clay.export_audience_segment(segment_id, format="csv")  # entity type comes from the segment
 ```
 
 Helpers:
 - `list_audience_segments(entity_type="CONTACT"|"ACCOUNT")` — lists available segments
-- `count_audience_segment(segment_id, ...)` — cheap count before export
-- `export_audience_segment(...)` — writes local CSV/JSON under `<project_root>/tmp/clay-artifacts/`
+- `count_audience_segment(segment_id)` — cheap count before export; the entity type comes from the segment (a wrong `entity_type=` raises)
+- `export_audience_segment(segment_id, ...)` — writes local CSV/JSON under `<project_root>/tmp/clay-artifacts/`; the entity type comes from the segment too (a wrong `entity_type=` raises)
+
+### Audiences: Salesforce sync field mapping
+
+The Clay UI's Audiences → Settings → Salesforce sync → "add field" has no official CLI or API
+equivalent (the `clay` CLI's `audiences fields create` makes an empty field nothing fills).
+ClayCast replays what the UI sends — create the Audiences field(s), then PATCH the import's
+whole mapping — verified live 2026-09-29. The two calls are not atomic, so everything — including
+every EXISTING mapping entry — is validated before the first write, and a PATCH that still fails
+after the fields were created raises `AudienceFieldsOrphanedError` (below) instead of leaving
+unmapped fields behind silently:
+
+```python
+imports = clay.list_audience_imports(entity_type="ACCOUNT")      # find the Salesforce import (audimp_...)
+imp = next(i for i in imports if i["importSourceType"] == "SALESFORCE")
+new = [
+    {"salesforceFieldId": "Account_Owner_Manager__c", "displayName": "Account Owner - Manager"},
+    {"salesforceFieldId": "Account_Owner_Active__c"},   # displayName defaults to the SF label; dataType inferred (boolean)
+]
+plan = clay.add_salesforce_import_fields(imp["id"], new, dry_run=True)   # reads only — no field is created
+plan["to_create"], plan["skipped"]                                # [{"salesforceFieldId", "displayName", "dataType"}], [already mapped]
+res = clay.add_salesforce_import_fields(imp["id"], new)           # the write: create the fields, then PATCH the mapping
+res["created_fields"]                                             # [{"id": "audf_...", "dataType": ..., ...}]
+clay.get_audience_import_sync_status(imp["id"])                   # {"importSyncStatus": ..., "numImportRecordsSynced": ...}
+```
+
+- `add_salesforce_import_fields` checks everything before its first write: the import (found,
+  Salesforce, entityType / Salesforce object / connection present), every EXISTING mapping
+  entry (an incomplete pair fails the call — the PATCH replaces the whole list, so it is never
+  dropped), each new API name against the connection's field catalog
+  (`list_salesforce_import_fields`), one field per Salesforce API name (an API name already
+  mapped is skipped and reported once; repeated entries collapse; entries that disagree on
+  displayName / dataType raise before any request), distinct displayNames for the new fields
+  (the create response is paired with the request by position and checked by displayName), and
+  the five sync settings. `dataType` is inferred from the Salesforce type (boolean / date /
+  number / email / url, else text). It then sends the EXISTING mapping plus the new pairs —
+  because the PATCH replaces the whole list — after one more read of the import that aborts if
+  the mapping changed in between. `dry_run=True` stops after the checks and returns the plan.
+- Sync settings are never defaulted: the PATCH also replaces `isImportSyncEnabled`,
+  `isExportSyncEnabled`, `isCreateNewRecordsEnabled`, `createNewRecordsIdMapping` and
+  `isTaskSyncEnabled`, so `add_salesforce_import_fields` copies all five from `importMetadata`
+  and raises — naming the key and the remedy — when one is missing or null. Supply it with
+  `sync_flags={"isTaskSyncEnabled": False}` (the value the UI's Salesforce sync toggle shows).
+  isTaskSyncEnabled was absent from a live CONTACT import's importMetadata on 2026-09-29 while
+  the ACCOUNT import had all five; the UI's replay sent False.
+- If the mapping PATCH fails after the fields were created, `AudienceFieldsOrphanedError` (a
+  `RuntimeError`) carries `.created_field_ids`, `.mapping`, `.entity_type`, `.sync_flags`,
+  `.pairing_verified` and `.mapped_after_failure`. With `pairing_verified` True and `.mapping`
+  set, re-send the mapping — idempotent, the PATCH is a full REPLACE (`.mapping` is None only
+  when the import could not be found or parsed on the re-read before the PATCH; the message
+  says so — check the import first):
+  `clay.update_salesforce_import_field_mapping(err.import_id, err.mapping, entity_type=err.entity_type, **err.sync_flag_kwargs())`.
+  With it False (the create response could not be paired with the request) `.mapping` is None:
+  map the fields by hand after checking each displayName, or delete them. claycast has no
+  delete wrapper for Audiences fields (endpoint never captured): the official CLI
+  `clay audiences fields delete <audf_id> --entity-type people|companies` (soft, idempotent; run
+  `clay audiences fields segments <id>` first and confirm `clay whoami` shows the same
+  workspace) or the UI. Delete only once a re-read confirms the fields are unmapped — a
+  connection error after the PATCH was sent leaves its outcome unknown, and the error says so.
+- Use `update_salesforce_import_field_mapping(...)` directly only to remove mappings: pass the
+  complete list and all five sync settings — required keyword arguments with no defaults
+  (omitting one is a TypeError), sourced from the import, never guessed:
+
+  ```python
+  imp = next(i for i in clay.list_audience_imports() if i["id"] == import_id)
+  m = imp["importMetadata"]
+  mapping = [p for p in imp["fieldMapping"]["fieldMappings"] if p["salesforceFieldId"] != "Field_To_Drop__c"]
+  clay.update_salesforce_import_field_mapping(
+      import_id, mapping, entity_type=imp["entityType"],
+      is_import_sync_enabled=m["isImportSyncEnabled"], is_export_sync_enabled=m["isExportSyncEnabled"],
+      is_create_new_records_enabled=m["isCreateNewRecordsEnabled"],
+      create_new_records_id_mapping=m["createNewRecordsIdMapping"], is_task_sync_enabled=m["isTaskSyncEnabled"],
+  )
+  # or, equivalently: sync_flags={k: m[k] for k in ("isImportSyncEnabled", "isExportSyncEnabled",
+  #     "isCreateNewRecordsEnabled", "createNewRecordsIdMapping", "isTaskSyncEnabled")}
+  ```
+- No credits; these are workspace-config writes. Endpoint shapes and gotchas:
+  `references/clay-api-reference.md` → "Audiences: Salesforce import field mapping".
+
+### Audiences segments: build filters that mean what they say
+
+Segments are saved filter ASTs. The `af_*` helpers build the exact node shapes the Clay UI
+writes (so code-built segments stay editable in the UI), and the client can count, save, update
+and delete them. Verified live 2026-09-30.
+
+```python
+from clay_client import ClayClient, af_and, af_or, af_field, af_activity, af_owner_in, af_exclusion_pair
+
+clay = ClayClient()
+signal = af_activity("acttyp_<id>", "title", "NotEmpty")               # has any imported CRM activity of this type
+# NotEqual/NotContain also match BLANK cells (verified live 2026-09-29): pin with
+# af_and(af_field(..., "NotEmpty"), rule) when blanks must not be selected.
+status_ok = af_field("ACCOUNT", "audf_<status>", "NotEqual", "Current Client")
+
+# 1. Explore before you save: the funnel shows what each rule removes (a rule that removes
+#    nothing usually names a value that does not exist).
+print(clay.count_audience_filter_stages("ACCOUNT", [signal, status_ok]))
+
+# 2. An exclusion list and its exact complement from ONE rule table.
+excluded, included = af_exclusion_pair("ACCOUNT", [
+    ("audf_<status>", [("Equal", "Current Client"), ("Equal", "Churned Client")]),
+    ("audf_<tier>",   [("Contain", "NOT ICP")]),
+    ("domain",        [("Contain", "mycompany")]),
+])
+print(clay.verify_audience_filter_complement("ACCOUNT", af_or(*excluded), af_and(*included)))  # exact: True
+
+# 3. Save, then describe. Prospecting = has a signal AND NOT excluded.
+seg = clay.create_audience_segment("ACCOUNT", "Prospects with a signal", af_and(signal, *included))
+clay.update_audience_segment(seg["id"], description="signal AND NOT excluded; generated by code on ...")
+print(clay.count_audience_records(segment_id=seg["id"]))  # entity type comes from the segment
+```
+
+Rules that keep segments honest (each cost a real mistake):
+- **Count first, save second.** `count_audience_records(filter_ast=...)` returns exactly what the
+  same AST would hold as a segment.
+- **One activity condition → `af_activity()`** (renders in the UI). Conditions that must describe
+  the *same* activity (type AND date) → `af_activity_same_event()` (a `ColOp`; correct, but the UI
+  shows the row as "deleted field" — tell the user).
+- **Exclusion pairs need exact negations, and blanks are decided per field.** A rule is `(op,)`,
+  `(op, value)` or `(op, value, time_unit)` (or a dict); `af_exclusion_pair()` accepts only
+  Equal/NotEqual, Contain/NotContain, True/False, Empty/NotEmpty, WithinLast/NotWithinLast and
+  WithinNext/NotWithinNext (time rules need `"day"|"week"|"month"` — a unit-less time node is a
+  Clay server error) and raises on `""`/`None`/list values, empty rule lists and unknown
+  operators. A blank cell counts as "not excluded" on both sides unless the field has an
+  `("Empty",)` rule, which excludes it. Blank behaviour: NotEqual/NotContain match blank cells
+  (verified live 2026-09-29), so the excluded side pins such a field under `And(NotEmpty, …)`;
+  for a standalone negative operator outside a pair, pin with `af_and(af_field(..., "NotEmpty"),
+  rule)` when blanks must not be selected. Booleans are the exception: a blank checkbox IS False,
+  so True/False rules are exact without a pin. The nested shapes both sides produce render and
+  edit in the segment editor as ordinary rows and groups (verified 2026-09-30: no "deleted
+  field", editor count = API count, saved filter round-trips intact). Prove every pair with
+  `verify_audience_filter_complement()`: `both` and `neither` must both be 0; `neither` > 0 means
+  an import is back-filling (counts drift — re-run) or records lack the related object (a people
+  segment testing company fields).
+- **Use the values the data actually holds** (`audiences/{accounts|contacts}/columns`, or the
+  official CLI's `fields list-values`). Lookup fields hold IDs, not names.
+- **ID lists go in one `ContainAny`** (`af_owner_in`), not N `Equal` rows.
+- **Never edit a colleague's segment in place** — create your own. `delete_audience_segment` is a
+  hard delete with no undo.
+- No credits are spent by any of these calls.
 
 CSV ordering is deterministic: `name`, `first_name`, `last_name`, `title` first when present, then alphabetical by `field_id`. Optional `include_signals`, `include_activities`, and `include_custom_objects` add per-row N+1 fetches; leave them off unless you really need the extra data.
 
@@ -342,19 +483,21 @@ ClayCast ports every mode of the writer deployed at Datagen UUID `71197300-6fdb-
 
 Playwright-based daemon that runs a visible or headless Chromium with your Clay session cookie injected, and auto-captures every `api.clay.com` request + response to `/tmp/clay-browser/requests.jsonl`. Use it to (a) discover real API shapes when claycast doesn't wrap an endpoint yet, (b) watch live Clay UI behavior against a live workspace, or (c) drive the UI programmatically.
 
+The runtime dir is `/tmp/clay-browser` (`%TEMP%\clay-browser` on Windows; override with `CLAY_BROWSER_DIR`). The control channel is a UNIX socket when `<dir>/server.sock` fits the AF_UNIX limit (103 bytes on macOS, 107 on Linux) and otherwise — always on Windows — a loopback TCP port recorded in `server.port`; `launch` prints a NOTE when it falls back, and the fix is a `CLAY_BROWSER_DIR` of at most 91 bytes (95 on Linux). Every command carries a per-daemon secret the client reads from `server.token` (0600, created before the socket/port is advertised); any other local process that reaches the endpoint gets `unauthorized` — this is what makes the loopback-TCP mode safe on Windows and on POSIX with a long `CLAY_BROWSER_DIR`.
+
 ### Commands
 
 | Command | Purpose |
 |---|---|
 | `launch [--headless]` | Start the daemon (forks in the background), inject session cookie, begin capture |
-| `close` | Graceful shutdown; synchronously unlinks all capture files (`requests.jsonl`, `daemon.log`, `server.{sock,pid}`) before returning |
+| `close` | Graceful shutdown; synchronously unlinks all runtime files (`requests.jsonl`, `daemon.log`, `server.{sock,port,token,pid}`) before returning |
 | `goto <url>` | Navigate the page |
 | `snapshot` | Aria-tree snapshot of the current page |
-| `screenshot [path]` | PNG (default `/tmp/clay-browser/shot.png`) |
+| `screenshot [path]` | PNG (default `<runtime dir>/screenshot.png`) |
 | `click <text> [--role <aria-role>] [--nth N]` | Click by visible text (optionally scoped to role or nth match) |
 | `click_selector <css>` | Click by CSS selector |
 | `fill <text> [--placeholder <str>]` | Type into a text input (targets `[placeholder=]` when provided) |
-| `eval <js>` | Run JS in page context — wrap multi-statement logic in an IIFE `(() => { …; return X; })()` since top-level `return` is a SyntaxError |
+| `eval <js>` | Run JS in page context — wrap multi-statement logic in an IIFE `(() => { …; return X; })()` since top-level `return` is a SyntaxError. Runs with the injected Clay session, i.e. as you, logged in — which is why every command must carry the `server.token` secret and the runtime dir is `0700` |
 | `requests [--filter <substr>] [--last N]` | Dump captured `api.clay.com` traffic (filter by URL substring, tail last N entries) |
 
 ### Action-discovery recipe
@@ -376,7 +519,12 @@ Pull the `inputsBinding` array from the real POST and mirror it in `create_actio
 
 - `fill --placeholder` cannot reliably drive React-controlled token-picker components (e.g. Clay's column picker). For those, inspect concurrent waterfall-preset responses instead.
 - `--headless` means no visible window; the daemon still captures traffic. For manual driving, launch without `--headless`.
-- Capture files have `0600` perms, but still contain your session cookie and scraped PII until `close` removes them. Don't `kill -9` the daemon mid-capture without manually deleting `/tmp/clay-browser/`.
+- Capture files have `0600` perms, but still contain your session cookie and scraped PII until `close` removes them. Don't `kill -9` the daemon mid-capture without manually deleting the runtime dir (`/tmp/clay-browser/` by default).
+- A long `CLAY_BROWSER_DIR` does not break the daemon any more: it switches the control channel to loopback TCP (see the NOTE at launch). Prefer a short dir so the socket stays a UNIX socket.
+- The control channel is authenticated in both modes: the UNIX socket lives in a `0700` dir; in TCP mode the loopback port is reachable by any local process, so access is gated by the `0600` `server.token` file — do not loosen the runtime dir's permissions or copy the token. Pre-auth reads are bounded (a 5 s deadline per connection, 1 MiB line), so a rogue peer — even one dribbling a byte at a time — can stall the daemon for at most 5 s per connection; a flood of idle peers still queues behind that, and the client then reports `Daemon alive (PID n) but … is not accepting connections` — retry, or kill the PID and launch again.
+- Windows: `0600`/`0700` mean nothing there (`os.chmod` only toggles the read-only bit). `server.token`, `server.port` and `requests.jsonl` are private only because `%TEMP%` inherits the per-user NTFS ACL of your profile — do not point `CLAY_BROWSER_DIR` (or `TEMP`) at a shared folder; `launch` warns when the runtime dir is outside `%LOCALAPPDATA%`, `%APPDATA%` and `%USERPROFILE%`.
+- If `server.token` disappears while the daemon runs, `close` cannot authenticate: kill the PID in `server.pid` and delete the runtime dir (the client says exactly that).
+- The client checks that the PID in `server.pid` is alive before it connects, so a stale endpoint does not receive the token unless the daemon's PID has been reused by another process of yours — and the token of a dead daemon authorises nothing. It must therefore be able to signal-probe that PID: a sandbox that denies it, or Windows mixed elevation (daemon launched from an elevated prompt, client from a normal one), reads as `Daemon not running` even though the daemon is up.
 
 ---
 
