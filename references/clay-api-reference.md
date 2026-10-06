@@ -1709,19 +1709,27 @@ and one silently destroys finished answers.
 
 - **Changing any value an AI column's "Only run if" condition reads marks its finished cells out of
   date.** Nothing runs by itself, but the next UI "Run N empty or out-of-date rows" includes them. If
-  the condition now FAILS, the re-run turns the cell into `ERROR_RUN_CONDITION_NOT_MET`, **and the old
-  answer is gone**: formulas that read the column see no value. Measured: clearing a per-row
-  "run this row" switch column on 2 finished rows, then running the column for other rows, destroyed
-  both rows' answers, and they had to be bought again. **Make any run-scope switch one-way**: set it,
-  never clear it.
+  the condition now FAILS, that UI re-run turns the cell into `ERROR_RUN_CONDITION_NOT_MET`, **and the
+  old answer is gone**: formulas that read the column see no value. Measured: clearing a per-row
+  "run this row" switch column on 2 finished rows, then running the column from the UI for other
+  rows, destroyed both rows' answers, and they had to be bought again. Whether an API `run_column`
+  does the same was not measured. **Make any run-scope switch one-way**: set it, never clear it.
+  Turning auto-run back on is a separate trigger: the `AUTO_RUN_ON` backfill re-runs stale auto-run
+  cells across the whole table (see that entry under "View filter/sort write path + replication
+  side-effects"; `useCase "claygent"` columns are UI-run only).
 - **Re-pushing a formula column that an AI column reads (`update_column` on the formula) also marks
   the AI column's cells out of date.** A Copy column re-ran on a row nobody asked for, after a push to
   its input formulas.
 - **Changing the AI column's model** (`update_column` on the `model` binding) did NOT mark finished
   cells out of date.
-- **No signal visible from a formula shows "out of date".** The one reliable check is the count the
-  UI's run menu offers. Read "Run N empty or out-of-date rows" before clicking, and stop if N is larger
-  than intended.
+- **No signal visible from a formula shows "out of date".** In the UI, read the run menu's "Run N
+  empty or out-of-date rows" count before clicking, and stop if N is larger than intended. From code,
+  the formula re-push case has a documented marker: the 2026-08-13 notes on the `AUTO_RUN_ON`
+  backfill (under "View filter/sort write path + replication side-effects") record `isStale: true` +
+  `staleReason` in the cell metadata of armed action columns after an upstream formula edit.
+  `get_record` returns cell metadata unchanged; `fetch_all_records_full` keeps only the full value and
+  `status`, so it does not show the flag. Whether `isStale` is also set after an "Only run if" input
+  change was not checked, so for that case the UI count is the only check measured here.
 - **The non-force menu item honors "Only run if"; "Force run" bypasses it.** So a gate scopes a
   whole-column UI run only when you use the non-force item.
 
