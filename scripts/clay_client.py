@@ -5798,8 +5798,12 @@ class ClayClient:
 
         The ACK ({"runMode": "INDIVIDUAL"}) does NOT guarantee execution
         (verified 2026-07-30):
-        - a column whose `conditionalRunFormulaText` doesn't pass is skipped
-          SILENTLY (blank cell, no status); `force_run=True` bypasses the gate.
+        - a row whose `conditionalRunFormulaText` doesn't pass is handled per
+          action: `http-api-v2` skipped it SILENTLY (blank cell, no status) and
+          `force_run=True` bypassed the gate; SOQL lookups record
+          ERROR_RUN_CONDITION_NOT_MET (2026-09-30); `execute-subroutine` honors
+          the gate even with `force_run=True` (2026-08-06). See
+          clay-api-reference.md "Conditional Execution".
         - `use-ai` columns never executed via this API in testing (0 credits,
           blank cell even with force_run) while lookup columns ran fine — run
           AI columns from the Clay UI. See clay-api-reference.md "AI Columns".

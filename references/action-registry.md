@@ -38,7 +38,9 @@ Generates text/JSON from data already in the table. Cheap, fast, deterministic.
 - **gotchas:**
   - actionKey is `"use-ai"`, NOT `"ai"` — `"ai"` silently drops all inputs
   - For JSON output: use Grok + `answerSchemaType`. Gemini/GPT wrap JSON in code fences.
-  - `answerSchemaType` needs `formulaMap` (not `formulaText`) + `_metadata` input with `"modelSource": "user"`
+  - `answerSchemaType` needs `formulaMap` (not `formulaText`). A `_metadata` input with
+    `modelSource: '"user"'` is needed only for a bring-your-own-key column, not for the schema
+    (corrected 2026-08-06, see the checklist in clay-api-reference.md "Creating a Use AI Column")
   - JSON schemas must be double-encoded: `json.dumps(json.dumps(schema))`
 
 ```python
@@ -468,6 +470,41 @@ clay.create_action_column(rep_table, "SFDC Role (SOQL)",
 
 2. **Sandbox orgs munge emails → exact match returns zero rows.** If the auth-account name contains `test` / `sandbox` / `--` (e.g. `API_Read_Only_acmetest`), it's a sandbox, and Salesforce appends a suffix like `.invalid` or `.<sandboxname>` to every User's `Email`. So `WHERE Email = 'x@co.com'` silently returns "no records found" (a clean run, not an error). Use `WHERE Email LIKE 'x@co.com%'` plus a `Name IN (...)` fallback instead of equality.
 
+3. **At most 1,000 rows per query, truncated SILENTLY** (verified 2026-09-30,
+   `salesforce-lookup-via-soql`). A query the sf CLI answers with 2,000 rows (`LIMIT 2000`, more
+   than 2,000 matching) came back from the Clay action with exactly 1,000, status SUCCESS and no
+   warning. Page it, one SOQL column per page:
+   - page k (k = 1, 2, 3): `... ORDER BY CreatedDate DESC, Id DESC LIMIT 1000 OFFSET <1000*(k-1)>`
+     (page 1 needs no `OFFSET`). `OFFSET 1000` worked through the action; SOQL caps `OFFSET` at
+     2,000, so offset paging reaches at most 3 pages (3,000 rows).
+   - Gate page k on page k-1 being full, e.g. for page 2
+     `!!{{page2_query}} && ((({{page1}} || {})?.records) || []).length >= 1000`. The gate reads the
+     action cell's `records` fine.
+   - **A full last page means the result may still be truncated**, in the same silent way (a result
+     of exactly 3,000 rows fills page 3 too). Flag it in a formula column, e.g.
+     `((({{page3}} || {})?.records) || []).length >= 1000 ? "MAYBE TRUNCATED" : ""`.
+   - Past 3,000 rows, use keyset paging instead of `OFFSET` (not measured through the action):
+     keep the same `ORDER BY ... LIMIT 1000`, and AND page k+1's WHERE with a condition on the last
+     row of page k (`d` = its CreatedDate, unquoted; `x` = its Id):
+     `(CreatedDate < d OR (CreatedDate = d AND Id < 'x'))`.
+
+   The unique `Id` tiebreaker keeps the pages from overlapping or skipping rows that share a
+   timestamp, as long as the matching data does not change between page runs. Each page is a
+   separate cell run: a record created, deleted or newly matching in between shifts the `OFFSET`
+   pages, so a row can repeat or go missing at a page boundary (keyset pages do not shift). The
+   same action inside a Workflow tool node presumably has the same cap (not re-measured there).
+4. **Large results are fine in the ACTION cell:** a 1,000-row page (~204 KB JSON) and two pages
+   (407 KB) arrived whole, and formulas read all of it. This is unlike text and formula cells, which
+   drop anything over 8,192 characters (see clay-api-reference.md, Formula Syntax).
+5. **Account rows gain a `CRMLink` key** (the record's Lightning URL) that Salesforce itself does not
+   return. Strip it before comparing with another source.
+6. **SOQL columns run from the API** (verified 2026-09-30): `run_column(..., force_run=True)`
+   executed all cells within ~20s, unlike `use-ai` Claygent columns. A non-forced `run_column` (no
+   `force_run`) honored the "only run if" gate and recorded `ERROR_RUN_CONDITION_NOT_MET` on the
+   gated rows. That is not universal: an `http-api-v2` column left gated rows blank with no status
+   (the conditional-gate gotcha under LinkedIn Posts; clay-api-reference.md § Conditional
+   Execution). Empty results show `SUCCESS_NO_DATA`.
+
 ### Salesforce: Create Object / Update Object — payload shapes + duplicate rules (verified 2026-08-13)
 
 Write actions against the connected Salesforce org (keys discoverable via
@@ -555,10 +592,13 @@ clay.create_column(t_id, {
 }, view_id=v_id)
 ```
 
-- **conditional-gate gotcha (verified 2026-07-30):** on API-triggered `run_column`, a
-  failing `conditionalRunFormulaText` skips SILENTLY — blank cell, no status — and `!!`
-  gates were observed skipping even when the referenced cell read true. `force_run=True`
-  bypasses the gate; treat it as an auto-run spend-guard, not run-time logic.
+- **conditional-gate gotcha (verified 2026-07-30 on `http-api-v2`):** on API-triggered
+  `run_column`, a failing `conditionalRunFormulaText` skips SILENTLY — blank cell, no status
+  — and `!!` gates were observed skipping even when the referenced cell read true.
+  `force_run=True` bypasses the gate here. Other actions differ: SOQL columns record
+  `ERROR_RUN_CONDITION_NOT_MET` (SOQL gotcha 6), and `execute-subroutine` honors the gate
+  even under `force_run` (clay-api-reference.md § Conditional Execution). Treat the gate as an
+  auto-run spend-guard, not run-time logic.
 - **gate refs are DAG edges (verified 2026-08-06):** a gate referencing a column that
   transitively depends back on the gated column (even only via another column's gate)
   is rejected with `400 "Dag is cyclical"` — gate only on strictly-upstream columns.
@@ -653,8 +693,10 @@ clay.create_action_column(t_id, "Deep Qualify",
     auth_account_id="<gemini-auth-account-id>",
     view_id=v_id)
 # Status when skipped: ERROR_RUN_CONDITION_NOT_MET (normal, 0 credits spent)
-# ⚠ On API-triggered run_column the skip is SILENT instead — blank cell, no status
-#   (verified 2026-07-30); force_run=True bypasses the condition.
+# ⚠ On API-triggered run_column it is action-dependent: http-api-v2 skipped SILENTLY
+#   (blank cell, no status; verified 2026-07-30) and force_run=True bypassed the condition;
+#   SOQL recorded the status; execute-subroutine honored the condition even with
+#   force_run=True. See clay-api-reference.md § Conditional Execution.
 ```
 
 ### Records (CRUD)

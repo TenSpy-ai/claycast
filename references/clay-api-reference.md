@@ -75,7 +75,7 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
   - `top_n=` + `view_id=` (`viewIdTopRecords`)
   - `force_run=`
   - omitted field list = resolve all runnable fields (`action`, `enrichment`, `source`, `waterfall`, `claygent`)
-  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing (claygent-useCase; the plain `"use-ai"` useCase DOES auto-run on arriving rows — see the corrected scheduling-boundary entry in "AI Columns"; its run_column/force-run path is untested) — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
+  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) A column whose `conditionalRunFormulaText` doesn't pass behaves per action: `http-api-v2` rows were skipped with a completely blank cell — no status, no error — and `force_run=True` bypassed the gate; SOQL rows record `ERROR_RUN_CONDITION_NOT_MET` (2026-09-30); `execute-subroutine` honors the gate even with `force_run=True` (2026-08-06). See "Conditional Execution". (b) `use-ai` columns never executed via the API at all in testing (claygent-useCase; the plain `"use-ai"` useCase DOES auto-run on arriving rows — see the corrected scheduling-boundary entry in "AI Columns"; its run_column/force-run path is untested) — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
 - `clay.get_run_status(table_id)` normalizes both `GET /tables/{t}/fieldrun` and `GET /workspaces/{ws}/tables/{t}/fields/runstatus`.
 - `clay.wait_for_runs(...)` is the shared polling / stall-detection surface used to cover the Datagen job-monitor behavior.
 - `clay.rerun_errored_cells(...)` is the SDK recipe for Datagen `rerun_errors`: find the Errored Rows view, inspect which specific cells failed, then re-run only those field+record combinations.
@@ -1442,7 +1442,25 @@ clay.session.patch(
 
 ### Formula Syntax — What Clay Actually Supports
 
-Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key rules:
+Clay formulas are **expression-only JavaScript**: nearly the whole standard library works, but
+statements do not. **Re-measured 2026-09-30** with 22 probe columns (expected values checked in
+Node first, one row, all probes on the same table). **20/22 matched Node exactly:**
+
+- **Arrays:** `.map`, `.filter`, `.reduce`, `.some`, `.every`, `.find`, `.findIndex`, `.includes`,
+  `.indexOf`, and `Array.from({length: 2000}, fn).reduce(...)` over 2,000 items.
+- **Strings:** `.startsWith`, `.endsWith`, `.normalize('NFD')`.
+- **Regex:** `\b` word boundaries, lookahead `(?!...)`, `matchAll`, and a
+  combining-accent range class written with `\u` escapes inside a REGEX literal (allowed there,
+  though `\u` escapes in STRING literals are rejected, see below).
+- **Math:** `Math.round` (2.5 -> 3), `Math.log2`, `Math.min`, `Math.max`, `Math.floor`.
+- **Dates:** `Date.UTC` with month rollover (`Date.UTC(2026, -10, 30)` -> 2025-03-30), `Date.parse`
+  with `+0000`, `Date.now()`.
+- **Objects:** `Object.entries` + `.sort`, `Object.assign`, `Array.from(new Set(...))`.
+- **Functions:** nested arrow IIFEs, which also make parameters usable as local variables.
+
+**The 2 failures are both spread syntax, and both failed SILENTLY (no cell at all):** `{...obj}`
+and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. Some entries in the
+"Does NOT work" list below were written earlier and are corrected there. Key rules:
 
 **Works:**
 - Ternary expressions: `condition ? "yes" : "no"`
@@ -1501,13 +1519,62 @@ Clay formulas use a **limited expression evaluator**, NOT full JavaScript. Key r
   (Evidence: side-by-side columns — statement forms produced no cells, expression forms
   returned SUCCESS.) This refines the older entries: IIFEs as such are fine; it's the
   statement BODY that kills them.
-- `.includes()`, `.indexOf()` — may cause "Error evaluating formula" on some Clay versions
-- `.some()`, `.filter()`, `.map()`, `.find()` — parse error
+- **Spread syntax fails SILENTLY (verified 2026-09-30):** `{...obj}` and `[...iterable]` both
+  produced no cell. Use `Object.assign({}, a, b)` and `Array.from(iterable)`.
+- **`typeof` and `instanceof` fail SILENTLY (verified 2026-09-30):** any formula that contains
+  either keyword produces no cell, even `typeof x` alone. `.constructor` gives FORMULA_ERROR. Type
+  tests that work instead (all probed):
+  - number: `Number.isFinite(x)`;
+  - string: `String(x) === x`;
+  - boolean: `x === true || x === false`;
+  - array: `Array.isArray(x)`;
+  - plain object: `Object(x) === x && !Array.isArray(x)`.
+- **`Intl` is not available** (FORMULA_ERROR). The evaluator runs in **UTC**:
+  `getTimezoneOffset()` is 0, and a date-time with no offset parses as UTC.
+- **`JSON.stringify` sorts object keys alphabetically at every level** (verified 2026-09-30):
+  `JSON.stringify({b:1, a:2})` returns `{"a":2,"b":1}`. `Object.keys`, `Object.entries` and
+  `Object.assign` keep normal insertion order. Never compare stringified JSON as text.
+- **There is no json-typed formula column:** PATCHing a formula with
+  `dataTypeSettings.type: "json"` returns 400 `Data type "json" is not supported for basic fields`.
+  A formula returns text; pass structure as a JSON string and `JSON.parse` it downstream.
 - `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
-- Regex word boundaries `\b` — causes parse error
-- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost
+- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost.
+  To name an intermediate value, pass it into an arrow IIFE: `((x) => x.a + x.b)(JSON.parse(s))`.
+- ~~`.includes()`, `.indexOf()`, `.some()`, `.filter()`, `.map()`, `.find()`, regex `\b`~~: all
+  **WORK** as of 2026-09-30 (probe above). These entries dated from earlier testing; either Clay's
+  evaluator changed or the original failures had another cause, such as a statement body in the
+  same formula.
 
-**Pattern for complex formulas:** Use pure nested ternaries with inline expressions. Repeat the field reference rather than trying to store in a variable:
+**Cell size cap for text and formula cells: 8,192 characters, and a longer value is DROPPED
+SILENTLY** (verified 2026-09-30):
+- A formula RESULT of 8,193+ characters stores nothing. The cell still reports `status: SUCCESS`,
+  with `coercionErrorCode: "SIZE_LIMIT_EXCEED"` in its metadata.
+- **Plain TEXT cells have the same cap:** writing 8,193 / 20k / 100k / 300k characters via the
+  records PATCH stored nothing, with the same code.
+- **A formula reading a dropped cell sees `""`**, so it computes on an empty input and reports
+  SUCCESS. Nothing downstream can tell.
+- Formula TEXT (the source) is not capped this way: a 60,000-character string literal inside a
+  formula evaluated fine.
+- Design rule: keep each formula's output well under 8 KB, split big results across columns, and
+  check any input that could exceed 8 KB before trusting a formula that reads it.
+- **SOQL action cells are not capped this way:** a 1,000-row SOQL result (~204 KB of JSON) arrived
+  whole in its action cell (action-registry.md, SOQL gotcha 4). AI and HTTP action cells were not
+  measured.
+
+**Also verified working 2026-09-30:**
+- values and coercion: `undefined`, `==`/`!=`, `Math.trunc`, `Number(' 72 ')` / `Number('0x40')` /
+  `Number('1e2')`;
+- dates: `new Date('2026-02-30')` rolls over exactly as V8 does (to 2026-03-02), and invalid dates
+  give NaN;
+- syntax: reserved words as object keys (`{class: 1}`), 3-argument `filter` callbacks, reduce with
+  object accumulators, and a regex character class containing `/` (`/[\/?#]/`).
+
+A formula that throws (e.g. `JSON.parse('{')`) shows status ERROR with `staleReason: FORMULA_ERROR`
+(visible, unlike the silent failures above).
+
+**Pattern for complex formulas:** Nested ternaries with inline expressions still work and stay
+readable for short rules. For anything longer, bind values once through an arrow IIFE and use the
+array methods (both verified 2026-09-30) instead of repeating the field reference. The older style:
 
 ```python
 # ✅ CORRECT — pure nested ternary, inline everything
@@ -1594,8 +1661,9 @@ clay.patch(f"/tables/{tid}/fields/{fid}", {
 | Run rejected: "Field runRecords - Required" | Missing runRecords | Always include `"runRecords": {"recordIds": [...]}` or `{"viewId": ...}` |
 | `ERROR_TOO_MANY_RUNS` | Column triggered too many times in short window | Wait ~3 minutes, then retry |
 | http-api-v2 queryString/headers broken (chars 0,1,2,3...) — verified 2026-04-23 | Used `formulaText` with JSON object | Use `formulaMap` with per-key formulas. The cell preview `"Status Code: 200"` can hide this if the target server accepts any GET — verify via `externalContent.fullValue` on the full record endpoint. |
-| Claygent "Unable to parse output schema" | `answerSchemaType` + `_metadata` missing, or `jsonSchema` single-encoded | Add both inputs with `formulaMap`. `jsonSchema` must be double-encoded: `json.dumps(json.dumps(schema))`. `_metadata` must have `modelSource: '"user"'` (inner quotes). |
-| Formula "Error evaluating formula" | Used `.indexOf()`, `.includes()`, `REGEXMATCH()`, or `LOWER()` | Use `/pattern/i.test(String({{f_id}}) \|\| "")` for matching. See Formula Syntax section. |
+| Claygent "Unable to parse output schema" | `answerSchemaType` missing (a column bound to a saved Claygent needs its own copy), or `jsonSchema` single-encoded | Add `answerSchemaType` with `formulaMap`. `jsonSchema` must be double-encoded: `json.dumps(json.dumps(schema))`. `_metadata` is not part of this: add it only for a bring-your-own-key column, with `modelSource: '"user"'` (inner quotes). See "Saved Claygents". |
+| Formula "Error evaluating formula" | Used a spreadsheet function: `REGEXMATCH()`, `REGEXEXTRACT()` or `LOWER()` (not available in Clay) | Use JavaScript: `/pattern/i.test(String({{f_id}}) \|\| "")`, `String({{f_id}}).toLowerCase()`. See Formula Syntax section. |
+| Formula column produces no cell at all (no value, no error status) | A statement body (`try{...}`, a block-bodied arrow), spread syntax (`{...obj}`, `[...xs]`), or `typeof` / `instanceof` anywhere in the formula | Rewrite it as one expression: ternaries, an expression-bodied arrow IIFE, `Object.assign` / `Array.from`, `Number.isFinite` / `Array.isArray`. See Formula Syntax section ("Does NOT work"). |
 | Webhook columns blank despite data in source | Extraction columns are plain text, not formulas | PATCH with `formulaText: "{{source_field}}?.key"`, `formulaType: "text"`, `dataTypeSettings: {"type": "text"}` |
 | 404 "NoMatchingURL" on `/views/{view_id}/records` | Endpoint does not exist | Use 2-step: `/views/{view_id}/records/ids` then `bulk-fetch-records` |
 | `bulk-fetch-records` 400 error | Empty or missing `recordIds` | Always pass a non-empty `recordIds` array |
@@ -1643,14 +1711,23 @@ Add `conditionalRunFormulaText` to `typeSettings` to gate column execution:
 # When condition not met, cell status is ERROR_RUN_CONDITION_NOT_MET
 ```
 
-**API-run skip is SILENT (verified 2026-07-30):** triggering a gated column via
-`run_column` when the condition doesn't pass leaves the cell **completely blank** (`{}` —
-no value, no metadata status; the `ERROR_RUN_CONDITION_NOT_MET` status above was observed
-in other contexts, not on API-triggered runs). Worse, a `!!{{boolean_field}}`-style gate
-was observed skipping even when the referenced gate cell read `true` — evaluation
-semantics are unclear (possibly stale-dependency related). `force_run: true` bypasses the
-conditional and is the reliable manual-activation path; treat `conditionalRunFormulaText`
-as a spend-guard for auto-run mode, not as logic you can depend on during API-driven runs.
+**API-run gate behaviour is action-dependent:** what `run_column` does with a row whose
+condition doesn't pass was measured per action, and the actions disagree:
+- **`http-api-v2` (verified 2026-07-30):** the cell stays **completely blank** (`{}` — no
+  value, no metadata status). Worse, a `!!{{boolean_field}}`-style gate was observed skipping
+  even when the referenced gate cell read `true` — evaluation semantics are unclear (possibly
+  stale-dependency related). `force_run: true` bypassed the conditional. `use-ai` Claygent
+  columns stayed blank too, but those never execute from the API at all (see "Creating a Use
+  AI Column"), so their blank cell says nothing about the gate.
+- **SOQL lookups (verified 2026-09-30):** a non-forced run recorded
+  `ERROR_RUN_CONDITION_NOT_MET` on the gated rows, as in the comment above.
+- **`execute-subroutine` (verified 2026-08-06):** even `force_run=True` honored the gate
+  (`ERROR_RUN_CONDITION_NOT_MET` on gate-failing rows); a non-forced run of this action parks
+  at `QUEUED` (see "Creating a Use AI Column").
+
+So a blank cell after an API run can be a gate skip, and `force_run` is not a universal bypass.
+Treat `conditionalRunFormulaText` as a spend-guard for auto-run mode, not as logic you can
+depend on during API-driven runs; pass only the `record_ids` you mean to run.
 
 **Gate references are dependency-DAG edges (verified 2026-08-06):** PATCHing an action
 column whose `conditionalRunFormulaText` references a formula column that — transitively,
@@ -1705,7 +1782,180 @@ When reading AI column values via `bulk-fetch-records`, the API returns:
 ```json
 {"value": "Response", "metadata": {"isPreview": true, "status": "SUCCESS"}}
 ```
-The actual parsed JSON is stored internally. Formula extractors (`?.key`) CAN access the parsed JSON from AI columns even though the API shows just `"Response"`.
+Formula extractors (`?.key`) CAN access the parsed JSON from AI columns even though the bulk read shows just `"Response"`. **To read the object from code, use the per-record endpoint** (`get_record` / `fetch_all_records_full`): it is at `cells[fid].externalContent.fullValue` (verified 2026-09-30 on Claygent columns with a JSON Schema output). A watcher that counts keys on the bulk read sees 0 keys on every finished cell.
+
+---
+
+## Saved Claygents (`c_…`): output schemas, table columns, workflow pins (verified 2026-09-30)
+
+A **saved Claygent** is a workspace resource (Clay UI: Claygents → edit), separate from any column or
+workflow node that uses it. It holds the prompt, the output format, the model settings and the input
+variables, and it is **versioned**: every save mints a new version. Tables and workflows both reference
+it, but in different ways, and the differences are where things break.
+
+### Read / write the Claygent itself
+
+```python
+path = f"/workspaces/{clay.workspace_id}/claygents/{claygent_id}"
+g = clay.get(path)["claygent"]       # id, name, currentVersionId, currentVersion, publishedAt, ...
+v = g["currentVersion"]              # userPrompt, outputFormat, modelSettings, variables, versionNumber,
+                                     # toolSettings, contextSettings, skills, externalToolIds, isPublished
+
+clay.patch(path, {
+    "userPrompt": prompt,                                   # uses {{variable}} placeholders
+    "outputFormat": {"type": "json", "jsonType": "JSONSchema",
+                     "jsonSchema": json.dumps(schema)},     # ONE json.dumps: a plain JSON string
+    "modelSettings": dict(v["modelSettings"], internetSearchEnabled=False),  # send the whole object back
+})
+# -> a new version; g["currentVersionId"] changes. Read back and compare; do not trust the 200.
+```
+
+- `outputFormat.jsonType` is `"JSONSchema"` or `"Fields"` (the UI's two output modes). On the Claygent
+  the schema is a **single-encoded** JSON string. The column-level copy (below) is a formula literal,
+  i.e. `json.dumps(json.dumps(schema))`. Same schema, two encodings.
+- `modelSettings` observed: `model`, `useCase` (a formula literal, e.g. `'"claygent"'`),
+  `internetSearchEnabled`, `peopleAndCompaniesSearchEnabled`, `peopleAndCompaniesSearchBudget`,
+  `shouldIncludeAllBusinessContext`. Always PATCH the full object back with your change; partial
+  `modelSettings` bodies were not tested.
+- `variables`: `[{name, type: "text", required: true, description}]`, one per `{{name}}` in the prompt.
+- **The UI prompt editor strips anything shaped like an HTML tag on save.** A prompt containing
+  `<external_data source="...">…</external_data>` delimiters or `<placeholder>` text came back with
+  every tag removed after a UI save, and nothing warned about it. Prompts with angle-bracket markup
+  must be written through the API and **not re-saved in the UI**. Duplicating a Claygent in the UI
+  (the copy is saved through the editor) inherits the damage.
+- The UI's **"Generate from prompt"** button on the JSON Schema output writes a plausible schema, but
+  check it before you use it: it produced **camelCase** keys for a prompt whose instructions and
+  downstream code used snake_case, and it wrote descriptions that added rules the prompt did not have.
+
+### Output is capped at 4,096 tokens per generation, and truncation still reports SUCCESS
+
+The `use-ai` action's `maxTokens` parameter reads *"Defaults to 4096, Maximum of 4096"*
+(`clay workflows actions schema` / `list_actions`). It limits one generation, not the cell's total.
+Measured 2026-09-30 on 12 cells (a ~20-key JSON Schema, `claude-opus-5`, ~26k input tokens):
+**all 12 reported `totalOutputTokens: 4096` exactly**, and on 7 of 12 the object was cut short. The
+**last keys in the answer were simply absent**. That happened even though the schema listed them in
+`required` with `additionalProperties: false`, and every one of those cells still said
+`status: SUCCESS`. The schema is a request, not a guarantee.
+
+- **The truncation signal is a missing required key, not `totalOutputTokens == 4096`.** Validate the
+  required keys yourself before you use the object. The token count misleads both ways: 5 of the 12
+  cells above read exactly 4096 and were not cut short, and on tool-using (web-search) Claygents
+  `totalOutputTokens` appears to sum over the agent's steps. Complete `SUCCESS` answers from such
+  Claygents read above 4,096 (verified live 2026-10-06), so a cut-short final answer there need not
+  read 4096 at all.
+- Keep a structured answer well under ~4k output tokens. Put the keys you cannot lose **first** in the
+  prompt's output instructions (the model writes in that order, so the tail is what gets cut). If the
+  answer is genuinely long, split it across two Claygents (a short scoring call and a separate copy
+  call). In the same project a four-key schema returned complete objects where the ~20-key one did not.
+- **Workflow agent nodes appear to drop a truncated answer entirely.** The same Claygent on the same
+  inputs returned `{}` as a workflow agent node, where the table column kept the partial object. This
+  is consistent with the node refusing an object that fails its own schema check, but it has not
+  been proven. If a workflow Claygent returns `{}` on long answers only, suspect the cap before the
+  prompt.
+
+### The cell value mixes your keys with Clay's metadata keys
+
+The object in `externalContent.fullValue` is **your schema's keys plus Clay's own keys, merged at the
+top level**: `reasoning` or `confidence`, `stepsTaken`, `totalInputTokens`, `totalOutputTokens`,
+`timeTakenInSeconds` (a string such as `"44.27"`), `totalCostToAIProvider` (a string such as
+`"$0.23829"`, sometimes with float noise like `"$0.23370999999999997"`) and
+`forcedToFinishEarlyBecauseOfCost`. Strip them before handing the object on. Avoid schema keys with
+those names, because a collision would be ambiguous. (That is inferred, not tested.)
+
+### Binding a table column to a saved Claygent
+
+An AI column that uses a saved Claygent is a `use-ai` column with `useCase '"claygent"'` and three
+Claygent-specific inputs. **It also needs its own copy of the output schema (and the model).** A
+column created through the API with only the Claygent reference exists, looks right, and then
+fails in the UI with **"Unable to parse the output schema for the column"**. After that, clicking
+Run on the column or on any single cell does nothing.
+
+**The `prompt` input is NOT yours to set** (corrected 2026-09-30, after this section first said it
+was). On every column create and update, Clay rebuilds `prompt` server-side from the bound
+Claygent's current prompt, with each `{{variable}}` replaced by its `claygentFieldMapping`
+expression. Measured on throwaway tables: a create that sent a bogus literal prompt stored the
+Claygent's real prompt; an update that changed only the prompt was discarded; an update that changed
+only `claygentId` replaced the whole prompt with the other Claygent's; an update that changed only a
+mapping expression changed the prompt's slot to match. Sending the rendered prompt (below) is harmless
+and matches what the UI sends.
+
+```python
+import json, re
+
+def lit(s):   # a formula string literal; ensure_ascii=False because Clay rejects \uXXXX escapes
+    return json.dumps(s, ensure_ascii=False)
+
+# each Claygent variable -> the formula expression that feeds it (here, one column reference)
+var_expr = {"score_input": "{{" + input_fid + "}}"}
+mapping = {"{{" + name + "}}": "Clay.formatForAIPrompt(" + expr + ")" for name, expr in var_expr.items()}
+
+# prompt = the Claygent's userPrompt with every {{variable}} replaced by its mapping. re.split with a
+# capture group alternates literal text (even indexes) and variable names (odd indexes); a name may
+# contain spaces, dots or colons, and may appear more than once.
+pieces = re.split(r"\{\{(.+?)\}\}", v["userPrompt"])
+prompt = " + ".join(mapping["{{" + p + "}}"] if i % 2 else lit(p)   # KeyError = a variable with no mapping
+                    for i, p in enumerate(pieces) if p)
+
+bindings = {
+    "useCase":   {"formulaText": '"claygent"'},
+    "claygentId": {"formulaText": lit(claygent_id)},
+    "model":     {"formulaText": lit(v["modelSettings"]["model"])},
+    "claygentFieldMapping": {"formulaMap": mapping},                # Claygent var -> expression
+    # REQUIRED even though the Claygent already has it:
+    "answerSchemaType": {"formulaMap": {"type": '"json"', "jsonType": '"JSONSchema"',
+                                        "jsonSchema": lit(v["outputFormat"]["jsonSchema"])}},
+    # Optional: Clay replaces it with its own rendering (see above).
+    "prompt":    {"formulaText": prompt},
+}
+```
+
+- Bind the action's **full** parameter list as elsewhere (unset ones bare): a UI-made Claygent column
+  carries `temperature`, `reasoningLevel`, `reasoningBudget`, `maxTokens`, `maxCostInCents`,
+  `jsonMode`, `systemPrompt`, `tableExamples`, `stopSequence`, `runBudget`, `topP`, `width`,
+  `height`, `aspectRatio`, `referenceImageURL`, `contextDocumentIds`, `mcpSettings`, `_metadata`.
+- **The schema and model copies do not follow the Claygent.** Editing the Claygent later leaves the
+  column's `answerSchemaType` and `model` stale. Re-copy both whenever the Claygent changes, and read
+  them back. That column write also makes Clay re-render the prompt. Whether the stored prompt follows
+  a Claygent edit with no column write at all is untested, so check it on read-back too.
+- **Clay's rendering of `prompt` differs from a hand-built one.** It drops the spaces around `+` and
+  drops a trailing `+ ""` when the text after the variable is empty. A byte-for-byte read-back check
+  therefore always fails. Compare meaning instead: find each literal piece of the Claygent's prompt
+  (as a JSON string literal) in order, and count one `Clay.formatForAIPrompt(` per variable.
+- **Running:** re-confirmed 2026-09-30 that neither `run_column` nor an API flip of the table's
+  `AUTO_RUN_ON` starts a `useCase "claygent"` column. The cells only ran after a click on the column's
+  Run button in the UI. Build the column by API, then have a person click Run, and watch the cells
+  from code (per-record reads, above).
+
+### Workflow agent nodes are PINNED to a Claygent version
+
+A workflow agent node stores `claygentId` **and** `claygentVersionId` on the node record, and repeats
+`claygentVersionId` inside `nodeConfig` (some nodes also carry `claygentId` there). `agentClaygentId`
+is the official CLI's node-edit input for the same id, not a stored key. PATCHing the Claygent mints
+a new version, **and the node keeps running the old one**:
+
+- workflow **runs** use the pinned version;
+- single-node **tests** (`clay workflows nodes test`) use the latest version;
+- so a changed output format passes every node test and fails every real run. Observed:
+  `expected record, received string` after switching a Claygent from Fields to JSON Schema, with
+  `validate` warning `outdated_claygent_version`.
+
+Re-pin by a full-replacement node PATCH (the node PATCH replaces the whole record, see "Node
+updates" in the Terracotta section):
+
+```python
+gpath = f"/workspaces/{ws}/tc-workflows/{wf}/graph"
+rec = next(n for n in clay.get(gpath)["nodes"] if n["id"] == node_id)
+cur = clay.get(f"/workspaces/{ws}/claygents/{claygent_id}")["claygent"]["currentVersionId"]
+body = {k: v for k, v in rec.items() if k not in ("id", "workspaceId", "workflowId", "createdAt", "updatedAt")}
+body["claygentVersionId"] = cur
+body["nodeConfig"] = dict(rec["nodeConfig"], claygentVersionId=cur)
+body["nodeConfig"].pop("outputPreview", None)    # points at the old version's output shape
+clay.patch(f"/workspaces/{ws}/tc-workflows/{wf}/nodes/{node_id}", body)
+# read the graph back: both claygentVersionId fields must equal cur
+```
+
+Do this after **every** Claygent change that a workflow depends on, and re-run `validate` to see
+whether `outdated_claygent_version` clears.
 
 ---
 
@@ -2610,8 +2860,8 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 
 - **HTTP API `queryString` and `headers`** must use `formulaMap`, not `formulaText` — `formulaText` splits the JSON character-by-character. Verified 2026-04-23: a `formulaText` value of `'{"q": hello}'` produced `?0={&1="&2=q&3="&4=:&5= &6=h...` when sent. Cell previews (`"Status Code: 200"`) can mask the bug if the target accepts any GET; inspect `externalContent.fullValue` via `GET /tables/{t}/records/{r}` to verify what Clay actually sent.
 - **Formula columns:** create as `text` first, then PATCH with `formulaText` + `formulaType: "text"`. Creating with the formula in one shot drops it.
-- **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded; `_metadata.modelSource` needs inner quotes: `'"user"'`.
-- **Formula string ops:** `.indexOf()` and `.includes()` are unreliable — use `/pattern/i.test(String({{f_id}}) || "")`.
+- **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded. `_metadata` is a separate input, needed only for bring-your-own-key columns; its `modelSource` needs inner quotes: `'"user"'`.
+- **Formulas that fail silently:** a statement body, spread syntax (`{...obj}`, `[...xs]`), `typeof` or `instanceof` makes the column produce no cell at all, with no error; a text or formula result over 8,192 characters is dropped while the cell still reports SUCCESS; `JSON.stringify` sorts object keys. (`.indexOf()` and `.includes()` work, re-measured 2026-09-30.) Details and workarounds: "Formula Syntax — What Clay Actually Supports".
 - **Lookup columns** use a `fields|` prefix on filter inputs: `fields|targetColumn`, `fields|filterOperator`, `fields|rowValue`. Extractor mechanics (verified 2026-07-24): the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works in the formula engine (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect. Lookup execution is 0 credits. Details: action-registry.md → lookup-row-in-other-table.
 - **Webhook source tables** need formula extractors — incoming columns are not auto-populated; PATCH each downstream column with `formulaText` + `formulaType`.
 
