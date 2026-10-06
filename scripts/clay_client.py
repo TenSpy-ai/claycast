@@ -6608,8 +6608,10 @@ class ClayClient:
         that, the object holding the most of them (the top level wins a tie);
         else {}. Clay's metadata keys are removed from the result unless you
         asked for them in `keys`. A partial result is returned as it is: check
-        the keys you need, and truncation (`totalOutputTokens == 4096`) on the
-        raw value or by asking for that key. Also accepts a JSON string.
+        that every required key is present (a missing required key is the
+        truncation signal, not totalOutputTokens == 4096; see clay-api-reference
+        "Saved Claygents"). Ask for totalOutputTokens in `keys` to keep it.
+        Also accepts a JSON string.
         """
         if isinstance(value, str):
             try:

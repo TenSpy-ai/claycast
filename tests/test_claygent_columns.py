@@ -1233,9 +1233,12 @@ def test_unwrap_real_wrapped_shape():
                                                 "angle": {"name": "a", "reasoning": "nested"}}
 
 
-def test_unwrap_truncated_answer_is_partial_and_flag_can_be_kept():
+def test_unwrap_truncated_answer_is_returned_partial():
+    # A cut-short answer comes back as it is: the missing required keys are what tells the caller
+    # it was truncated. Clay's token count is kept only when it is requested.
     cell = {"score": 1, "reasoning": "clay", **META, "totalOutputTokens": 4096}
-    assert U(cell, ["score", "reason", "summary"]) == {"score": 1}
+    out = U(cell, ["score", "reason", "summary"])
+    assert out == {"score": 1} and [k for k in ("score", "reason", "summary") if k not in out] == ["reason", "summary"]
     assert U(cell, ["score", "reason", "totalOutputTokens"]) == {"score": 1, "totalOutputTokens": 4096}
 
 

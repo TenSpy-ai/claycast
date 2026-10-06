@@ -1775,8 +1775,12 @@ What each method does, and what was measured behind it:
   saved from the UI was seen storing its Claygent's prompt with exactly such changes. Any other
   difference, including text added to or removed from the Claygent, is reported: the stored prompt
   differs from the Claygent's current prompt, e.g. the Claygent was edited after the column was last
-  written. Run it after anyone opens the column's panel in the UI: opening it can arm "Save", and a
-  save re-writes the column from the UI's state.
+  written. Each slot is matched against the column's own mapping expressions first (read live
+  2026-10-06: on every mapped column compared, each stored slot was one of them, byte for byte), so
+  any `var_map` expression reads back, regex literals included; a slot that is none of them is read
+  up to its closing `)` by bracket matching, which skips string literals but not regex literals.
+  Run it after anyone opens the column's panel in the UI: opening it can arm "Save", and a save
+  re-writes the column from the UI's state.
 - **Any expression works in `var_map`,** not only a column reference. The expression is evaluated at
   run time as the action's input and is not stored in a cell, so it is how to feed an input larger than
   a cell's 8,192-character cap.
@@ -1806,8 +1810,9 @@ What each method does, and what was measured behind it:
      level down, in order. Failing that, the object holding the most of them (the top level wins a
      tie); if none holds any, `{}`.
   3. Clay's metadata keys are removed from the result unless they are in `keys`.
-  4. A partial result is returned as it is: check the keys you need. Check truncation
-     (`totalOutputTokens == 4096`) on the raw value, or ask for `totalOutputTokens` in `keys` to keep it.
+  4. A partial result is returned as it is: check that every required key is present (a missing
+     required key is the truncation signal, not `totalOutputTokens == 4096`; see "Saved Claygents").
+     Ask for `totalOutputTokens` in `keys` to keep it.
   5. A JSON string is parsed first; anything that is not an object gives `{}`.
 
 ---
