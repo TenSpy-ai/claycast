@@ -748,7 +748,7 @@ def test_acl_warning_only_on_windows_outside_profile_roots(short_dir, monkeypatc
 @pytest.mark.skipif(os.name != "nt", reason="8.3 short names exist only on Windows")
 def test_acl_warning_expands_8dot3_short_names(tmp_path, monkeypatch):
     """Windows hands many processes their %TEMP% in 8.3 form (the user segment spelled like
-    JEREMY~1) while %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% carry the long name, so a plain
+    USERNA~1) while %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% carry the long name, so a plain
     prefix test on the two spellings says the DEFAULT runtime dir is outside the profile when it
     is the profile's own Temp. Measured 2026-09-30 on a Windows 11 laptop: every launch printed
     the WARNING under an untouched %TEMP%. Both sides have to be realpath()ed, which expands

@@ -3556,10 +3556,10 @@ class ClayClient:
         imports and get_audience_import_sync_status() for one import's full status (it adds the
         export-side fields). The UI calls it from Settings > Audiences > Sources.
 
-        A JSON null body returns []; a dict whose only key holds the list of rows is unwrapped
-        (never seen live); any other shape raises ValueError naming it, so an error body or a
-        changed shape is never passed off as rows or as "nothing to show". Verified live
-        2026-09-30 (`lastSyncedTime` on every row, the activity import under both entities and
+        A JSON null body returns []; a dict whose only key holds a list of objects is unwrapped
+        (never seen live; an error body of exactly that shape would be unwrapped too); any other
+        shape raises ValueError naming it instead of being passed off as rows or as "nothing to
+        show". Verified live 2026-09-30 (`lastSyncedTime` on every row, the activity import under both entities and
         the external-source-only listing: 2026-10-06).
         """
         entity_type = str(entity_type).upper()
@@ -3839,7 +3839,7 @@ class ClayClient:
         endpoint was never captured): orphans go through the official CLI
         `clay audiences fields delete <audf_id> --entity-type people|companies` (soft,
         idempotent) or the UI. Verified live 2026-09-29: two fields added to a large Account
-        import, backfill started immediately (status PENDING). A backfill is not guaranteed,
+        import; that time the backfill started immediately. A backfill is not guaranteed,
         though: check with get_audience_import_sync_status() and count the new fields'
         non-null values before relying on them (reference: "Import sync state, cadence and the
         backfill caveat"). No credits.
@@ -6387,8 +6387,8 @@ class ClayClient:
             exactly as declared (they may contain spaces, dots or colons). Any
             expression works, not only a column reference: an expression is
             evaluated at run time as the action's input and is NOT stored in a
-            cell, so it is the way to feed an input larger than a cell's
-            8,192-character cap.
+            cell, so it is the way to feed an input larger than a text or
+            formula cell's 8,192-character cap.
         byo_key: True binds `_metadata` = {"modelSource": '"user"'}, the marker of
             a column on your own provider key (pass that connection as
             `auth_account_id` when creating the column). False leaves `_metadata`

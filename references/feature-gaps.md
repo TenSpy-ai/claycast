@@ -176,11 +176,11 @@ GET /v3/credit-reporting/{ws}/creditReportType/{type}
   "entities": [
     {
       "id": "f_<id>",                                     // folder id (or wb_<id> at next level)
-      "entity": {"name": "TRA", "isDeleted": false, "__kind": "folder"},
-      "credits": 15109.5,
-      "actionExecutions": 12266,
+      "entity": {"name": "<folder name>", "isDeleted": false, "__kind": "folder"},
+      "credits": 1520.5,
+      "actionExecutions": 1310,
       "subentities": [
-        {"id": "wb_<id>", "entity": {"name": "JR: Scoring WIP", "__kind": "workbook"}, "credits": ..., "actionExecutions": ..., "subentities": [...]}
+        {"id": "wb_<id>", "entity": {"name": "<workbook name>", "__kind": "workbook"}, "credits": ..., "actionExecutions": ..., "subentities": [...]}
       ]
     }
   ],

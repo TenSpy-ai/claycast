@@ -144,7 +144,7 @@ def _acl_warning():
     under none of them; None otherwise, and None when no root is set (cannot judge).
 
     Both sides go through os.path.realpath, not abspath: Windows hands many processes their %TEMP%
-    in 8.3 form (the user segment spelled like JEREMY~1) while the three profile roots carry the
+    in 8.3 form (the user segment spelled like USERNA~1) while the three profile roots carry the
     long name, and a prefix test on the two spellings flagged the DEFAULT runtime dir as outside
     the profile on every launch (measured 2026-09-30). realpath expands short names on Windows."""
     if not IS_WINDOWS:

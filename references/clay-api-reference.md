@@ -1958,6 +1958,11 @@ those names, because a collision would be ambiguous. (That is inferred, not test
 
 ### Binding a table column to a saved Claygent
 
+**From code, use the methods:** `create_claygent_column`, `sync_claygent_column` and
+`verify_claygent_column` build this binding from the Claygent, re-copy it after a Claygent edit and
+check it (see "Claygent columns from code" below). The dict below shows the Claygent inputs they
+write, for a JSON Schema Claygent; the Fields encoding is listed in that section.
+
 An AI column that uses a saved Claygent is a `use-ai` column with `useCase '"claygent"'` and three
 Claygent-specific inputs. **It also needs its own copy of the output schema (and the model).** A
 column created through the API with only the Claygent reference exists, looks right, and then
@@ -2013,8 +2018,11 @@ bindings = {
   a Claygent edit with no column write at all is untested, so check it on read-back too.
 - **Clay's rendering of `prompt` differs from a hand-built one.** It drops the spaces around `+` and
   drops a trailing `+ ""` when the text after the variable is empty. A byte-for-byte read-back check
-  therefore always fails. Compare meaning instead: find each literal piece of the Claygent's prompt
-  (as a JSON string literal) in order, and count one `Clay.formatForAIPrompt(` per variable.
+  therefore always fails. Compare meaning instead: read the stored prompt as text pieces and
+  `Clay.formatForAIPrompt(...)` slots, and require one slot per `{{variable}}` placeholder in the
+  Claygent's prompt with the same text between them, allowing for the whitespace a UI save re-flows.
+  Finding the Claygent's pieces in order is not enough: it misses text removed from the Claygent.
+  `verify_claygent_column` does the full compare (see "Claygent columns from code").
 - **Running:** re-confirmed 2026-09-30 that neither `run_column` nor an API flip of the table's
   `AUTO_RUN_ON` starts a `useCase "claygent"` column. The cells only ran after a click on the column's
   Run button in the UI. Build the column by API, then have a person click Run, and watch the cells
@@ -2127,7 +2135,7 @@ What each method does, and what was measured behind it:
   re-writes the column from the UI's state.
 - **Any expression works in `var_map`,** not only a column reference. The expression is evaluated at
   run time as the action's input and is not stored in a cell, so it is how to feed an input larger than
-  a cell's 8,192-character cap.
+  a text or formula cell's 8,192-character cap.
 - **All `use-ai` parameters are bound** (from `list_actions()`, unset ones bare). A column missing some
   shows no inputs in the UI.
 - **`byo_key`** (`create_claygent_column`, `claygent_column_inputs`): `True` (the default) binds
@@ -3063,7 +3071,7 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 - **HTTP API `queryString` and `headers`** must use `formulaMap`, not `formulaText` — `formulaText` splits the JSON character-by-character. Verified 2026-04-23: a `formulaText` value of `'{"q": hello}'` produced `?0={&1="&2=q&3="&4=:&5= &6=h...` when sent. Cell previews (`"Status Code: 200"`) can mask the bug if the target accepts any GET; inspect `externalContent.fullValue` via `GET /tables/{t}/records/{r}` to verify what Clay actually sent.
 - **Formula columns:** create as `text` first, then PATCH with `formulaText` + `formulaType: "text"`. Creating with the formula in one shot drops it.
 - **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded. `_metadata` is a separate input, needed only for bring-your-own-key columns; its `modelSource` needs inner quotes: `'"user"'`.
-- **Formulas that fail silently:** a statement body, spread syntax (`{...obj}`, `[...xs]`), `typeof` or `instanceof` makes the column produce no cell at all, with no error; a text or formula result over 8,192 characters is dropped while the cell still reports SUCCESS; `JSON.stringify` sorts object keys. (`.indexOf()` and `.includes()` work, re-measured 2026-09-30.) Details and workarounds: "Formula Syntax — What Clay Actually Supports".
+- **Formulas that fail silently:** a statement body, spread syntax (`{...obj}`, `[...xs]`), `typeof` or `instanceof` makes the column produce no cell at all, with no error; a formula result over 8,192 characters is dropped while the cell still reports SUCCESS (text cells have the same cap); `JSON.stringify` sorts object keys. (`.indexOf()` and `.includes()` work, re-measured 2026-09-30.) Details and workarounds: "Formula Syntax — What Clay Actually Supports".
 - **Lookup columns** use a `fields|` prefix on filter inputs: `fields|targetColumn`, `fields|filterOperator`, `fields|rowValue`. Extractor mechanics (verified 2026-07-24): the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works in the formula engine (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect. Lookup execution is 0 credits. Details: action-registry.md → lookup-row-in-other-table.
 - **Webhook source tables** need formula extractors — incoming columns are not auto-populated; PATCH each downstream column with `formulaText` + `formulaType`.
 
