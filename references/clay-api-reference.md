@@ -1767,11 +1767,12 @@ attention" view. **Delete it** (`delete_records`) once the table is built, or sk
 
 ### Cell size and AI inputs
 
-A cell over 8,192 characters is dropped silently, and that includes a formula cell whose only
-consumer is an AI column's input. The UI marks such a cell "Cell data size exceeds limit (8 kB)" when
-it is shown in a view. To feed an AI column more than 8 KB, put the expression in the Claygent's
-field mapping (`claygentFieldMapping`, or the prompt for a plain `use-ai` column). The mapping is
-evaluated at run time and never stored in a cell.
+A text or formula cell over 8,192 characters is dropped silently (details in "Formula Syntax"), and
+that includes a formula cell whose only consumer is an AI column's input. The UI marks such a cell
+"Cell data size exceeds limit (8 kB)" when it is shown in a view. A SOQL action cell is not capped
+this way (a ~400 KB result arrived whole); AI and HTTP cells were not measured. To feed an AI column
+more than 8 KB, put the expression in the Claygent's field mapping (`claygentFieldMapping`, or the
+prompt for a plain `use-ai` column). The mapping is evaluated at run time and never stored in a cell.
 
 ### UI traps while auditing a table
 
