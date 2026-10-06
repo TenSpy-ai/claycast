@@ -1995,11 +1995,11 @@ existing `fieldMappings` before step 1, re-reads the import between the steps, a
 
 - A Salesforce lookup (e.g. `OwnerId`-style reference fields) arrives as the 18-char record
   ID, not a name — map the companion name/formula field too if a human will read it.
-- Backfill CAN be fast (tens of thousands of rows in the first minute on a ~500k-row import) but
-  it is not guaranteed — see "Import sync state, cadence and the backfill caveat" below. The
-  import's `importedCount` stays 0 and `status` stays PENDING after any mapping PATCH; neither
-  tells you anything. Watch the sync-status endpoint and count non-null values in the new
-  column instead.
+- Backfill CAN start fast (rows were filling within the first minute on a large import), but
+  its speed varies widely and it is not guaranteed — see "Import sync state, cadence and the
+  backfill caveat" below. The import's `importedCount` stays 0 and `status` stays PENDING after
+  any mapping PATCH; neither tells you anything. Watch the sync-status endpoint and count
+  non-null values in the new column instead.
 - Mapping is per import: the CONTACT import is a different `audimp_<id>` with its own list.
 - No credits are spent by any of these calls; they are workspace-config writes.
 - Orphan fields: the two-call write is not atomic. Validate the existing `fieldMappings`
@@ -2031,14 +2031,13 @@ also runs a **full re-import once a week** on every plan; cadence is per workspa
 only through Clay ("contact your Growth Strategist"). The docs also say that adding a mapped
 field backfills it across the records already imported.
 
-**What was measured on a ~500k-company Account import and a ~730k-person Contact import
-(workspace 12345):**
+**What was measured on a large Account import and a larger Contact import (workspace 12345):**
 
 | Event | What happened |
 |---|---|
-| Field added to the Account import (afternoon) | Full backfill started at once, ran ~50k companies/hour, finished in ~10 h — the new column was populated on 100 % of the records that have a value in Salesforce. |
-| 15 fields added to the Contact import ~5 h later | Backfill ran fast (~200k/hour) for ~2 h, then stopped at about 60 % of the records. The remaining records only pick the fields up as they change in Salesforce. |
-| One more field added to the Account import while the first backfill was still running | **No backfill at all.** Only `sync_incremental` runs followed (every 15 min); the column filled on exactly the records modified in Salesforce since the add (~600 of 512k after 2.5 h). |
+| Field added to the Account import (afternoon) | Full backfill started at once and ran for many hours — the new column was populated on 100 % of the records that have a value in Salesforce. |
+| A batch of fields added to the Contact import a few hours later | Backfill ran several times faster for a couple of hours, then stopped at about 60 % of the records. The remaining records only pick the fields up as they change in Salesforce. |
+| One more field added to the Account import while the first backfill was still running | **No backfill at all.** Only `sync_incremental` runs followed; the column filled on exactly the records modified in Salesforce since the add (well under 1 % of the import a couple of hours later). |
 | Re-sending the identical mapping PATCH | Import `status` → PENDING again; next run still `sync_incremental`. |
 | Removing the field's pair and adding it back (two PATCHes) | Same — no full sync. |
 | The UI | No manual trigger anywhere: Settings → Audiences → Sources (⋮ → Settings only), the import's settings page (Import sync toggle, mappings, Save and review), the sync's menu (Rename / Remove), the source's Manage menu (Disconnect). |

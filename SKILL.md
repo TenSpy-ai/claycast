@@ -238,12 +238,13 @@ clay.get_audience_import_history("ACCOUNT")                       # every import
 
 Then **measure the fill before you build on the new field** — the backfill Clay starts when a
 field is added is not guaranteed (a field added while another backfill was running got none;
-another stopped at ~60 %). Incremental syncs (every ~15 min on Enterprise) only touch records
-that changed in Salesforce, so an unfilled field stays unfilled until the weekly full re-import
-or a Clay-triggered one; nothing in the API or the UI forces a `sync_full`. Count non-null
-values with the official CLI (`clay audiences records search-count --query "count from
-companies where <audf_id> is_not_null"`) against Salesforce and poll the sync status for
-`sync_full` (details: reference → "Import sync state, cadence and the backfill caveat").
+another stopped at ~60 %). Incremental syncs (per Clay's docs: every 15 min on Enterprise,
+daily on other paid plans) only touch records that changed in Salesforce, so an unfilled field
+stays unfilled until the weekly full re-import or a Clay-triggered one; nothing in the API or
+the UI forces a `sync_full`. Count non-null values with the official CLI (`clay audiences
+records search-count --query "count from companies where <audf_id> is_not_null"`) against
+Salesforce and poll the sync status for `sync_full` (details: reference → "Import sync state,
+cadence and the backfill caveat").
 
 - `add_salesforce_import_fields` checks everything before its first write: the import (found,
   Salesforce, entityType / Salesforce object / connection present), every EXISTING mapping

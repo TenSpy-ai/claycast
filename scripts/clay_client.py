@@ -3501,10 +3501,11 @@ class ClayClient:
         numExportRecordsTotal}. The UI polls this every ~5 s after a mapping change; Clay's
         server occasionally answers 500 mid-run — retry, do not treat it as a failed sync.
 
-        How to read it (measured 2026-09-30 on a ~500k-company Salesforce import):
-        - `sync_incremental` runs on the plan's cadence (every ~15 min on Enterprise) and only
-          touches records changed in Salesforce since the last run. It does NOT fill a newly
-          mapped field on records that did not change.
+        How to read it (measured 2026-09-30 on a large Salesforce import):
+        - `sync_incremental` runs on the workspace's plan cadence (per Clay's docs: every 15 min
+          on Enterprise, daily on other paid plans) and only touches records changed in
+          Salesforce since the last run. It does NOT fill a newly mapped field on records that
+          did not change.
         - `sync_full` is the weekly full re-import, or the backfill Clay starts when a mapped
           field is added — but that backfill is not guaranteed: a field added while a previous
           backfill was still running never got one, and one backfill stopped at ~60 % of the
@@ -3664,7 +3665,7 @@ class ClayClient:
 
         Shape trap: you send `fieldMapping: [...]`, the response nests it as
         `fieldMapping.fieldMappings`. The response `status` flips to PENDING and the import
-        backfills the new fields (~11k rows took a few minutes). Prefer
+        backfills the new fields (it took a few minutes). Prefer
         add_salesforce_import_fields() unless you need to remove mappings. Verified live
         2026-09-29. No credits.
         """
@@ -3826,8 +3827,8 @@ class ClayClient:
         The two writes are not atomic and claycast has no delete for Audiences fields (the
         endpoint was never captured): orphans go through the official CLI
         `clay audiences fields delete <audf_id> --entity-type people|companies` (soft,
-        idempotent) or the UI. Verified live 2026-09-29: two fields added to a 512k-row
-        Account import, backfill started immediately (status PENDING). No credits.
+        idempotent) or the UI. Verified live 2026-09-29: two fields added to a large Account
+        import, backfill started immediately (status PENDING). No credits.
         """
         where = "add_salesforce_import_fields"
         # 1. network-free
