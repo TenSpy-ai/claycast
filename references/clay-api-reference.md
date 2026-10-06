@@ -1776,6 +1776,100 @@ cell exists that flips when the work is done, gate on that cell instead.
 
 ---
 
+## Table run traps: out-of-date cells, error propagation, error views (verified 2026-09-30)
+
+Measured on a small table with several AI/action columns (Claygents and SOQL lookups) and a long
+formula chain, run from the UI with auto-run OFF. Two of these traps spend money, and one silently
+destroys finished answers.
+
+### "Out of date": what re-arms a finished AI cell
+
+- **Changing any value an AI column's "Only run if" condition reads marks its finished cells out of
+  date.** Nothing runs by itself, but the next UI "Run N empty or out-of-date rows" includes them. If
+  the condition now FAILS, that UI re-run turns the cell into `ERROR_RUN_CONDITION_NOT_MET`, **and the
+  old answer is gone**: formulas that read the column see no value. Measured: clearing a per-row
+  "run this row" switch column on 2 finished rows, then running the column from the UI for other
+  rows, destroyed both rows' answers, and they had to be bought again. Whether an API `run_column`
+  does the same was not measured. **Make any run-scope switch one-way**: set it, never clear it.
+  Turning auto-run back on is a separate trigger: the `AUTO_RUN_ON` backfill re-runs stale auto-run
+  cells across the whole table (see that entry under "View filter/sort write path + replication
+  side-effects"; `useCase "claygent"` columns are UI-run only).
+- **Re-pushing a formula column that an AI column reads (`update_column` on the formula) also marks
+  the AI column's cells out of date.** A Copy column re-ran on a row nobody asked for, after a push to
+  its input formulas.
+- **Changing the AI column's model** (`update_column` on the `model` binding) did NOT mark finished
+  cells out of date.
+- **No signal visible from a formula shows "out of date".** In the UI, read the run menu's "Run N
+  empty or out-of-date rows" count before clicking, and stop if N is larger than intended. From code,
+  the formula re-push case has a documented marker: the 2026-08-13 notes on the `AUTO_RUN_ON`
+  backfill (under "View filter/sort write path + replication side-effects") record `isStale: true` +
+  `staleReason` in the cell metadata of armed action columns after an upstream formula edit.
+  `get_record` returns cell metadata unchanged; `fetch_all_records_full` keeps only the full value and
+  `status`, so it does not show the flag. That marker is not confirmed on AI columns, and `isStale`
+  was not checked after an "Only run if" input change, so for those cases the UI count is the only
+  check measured here.
+- **The non-force menu item honors "Only run if"; "Force run" bypasses it.** So a gate scopes a
+  whole-column UI run only when you use the non-force item.
+
+### Error propagation between formulas
+
+- **A formula that references an ERRORED formula cell errors too**, even when the reference sits
+  inside `Clay.getCellStatus(...)`. A "health" formula that reads a chain of formulas therefore goes
+  blank on exactly the rows it exists to flag. Have it read only action/AI cells, and formulas that
+  cannot error.
+- **`Clay.getCellStatus({{f_formula}})` returns `undefined` for formula cells.** It works for action
+  and AI cells.
+
+### View filters and Clay's own "Errored rows" view
+
+- Filter item types seen in read-backs: `EMPTY`, `NOT_EMPTY`, `HAS_ERROR`, with
+  `combinationMode: "OR"`.
+- **`HAS_ERROR` on a FORMULA column is silently dropped** from a view filter write (the read-back no
+  longer has it). An errored formula cell has no value, so **`EMPTY` matches it**: filter on `EMPTY`
+  of the formula's final output to catch "the chain failed".
+- **The default "Errored rows" view covers action columns only.** Clay keeps it as one `HAS_ERROR`
+  item per action column, OR'd with a placeholder `EMPTY` on `f_created_at`, which never matches. A
+  formula error never appears there: that view was empty on a table whose formula columns showed
+  "This formula could not be..." on a row.
+
+### A new table's defaults
+
+`create_table` (measured on a throwaway table) gives:
+- **one blank row**;
+- a text column `New Column`, plus `Created At` / `Updated At`;
+- six views: `Default view` (= `firstViewId`), `Support view`, `Fully enriched rows`,
+  `Non enrichment columns`, `Errored rows`, `All rows`.
+
+The blank row has no inputs, so every formula chain errors on it, and it shows up in any "needs
+attention" view. **Delete it** (`delete_records`) once the table is built, or skip it in row loops.
+
+### Cell size and AI inputs
+
+A text or formula cell over 8,192 characters is dropped silently (details in "Formula Syntax"), and
+that includes a formula cell whose only consumer is an AI column's input. The UI marks such a cell
+"Cell data size exceeds limit (8 kB)" when it is shown in a view. A SOQL action cell is not capped
+this way (a 1,000-row result of ~204 KB arrived whole; action-registry.md, SOQL gotcha 4); AI and
+HTTP cells were not measured. To feed an AI column more than 8 KB, put the expression in the
+Claygent's field mapping (`claygentFieldMapping`, or the prompt for a plain `use-ai` column). The
+mapping is evaluated at run time and never stored in a cell.
+
+### UI traps while auditing a table
+
+- **Opening an AI column's panel can arm "Save"** (the button is active on open), and switching
+  columns with a panel open raised "Save changes?". Clay re-parses the long mapping expression that it
+  shows as raw code. Never save from an audit. Answer "Don't save", then confirm by an API read-back
+  that the column is unchanged.
+- **"Selected model is deprecated. Please choose a different model."** showed in the panel of columns
+  on `claude-sonnet-4-5` (2026-09-30). Their runs still succeeded (21/21). Moving the model to
+  `claude-opus-5` cleared it.
+- **The colored markers on AI cells are the model's self-reported confidence, not errors**: green dot
+  = high, orange triangle = medium, red square = low (matched against the cells' metadata on 14 cells).
+- **A saved Claygent is renamed by `PATCH /workspaces/{ws}/claygents/{id}` with `{"name": ...}`.** A
+  column is renamed by `update_column(table, field, {"name": ...})`. Neither touches references,
+  which are by id.
+
+---
+
 ## AI Columns — API Read Behavior
 
 When reading AI column values via `bulk-fetch-records`, the API returns:
