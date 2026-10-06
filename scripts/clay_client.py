@@ -6259,6 +6259,462 @@ class ClayClient:
                 ) from e
             raise
 
+    # ── Saved Claygents as table columns ────────────────────────────────────
+    # A saved Claygent (c_...) is a workspace resource with a prompt, an output
+    # format and model settings. A table column that uses it is a `use-ai`
+    # column with useCase "claygent" plus claygentId + claygentFieldMapping, AND
+    # its own copies of the output schema (answerSchemaType) and the model.
+    # Without the schema copy the Clay UI shows "Unable to parse the output
+    # schema for the column" and the column will not run. The schema and model
+    # copies do NOT follow later edits to the Claygent: re-sync after any change.
+    #
+    # The PROMPT is different: Clay rebuilds it server-side on every column
+    # create/update, from the bound Claygent's current prompt with each
+    # {{variable}} replaced by its claygentFieldMapping expression. A prompt
+    # sent in the write is discarded (a bogus literal was replaced; repointing
+    # claygentId alone swapped the whole prompt). We still send the rendered
+    # prompt so the payload matches what the UI sends. Verified live 2026-09-30.
+    #
+    # Only JSON Schema and Fields output formats are copied, in the encodings
+    # UI-made columns carry (read live 2026-10-06). Any other format (text, null,
+    # unknown) is unmeasured: the builders raise and verify reports it.
+
+    USE_AI_PACKAGE_ID = "67ba01e9-1898-4e7d-afe7-7ebe24819a57"
+    # Clay's own keys, merged into a Claygent cell's object next to the answer
+    # (clay-api-reference "Saved Claygents"). unwrap_claygent_output strips them.
+    CLAYGENT_META_KEYS = ("reasoning", "confidence", "stepsTaken", "totalInputTokens",
+                          "totalOutputTokens", "timeTakenInSeconds", "totalCostToAIProvider",
+                          "forcedToFinishEarlyBecauseOfCost")
+    # The inputs claygent_column_inputs derives from the Claygent. sync_claygent_column
+    # rewrites exactly these and keeps every other entry (temperature, _metadata, ...).
+    _CLAYGENT_OWNED_INPUTS = ("useCase", "claygentId", "model", "claygentFieldMapping",
+                              "prompt", "answerSchemaType")
+
+    def get_claygent(self, claygent_id: str) -> dict:
+        """`GET /workspaces/{ws}/claygents/{id}` -> the Claygent, incl.
+        `currentVersion` (userPrompt, outputFormat, modelSettings, variables)."""
+        res = self.get(f"/workspaces/{self.workspace_id}/claygents/{claygent_id}")
+        return res.get("claygent", res)
+
+    def _use_ai_param_names(self) -> list[str]:
+        """Every input the `use-ai` action declares (a column must bind them all,
+        unset ones bare, or the UI shows no inputs)."""
+        cached = getattr(self, "_use_ai_params_cache", None)
+        if cached:
+            return cached
+        act = next((a for a in self.list_actions() if a.get("key") == "use-ai"), None)
+        if not act:
+            raise RuntimeError("use-ai action not found in list_actions()")
+        names = [p["name"] for p in act.get("inputParameterSchema") or []]
+        self._use_ai_params_cache = names
+        return names
+
+    @staticmethod
+    def _claygent_split(user_prompt: str, names) -> list[str]:
+        """A Claygent prompt split on the {{name}} placeholders of `names`, kept as
+        separators: literal text at even indices, placeholders at odd ones. Only
+        the given names count, so a name may hold spaces, dots or colons, and any
+        other {{...}} text stays literal."""
+        if not names:
+            return [user_prompt]
+        alts = sorted({"{{" + n + "}}" for n in names}, key=lambda t: (-len(t), t))
+        return re.split("(" + "|".join(map(re.escape, alts)) + ")", user_prompt)
+
+    @staticmethod
+    def _claygent_prompt_formula(user_prompt: str, var_map: dict[str, str]) -> str:
+        """The Claygent's prompt as a column formula: literal pieces as JS string
+        literals, each {{variable}} named in var_map as
+        Clay.formatForAIPrompt(<its expression>)."""
+        pieces = []
+        for i, part in enumerate(ClayClient._claygent_split(user_prompt, var_map)):
+            if i % 2:
+                pieces.append("Clay.formatForAIPrompt(" + var_map[part[2:-2]] + ")")
+            elif part:
+                # ensure_ascii=False: \\uXXXX escapes in formula string literals are rejected by Clay.
+                pieces.append(json.dumps(part, ensure_ascii=False))
+        return " + ".join(pieces)
+
+    @staticmethod
+    def _claygent_schema_copy(fmt: Any) -> dict:
+        """The column's `answerSchemaType` formulaMap for a Claygent `outputFormat`,
+        encoded the way UI-made columns store it (read live 2026-10-06):
+          JSON Schema: {"type": '"json"', "jsonType": '"JSONSchema"',
+                        "jsonSchema": <the Claygent's schema string, as a string literal>}
+          Fields:      {"type": '"json"', "fields": <the fields as a compact object
+                        literal>, "jsonType": '"Fields"'}
+        Raises ValueError for any other format (text, null, unknown: unmeasured)."""
+        f = fmt if isinstance(fmt, dict) else {}
+        if f.get("type") == "json" and f.get("jsonType") == "JSONSchema" and isinstance(f.get("jsonSchema"), str):
+            return {"type": '"json"', "jsonType": '"JSONSchema"',
+                    "jsonSchema": json.dumps(f["jsonSchema"], ensure_ascii=False)}
+        if f.get("type") == "json" and f.get("jsonType") == "Fields" and isinstance(f.get("fields"), dict):
+            return {"type": '"json"',
+                    "fields": json.dumps(f["fields"], ensure_ascii=False, separators=(",", ":")),
+                    "jsonType": '"Fields"'}
+        if isinstance(fmt, dict):
+            what = f"type={fmt.get('type')!r}, jsonType={fmt.get('jsonType')!r}"
+        else:
+            what = "null" if fmt is None else repr(fmt)[:60]
+        raise ValueError(f"unsupported output format ({what})")
+
+    @staticmethod
+    def _decoded_schema_copy(fm: dict) -> dict | None:
+        """A schema copy with its formula literals decoded (and the JSON Schema
+        decoded once more), for comparing copies; None when it does not decode."""
+        try:
+            out = {k: json.loads(v) for k, v in fm.items()}
+            if "jsonSchema" in out:
+                out["jsonSchema"] = json.loads(out["jsonSchema"])
+            return out
+        except (TypeError, ValueError):  # not a string, not JSON, or a single-encoded schema
+            return None
+
+    @staticmethod
+    def _binding_literal(entry: dict | None) -> Any:
+        """The JSON literal an inputsBinding entry's formulaText holds; None when the
+        entry is missing, bare, or not a JSON literal."""
+        try:
+            return json.loads((entry or {}).get("formulaText") or "null")
+        except (TypeError, ValueError):
+            return None
+
+    def claygent_column_inputs(self, claygent_id: str, var_map: dict[str, str],
+                               *, byo_key: bool = True) -> dict[str, Any]:
+        """The full `use-ai` inputs for a column bound to a saved Claygent.
+
+        var_map: {claygent variable: formula expression}, e.g.
+            {"user_message": "{{f_abc}}"}. Keys are the Claygent's variable names,
+            exactly as declared (they may contain spaces, dots or colons). Any
+            expression works, not only a column reference: an expression is
+            evaluated at run time as the action's input and is NOT stored in a
+            cell, so it is the way to feed an input larger than a cell's
+            8,192-character cap.
+        byo_key: True binds `_metadata` = {"modelSource": '"user"'}, the marker of
+            a column on your own provider key (pass that connection as
+            `auth_account_id` when creating the column). False leaves `_metadata`
+            unset (bare when the action declares it, else absent), as on use-ai
+            columns that run on the workspace key. UI-made Claygent columns were
+            also seen with modelSource `generated`; this method never writes
+            that value.
+
+        The output format is copied for JSON Schema and Fields Claygents only.
+        Any other format (text, null, unknown) raises ValueError, because its
+        column copy has not been measured.
+        """
+        cg = self.get_claygent(claygent_id)
+        v = cg["currentVersion"]
+        names = [x["name"] for x in v.get("variables") or []]
+        if sorted(names) != sorted(var_map):
+            raise ValueError(f"claygent_column_inputs: Claygent {claygent_id} variables {sorted(names)} "
+                             f"!= var_map keys {sorted(var_map)}")
+        try:
+            schema_copy = self._claygent_schema_copy(v.get("outputFormat"))
+        except ValueError as e:
+            raise ValueError(f"claygent_column_inputs: Claygent {claygent_id} has an {e}; only JSON Schema "
+                             f"and Fields output can be copied onto a column") from None
+        inputs: dict[str, Any] = {n: None for n in self._use_ai_param_names()}
+        inputs.update({
+            "useCase": '"claygent"',
+            "claygentId": json.dumps(claygent_id),
+            "model": json.dumps(v["modelSettings"]["model"]),
+            "claygentFieldMapping": {"{{" + k + "}}": "Clay.formatForAIPrompt(" + e + ")" for k, e in var_map.items()},
+            "prompt": self._claygent_prompt_formula(v["userPrompt"], var_map),
+            "answerSchemaType": schema_copy,
+        })
+        if byo_key:
+            inputs["_metadata"] = {"modelSource": '"user"'}
+        return inputs
+
+    def create_claygent_column(self, table_id: str, name: str, claygent_id: str,
+                               var_map: dict[str, str], *, view_id: str = None,
+                               auth_account_id: str = None, condition: str = None,
+                               byo_key: bool = True) -> dict:
+        """Create a table column that runs a saved Claygent, with the schema and
+        model copies Clay requires, then verify it (`verify_claygent_column`).
+
+        Runs only from the Clay UI's Run button: `run_column` ACKs a
+        useCase-"claygent" column but never executes it. `condition` is the
+        "Only run if" formula; a non-force UI Run honors it, "Force run" does not.
+        byo_key: see `claygent_column_inputs`. True (default) binds modelSource
+        "user" (your own provider key: pass `auth_account_id`); False leaves
+        `_metadata` unset. Raises ValueError before writing on a var_map mismatch
+        or an output format other than JSON Schema / Fields, and RuntimeError if
+        the read-back does not match the Claygent (the column is left in place).
+        """
+        inputs = self.claygent_column_inputs(claygent_id, var_map, byo_key=byo_key)
+        col = self.create_action_column(table_id, name, "use-ai", self.USE_AI_PACKAGE_ID, inputs,
+                                        view_id=view_id, auth_account_id=auth_account_id,
+                                        condition=condition, data_type="json")
+        field_id = (col.get("field") or col).get("id")
+        check = self.verify_claygent_column(table_id, field_id)
+        if not check["ok"]:
+            raise RuntimeError(f"Claygent column {field_id} did not match its Claygent: {check['problems']}")
+        return col
+
+    def _claygent_column_settings(self, table_id: str, field_id: str, method: str) -> tuple[dict, dict]:
+        f = next((x for x in self.list_fields(table_id) if x["field_id"] == field_id), None)
+        if f is None:
+            raise ValueError(f"{method}: field {field_id} not found on {table_id}")
+        ts = f.get("type_settings") or {}
+        return ts, {b["name"]: b for b in ts.get("inputsBinding") or []}
+
+    def sync_claygent_column(self, table_id: str, field_id: str,
+                             var_map: dict[str, str] | None = None, *,
+                             condition: str | None = None) -> dict:
+        """Re-copy the Claygent's CURRENT schema and model onto an existing column
+        (do this after any Claygent edit: the column keeps the old copies
+        otherwise; the write also makes Clay re-render the prompt from the
+        Claygent). var_map defaults to the column's existing mapping; condition
+        defaults to the existing "Only run if". Verifies by read-back.
+
+        Rewrites the inputs claygent_column_inputs derives from the Claygent
+        (useCase, claygentId, model, claygentFieldMapping, prompt,
+        answerSchemaType) and adds any the column lacks, e.g. a missing schema
+        copy ("Unable to parse the output schema"). Every other entry is kept as
+        it is, `_metadata` included, so a sync never changes which key the column
+        bills. Inputs the action declares but the column lacks are added bare
+        (never `_metadata`); entries follow create's order. Raises ValueError
+        before writing when the column is not bound to a saved Claygent, its
+        mapping cannot be read back (pass var_map), or the Claygent's output is
+        not JSON Schema / Fields.
+
+        Changing the model this way did NOT mark finished cells out of date
+        (2026-09-30). Changing an input the condition reads DOES (see
+        clay-api-reference.md "Table run traps").
+        """
+        ts, b = self._claygent_column_settings(table_id, field_id, "sync_claygent_column")
+        cid = self._binding_literal(b.get("claygentId"))
+        if not cid or not isinstance(cid, str):
+            raise ValueError(f"sync_claygent_column: field {field_id} is not bound to a saved Claygent")
+        if var_map is None:
+            fm = (b.get("claygentFieldMapping") or {}).get("formulaMap") or {}
+            var_map = {}
+            for k, v in fm.items():
+                m = re.fullmatch(r"\{\{(.+?)\}\}", k)
+                inner = re.fullmatch(r"Clay\.formatForAIPrompt\((.*)\)", v, re.S)
+                if not m or not inner:
+                    raise ValueError(f"sync_claygent_column: cannot read the existing mapping for {k!r}; pass var_map")
+                var_map[m.group(1)] = inner.group(1)
+        # byo_key=False: _metadata is never rewritten here (it is kept as found below).
+        inputs = self.claygent_column_inputs(cid, var_map, byo_key=False)
+        binding = []
+        for name in list(inputs) + [n for n in b if n not in inputs]:
+            if name in self._CLAYGENT_OWNED_INPUTS:
+                val = inputs[name]
+                if isinstance(val, dict):
+                    binding.append({"name": name, "formulaMap": val})
+                elif val:
+                    binding.append({"name": name, "formulaText": val})
+                else:
+                    binding.append({"name": name})
+            elif name in b:
+                binding.append(b[name])
+            elif name != "_metadata":
+                binding.append({"name": name})
+        new_ts = dict(ts, inputsBinding=binding)
+        if condition is not None:
+            new_ts["conditionalRunFormulaText"] = condition
+        self.update_column(table_id, field_id, {"typeSettings": new_ts})
+        check = self.verify_claygent_column(table_id, field_id, var_map=var_map)
+        if not check["ok"]:
+            raise RuntimeError(f"sync did not stick on {field_id}: {check['problems']}")
+        return check
+
+    @staticmethod
+    def _close_paren(s: str, i: int) -> int:
+        """Index of the ')' that closes the '(' at s[i], skipping string literals;
+        -1 when there is none."""
+        depth = 0
+        while i < len(s):
+            ch = s[i]
+            if ch in "\"'`":
+                j = i + 1
+                while j < len(s) and s[j] != ch:
+                    j += 2 if s[j] == "\\" else 1
+                if j >= len(s):
+                    return -1
+                i = j
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    @staticmethod
+    def _prompt_formula_segments(formula: str, slots=()) -> list[str] | None:
+        """A stored prompt formula as the literal text around its
+        Clay.formatForAIPrompt(...) slots: n slots give n + 1 segments (whitespace
+        around `+` is ignored). None when the formula is anything other than
+        `+`-joined JSON string literals and such slots.
+
+        slots: the column's own mapping expressions ('Clay.formatForAIPrompt(<expr>)',
+        what Clay renders into the prompt). A slot is matched against them first,
+        longest first; only a slot that is none of them is read up to its closing
+        ')' by bracket matching, which skips string literals but not regex literals."""
+        slot = "Clay.formatForAIPrompt("
+        known = sorted({s for s in slots if isinstance(s, str) and s.startswith(slot) and s.endswith(")")},
+                       key=len, reverse=True)
+        dec = json.JSONDecoder(strict=False)
+        segs, i, n, operand_next, started = [""], 0, len(formula), True, False
+        while True:
+            while i < n and formula[i].isspace():
+                i += 1
+            if i == n:
+                return None if (operand_next and started) else segs  # a dangling `+` is malformed
+            if not operand_next:
+                if formula[i] != "+":
+                    return None
+                i, operand_next = i + 1, True
+            elif formula[i] == '"':
+                try:
+                    text, i = dec.raw_decode(formula, i)
+                except ValueError:
+                    return None
+                segs[-1] += text
+                operand_next, started = False, True
+            elif formula.startswith(slot, i):
+                hit = next((s for s in known if formula.startswith(s, i)), None)
+                if hit:
+                    i += len(hit)
+                else:
+                    i = ClayClient._close_paren(formula, i + len(slot) - 1)
+                    if i < 0:
+                        return None
+                    i += 1
+                segs.append("")
+                operand_next, started = False, True
+            else:
+                return None
+
+    @staticmethod
+    def _norm_prompt_segments(segs: list[str]) -> list[str]:
+        """Prompt text with the whitespace a UI save re-flows taken out: trailing
+        spaces at line ends, runs of blank lines, and whitespace at either end of
+        the whole prompt."""
+        out = []
+        for s in segs:
+            s = re.sub(r"[ \t]+\n", "\n", s.replace("\r\n", "\n"))
+            out.append(re.sub(r"\n{2,}", "\n", s))
+        out[0] = out[0].lstrip()
+        out[-1] = out[-1].rstrip()
+        return out
+
+    @staticmethod
+    def _claygent_prompt_problems(version: dict, stored_prompt: str, slots=()) -> list[str]:
+        """verify_claygent_column's prompt check: the stored prompt must hold one
+        slot per variable placeholder in the Claygent's prompt and the same text
+        between them, whitespace re-flow aside. slots: see _prompt_formula_segments."""
+        names = [x["name"] for x in version.get("variables") or []]
+        raw = ClayClient._prompt_formula_segments(stored_prompt, slots)
+        if raw is None:
+            return ["stored prompt is not a +-joined list of string literals and Clay.formatForAIPrompt(...) slots"]
+        want = ClayClient._norm_prompt_segments(ClayClient._claygent_split(version.get("userPrompt") or "", names)[::2])
+        have = ClayClient._norm_prompt_segments(raw)
+        problems = []
+        if len(have) == len(want):
+            pairs = list(zip(want, have))
+        else:  # the slot counts differ: compare the text alone, wherever the slots sit
+            w_text, h_text = [t for t in want if t], [t for t in have if t]
+            pad = max(len(w_text), len(h_text))
+            pairs = [] if "".join(w_text) == "".join(h_text) else list(
+                zip(w_text + [""] * (pad - len(w_text)), h_text + [""] * (pad - len(h_text))))
+        diff = next(((w, h) for w, h in pairs if w != h), None)
+        if diff:
+            problems.append(f"stored prompt text differs from the Claygent prompt near: {(diff[0] or diff[1])[:60]!r}")
+        if len(have) != len(want):
+            problems.append(f"stored prompt has {len(have) - 1} variable slot(s), the Claygent prompt has {len(want) - 1}")
+        return problems
+
+    def verify_claygent_column(self, table_id: str, field_id: str,
+                               var_map: dict[str, str] | None = None) -> dict:
+        """READ-ONLY: does the column still say what its Claygent says? Checks
+        - the Claygent binding;
+        - the model;
+        - the schema copy: it must decode to what claygent_column_inputs writes for
+          the Claygent's CURRENT output format (JSON Schema: same schema; Fields:
+          same fields; same type/jsonType markers). Any other format is reported
+          as "schema copy not checked", never passed;
+        - the prompt: read as text pieces and Clay.formatForAIPrompt(...) slots, it
+          must hold exactly one slot per variable placeholder in the Claygent's
+          prompt and the same text between them. Whitespace a UI save re-flows is
+          ignored (spaces around `+`, trailing spaces at line ends, runs of blank
+          lines, either end of the prompt). A mismatch means the stored prompt
+          differs from the Claygent's current prompt, e.g. the Claygent was edited
+          after the column was last written. Slots are matched against the
+          column's own mapping expressions first, so any var_map expression reads
+          back; a slot that is none of them is read by bracket matching, which
+          does not understand regex literals;
+        - the mapping covers exactly the Claygent's variables; with var_map, also
+          each mapping expression.
+        Returns {"ok", "problems", "claygent_id"}. Use after anyone opened the
+        column's panel in the UI: opening it can arm "Save", and saving re-writes
+        Clay's re-parsed copy.
+        """
+        ts, b = self._claygent_column_settings(table_id, field_id, "verify_claygent_column")
+        problems = []
+        cid = self._binding_literal(b.get("claygentId"))
+        if not cid or not isinstance(cid, str):
+            return {"ok": False, "problems": ["column is not bound to a saved Claygent"], "claygent_id": None}
+        v = self.get_claygent(cid)["currentVersion"]
+        if self._binding_literal(b.get("model")) != v["modelSettings"].get("model"):
+            problems.append("model differs from the Claygent's")
+        try:
+            want = self._claygent_schema_copy(v.get("outputFormat"))
+        except ValueError as e:
+            problems.append(f"schema copy not checked: {e}")
+        else:
+            have = self._decoded_schema_copy((b.get("answerSchemaType") or {}).get("formulaMap") or {})
+            if have is None or have != self._decoded_schema_copy(want):
+                problems.append("output schema copy differs from the Claygent's (UI: 'Unable to parse the output schema')")
+        fm = (b.get("claygentFieldMapping") or {}).get("formulaMap") or {}
+        problems += self._claygent_prompt_problems(v, (b.get("prompt") or {}).get("formulaText") or "", fm.values())
+        wanted = {"{{" + x["name"] + "}}" for x in v.get("variables") or []}
+        if set(fm) != wanted:
+            problems.append(f"variable mapping {sorted(fm)} != Claygent variables {sorted(wanted)}")
+        for k, e in (var_map or {}).items():
+            if fm.get("{{" + k + "}}") != "Clay.formatForAIPrompt(" + e + ")":
+                problems.append(f"variable {k!r} is mapped to {fm.get('{{' + k + '}}')!r}, expected {e!r}")
+        return {"ok": not problems, "problems": problems, "claygent_id": cid}
+
+    @staticmethod
+    def unwrap_claygent_output(value: Any, keys: list[str]) -> dict:
+        """A Claygent answer as a new dict holding `keys`. Clay does NOT enforce a
+        JSON Schema's shape: answers sometimes arrive one level down, e.g.
+        {"body": {...}} or {"parameters": {...}}, despite additionalProperties:
+        false (2026-09-30), and Clay merges its own keys (CLAYGENT_META_KEYS:
+        reasoning, confidence, stepsTaken, ...) into the cell's object.
+
+        Decides on the requested keys that are not Clay metadata names (on all
+        of them when every one is), and picks the object holding all of those:
+        the top level first, then each object one level down, in order. Failing
+        that, the object holding the most of them (the top level wins a tie);
+        else {}. Clay's metadata keys are removed from the result unless you
+        asked for them in `keys`. A partial result is returned as it is: check
+        that every required key is present (a missing required key is the
+        truncation signal, not totalOutputTokens == 4096; see clay-api-reference
+        "Saved Claygents"). Ask for totalOutputTokens in `keys` to keep it.
+        Also accepts a JSON string.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return {}
+        if not isinstance(value, dict):
+            return {}
+        meta = ClayClient.CLAYGENT_META_KEYS
+        deciding = [k for k in keys if k not in meta] or list(keys)
+        candidates = [value] + [v for v in value.values() if isinstance(v, dict)]
+        best = next((c for c in candidates if all(k in c for k in deciding)), None)
+        if best is None:
+            best = max(candidates, key=lambda c: sum(k in c for k in deciding))
+            if not any(k in best for k in deciding):
+                return {}
+        return {k: v for k, v in best.items() if k not in meta or k in keys}
+
     def create_formula_column(self, table_id: str, name: str,
                               formula_text: str, view_id: str = None,
                               data_type: str = "text",
