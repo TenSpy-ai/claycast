@@ -100,7 +100,7 @@ tables = clay.list_tables()
 | Credit usage / spend reporting | `get_credit_usage`, `get_table_credit_usage`, `get_default_workbook_credit_limit` |
 | Export / Documentation | `export_csv`, `fetch_all_records_full`, `export_rows`, `export_workspace`, `document_table`, `search_export_artifacts` |
 | Audience export (>50K rows) | `list_audience_segments`, `count_audience_segment`, `export_audience_segment` |
-| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields` (validates everything before its first write, `dry_run=True` returns the plan, raises `AudienceFieldsOrphanedError` if the mapping PATCH fails after the fields were created), `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status`. No delete wrapper for Audiences fields — that endpoint was never captured; orphans go through the official CLI `clay audiences fields delete <audf_id> --entity-type people` / `companies` or the UI |
+| Audiences: map more Salesforce fields into People / Companies | `add_salesforce_import_fields` (validates everything before its first write, `dry_run=True` returns the plan, raises `AudienceFieldsOrphanedError` if the mapping PATCH fails after the fields were created), `list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`, `update_salesforce_import_field_mapping`, `get_audience_import_sync_status` (one import's last run: `importSyncType` `sync_incremental` / `sync_full`, timestamps; finished = `importSyncStatus` `"success"` with a `lastSyncedTime` after your save — the record counts are running totals, not progress or fill), `get_audience_import_history` (current sync state per external-source import; rows can be missing — `[]` does not mean "no imports", `list_audience_imports` is the inventory). A newly mapped field is NOT reliably backfilled — measure the fill before building on it (reference: "Import sync state, cadence and the backfill caveat"). No delete wrapper for Audiences fields — that endpoint was never captured; orphans go through the official CLI `clay audiences fields delete <audf_id> --entity-type people` / `companies` or the UI |
 | Audiences: build, count, save and delete segments (saved filters) | `af_*` filter-AST builder, `create_audience_segment`, `update_audience_segment`, `delete_audience_segment`, `get_audience_segment`, `count_audience_records`, `count_audience_filter_stages`, `verify_audience_filter_complement` |
 | Portable schema | `export_schema`, `import_schema` |
 | AI helpers | `generate_formula`, `search_enrichments` |
@@ -232,8 +232,22 @@ plan = clay.add_salesforce_import_fields(imp["id"], new, dry_run=True)   # reads
 plan["to_create"], plan["skipped"]                                # [{"salesforceFieldId", "displayName", "dataType"}], [already mapped]
 res = clay.add_salesforce_import_fields(imp["id"], new)           # the write: create the fields, then PATCH the mapping
 res["created_fields"]                                             # [{"id": "audf_...", "dataType": ..., ...}]
-clay.get_audience_import_sync_status(imp["id"])                   # {"importSyncStatus": ..., "numImportRecordsSynced": ...}
+clay.get_audience_import_sync_status(imp["id"])                   # last run: {"importSyncType": "sync_incremental"|"sync_full", "importSyncStatus", "lastSyncedTime", ...}
+clay.get_audience_import_history("ACCOUNT")                       # current state per external-source import (object + activity import); rows can be missing — [] is not "no imports"
 ```
+
+Then **measure the fill before you build on the new field** — the backfill Clay starts when a
+field is added is not guaranteed (a field added while another backfill was running got none;
+another stopped at ~60 %). Incremental syncs (per Clay's docs: every 15 min on Enterprise,
+daily on other paid plans) only touch records that changed in Salesforce, so an unfilled field
+stays unfilled until the weekly full re-import or a Clay-triggered one; nothing in the API or
+the UI forces a `sync_full`. Count non-null values with the official CLI (`clay audiences
+records search-count --query "count from companies where <audf_id> is_not_null"`) or
+`clay.count_audience_records("ACCOUNT", filter_ast=af_field("ACCOUNT", "<audf_id>", "NotEmpty"))`
+against Salesforce — that count is the check. The sync status only says which kind of run was
+last (`sync_incremental` / `sync_full`) and whether it finished (`importSyncStatus ==
+"success"` with a `lastSyncedTime` after your save); its record counts are the import's running
+totals, not the fill (details: reference → "Import sync state, cadence and the backfill caveat").
 
 - `add_salesforce_import_fields` checks everything before its first write: the import (found,
   Salesforce, entityType / Salesforce object / connection present), every EXISTING mapping

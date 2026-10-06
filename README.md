@@ -14,7 +14,7 @@ It ships as a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) **sk
 - **Enrichment** — trigger runs and wait for completion (`run_column`, `run_and_wait`).
 - **Export / import** — serialize a table's column structure (the portable **ClayPrint** format) to copy or clone structure across tables; export rows to CSV/JSON; export whole workspaces.
 - **Discovery** — a Playwright-based browser daemon (`clay_browser.py`) that runs Clay with your session cookie and auto-captures every `api.clay.com` request/response, so you can reverse the shape of endpoints ClayCast doesn't wrap yet. Runs on macOS, Linux and Windows.
-- **Audiences ↔ Salesforce sync** — map more Salesforce fields into the People / Companies audience (`add_salesforce_import_fields`), something neither the official CLI nor the public API can do.
+- **Audiences ↔ Salesforce sync** — map more Salesforce fields into the People / Companies audience (`add_salesforce_import_fields`), something neither the official CLI nor the public API can do; read each external-source import's sync state (`get_audience_import_sync_status`, `get_audience_import_history`) — and count a newly mapped field's values before relying on it: the backfill is not guaranteed, and the sync state does not show the fill.
 - **Audiences segments** — build filter ASTs in code with the `af_*` helpers (the exact shapes the UI writes, so segments stay editable), count them before saving, prove an exclusion list and its complement partition the audience, then create / update / delete segments.
 
 ## Install as a Claude Code skill
