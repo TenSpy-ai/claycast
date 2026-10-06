@@ -1886,7 +1886,7 @@ Required query params and body shapes are listed verbatim from the captured call
 |---|---|---|
 | `POST /v3/workspaces/{ws}/audiences/accounts` | `{limit, offset, includeDeleted, isArchived, shouldInjectDraftFilter, segmentType}` | `{accounts: [...], pagination: {limit, offset, total, hasMore}}` |
 | `POST /v3/workspaces/{ws}/audiences/contacts` | `{limit, offset, includeDeleted, isArchived, shouldInjectDraftFilter, segmentType, includeData: {accountIds: bool}}` — note the extra `includeData` key vs `/accounts` | `{contacts: [...], pagination: {...}}` |
-| `POST /v3/workspaces/{ws}/audiences/count` | `{entityType: "ACCOUNT"\|"CONTACT", isArchived, shouldInjectDraftFilter, segmentType}` | `{count: N}` |
+| `POST /v3/workspaces/{ws}/audiences/count` | see the count row under "Audiences: segments" below — a segment count needs `filters` (the saved `filterAst`) as well as `segmentId`, and claycast takes `entityType` from the fetched segment | `{count: N}` |
 
 ### GETs (with required query params)
 
@@ -1894,7 +1894,7 @@ Required query params and body shapes are listed verbatim from the captured call
 |---|---|---|
 | `GET /v3/workspaces/{ws}/audiences/segments` | `entityType=ACCOUNT\|CONTACT` | `{segments: [...], total: N}` |
 | `GET /v3/workspaces/{ws}/audiences/scheduled-searches` | none | `{scheduledSearches: [...], total: N}` |
-| `GET /v3/workspaces/{ws}/audiences/imports` | `entityType=ACCOUNT\|CONTACT` | `{imports: [...]}` |
+| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType=ACCOUNT\|CONTACT` | `{audienceImports: [...]}` (corrected 2026-09-29 — the key is `audienceImports`, not `imports`; see the Salesforce import field mapping section) |
 | `GET /v3/workspaces/{ws}/audiences/imports/external-source-import-history/{TYPE}` | `{TYPE}` is `ACCOUNT` or `CONTACT` (path segment, not query) | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/accounts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
 | `GET /v3/workspaces/{ws}/audiences/contacts/columns` | `includeSystemFields=true\|false` | bare `list[dict]` |
@@ -1905,6 +1905,200 @@ Required query params and body shapes are listed verbatim from the captured call
 | `GET /v3/workspaces/{ws}/ad-audiences/sync-limit-status` | none | `{limit, used, remaining, canStartNewSync, isEnabled}` |
 
 Concrete request/response payloads for any of these are in the local clay-spy capture archives (look for the corresponding `kind: "http"` lines).
+
+---
+
+## Audiences: Salesforce import field mapping (verified live 2026-09-29, wrapped)
+
+How Audiences → Settings → Salesforce sync → "add field" maps more Salesforce fields into the
+People / Companies audience. Captured with `clay_browser.py` while saving one field in the UI,
+then replayed through the SDK for two more (one `text`, one `boolean`): the import re-synced
+within a minute and the new columns populated. **There is no official CLI or public-API surface
+for this** — the `clay` CLI's `audiences fields create` makes an empty field nothing fills.
+
+SDK: `clay.add_salesforce_import_fields(import_id, [...])` — the safe convenience, built on
+`list_audience_imports`, `list_salesforce_import_fields`, `create_audience_fields`,
+`update_salesforce_import_field_mapping` and `get_audience_import_sync_status`. "Safe" means:
+the five sync settings are echoed from `importMetadata` or the call aborts (never defaulted);
+the import, every EXISTING mapping entry, the field catalog and the new fields' displayNames
+are validated before the first write; duplicate `salesforceFieldId`s collapse to one field;
+`dry_run=True` returns the plan with no writes; the import is re-read before the PATCH so a
+concurrent mapping change is not overwritten; and a second write that fails after the fields
+were created surfaces as `AudienceFieldsOrphanedError` (created ids + the exact mapping to
+re-send when the create response paired with the request). No internal endpoint for deleting
+or updating an Audiences field definition has been captured; the official CLI
+`clay audiences fields delete|update` covers that.
+
+Model: one **import** (`audimp_<id>`) per synced Salesforce object (`importSourceSubtype`
+`account` / `contact`, `entityType` ACCOUNT / CONTACT), owned by one Salesforce connection
+(`importMetadata.appAccountId` = `aa_<id>`). The import's `fieldMapping.fieldMappings` is the
+list of `{audienceFieldId ↔ salesforceFieldId}` pairs. Activity imports (`audactimp_<id>`,
+Tasks/Events) are a separate object and were not captured being edited.
+
+### The write — what Save sends (two calls)
+
+The pair is not transactional: a failed step 2 leaves step 1's `audf_` fields as orphans, and
+no DELETE for `/audiences/field` has been captured or wrapped. The SDK therefore validates the
+existing `fieldMappings` before step 1, re-reads the import between the steps, and raises
+`AudienceFieldsOrphanedError` if step 2 still fails.
+
+1. `POST /v3/workspaces/{ws}/audiences/field` — bulk-create the Audiences field definitions.
+   Body `{"entityType": "ACCOUNT", "audienceFields": [{"displayName": "Account Owner - Manager", "fieldType": "SCALAR", "dataType": "text"}]}`.
+   Response: an array (even for one field) of `{"id": "audf_<id>", "displayName", "fieldType": "SCALAR", "dataType", "entityType", "order", "hidden": false, "isDefaultField": false, "isSystemField": false, "version": 1, ...}`.
+   `dataType` accepted: `text`, `number`, `boolean`, `date`, `email`, `url`.
+2. `PATCH /v3/workspaces/{ws}/audiences/salesforce-imports` — REPLACE the import's mapping.
+
+   ```json
+   {"audienceImports": [{
+       "audienceImportId": "audimp_<id>",
+       "fieldMapping": [
+         {"type": "SALESFORCE", "audienceFieldId": "org_name",   "salesforceFieldId": "Name",                     "mappingRule": "NEVER_WRITE"},
+         {"type": "SALESFORCE", "audienceFieldId": "audf_<id>",  "salesforceFieldId": "Account_Owner_Manager__c", "mappingRule": "NEVER_WRITE"}
+       ],
+       "isImportSyncEnabled": true, "isExportSyncEnabled": false,
+       "isCreateNewRecordsEnabled": false, "createNewRecordsIdMapping": null,
+       "entityType": "ACCOUNT", "isTaskSyncEnabled": false
+     }],
+     "reconcileOpportunityImportDependencies": true}
+   ```
+
+   Response `{"audienceImports": [<import>]}` with `status: "PENDING"` and `updatedAt` bumped.
+   **Shape trap:** you send a flat `fieldMapping` array; the response nests it as
+   `fieldMapping: {version: 1, fieldMappings: [...]}`. Built-in audience fields use their bare
+   ids as `audienceFieldId` (`org_name`, `domain`, `linkedin_url`, `sfdc_owner_id`; `name`,
+   `title`, `email`, `phone` on contacts); custom ones use `audf_<id>`. `mappingRule` was
+   `NEVER_WRITE` on every pair. **The list is the whole mapping** — read it first with
+   `list_audience_imports` and append, or the omitted pairs stop syncing. **The body also
+   REPLACES the five sync settings** (`isImportSyncEnabled`, `isExportSyncEnabled`,
+   `isCreateNewRecordsEnabled`, `createNewRecordsIdMapping`, `isTaskSyncEnabled`) — they are
+   written as sent, so echo the import's `importMetadata` values; a default of false would switch
+   export or task sync off. claycast requires them explicitly
+   (`update_salesforce_import_field_mapping` has no defaults — omitting one is a TypeError; the
+   `sync_flags={...}` form takes them keyed like importMetadata) and `add_salesforce_import_fields`
+   copies them from `importMetadata`, failing closed when one is absent.
+
+### The reads around it
+
+| Endpoint | Params | Response |
+|---|---|---|
+| `GET /v3/workspaces/{ws}/audiences/imports` | optional `entityType` | `{"audienceImports": [...]}` — each with `id`, `entityType`, `displayName`, `importSourceType`, `importSourceSubtype`, `status`, `importedCount`, `fieldMapping.fieldMappings`, `importMetadata{appAccountId, salesforceOrgId, isImportSyncEnabled, isExportSyncEnabled, isCreateNewRecordsEnabled, createNewRecordsIdMapping, isTaskSyncEnabled, salesforceImportKind}` (the five sync keys are what the mapping PATCH replaces; observed under `importMetadata` only, never at the import's top level. Verified live 2026-09-29: the ACCOUNT import carried all five, the CONTACT import had no `isTaskSyncEnabled` — the SDK refuses to guess it and takes `sync_flags=`) |
+| `GET /v3/workspaces/{ws}/audiences/imports/salesforce-fields/{object}` | `authAccountId=aa_<id>`; `{object}` = the import's `importSourceSubtype` | `{"fields": [{"value": "<API name>", "label", "type" (string, picklist, multipicklist, boolean, double, int, currency, percent, date, datetime, reference, url, email, textarea, id), "isUpdateable", "externalId", "isAssociatedObjectField"}]}` |
+| `GET /v3/workspaces/{ws}/audiences/imports/salesforce-preview/{Object}` | `authAccountId=aa_<id>` | sample records (`Task` returned 400 on the captured connection) |
+| `GET /v3/workspaces/{ws}/audiences/imports/external-source-sync-status/SALESFORCE/{audimp_<id>}` | — | `{importSyncStatus, importSyncType ("sync_incremental"), lastSyncedTime, numImportRecordsSynced, numImportRecordsTotal, lastExportedTime, hasExportInProgress, ...}`; the UI polls this every ~5 s after a save |
+| `GET /v3/workspaces/{ws}/audiences/import-connections` | — | connections usable by imports |
+| `GET /v3/workspaces/{ws}/audiences/activity-imports` | optional `appAccountId=aa_<id>` | activity imports (`audactimp_<id>`) |
+| `GET /v3/workspaces/{ws}/audiences/settings` | `entityType=ACCOUNT\|CONTACT` | audience settings |
+| `GET /v3/workspaces/{ws}/audiences/workspace-activity-types` | `includeStandard=true` | activity types |
+
+### Gotchas
+
+- A Salesforce lookup (e.g. `OwnerId`-style reference fields) arrives as the 18-char record
+  ID, not a name — map the companion name/formula field too if a human will read it.
+- Backfill is fast (tens of thousands of rows in the first minute on a ~500k-row import) but
+  the import's `importedCount` stays 0 and `status` stays PENDING for a while; watch the
+  sync-status endpoint or count non-null values in the new column instead.
+- Mapping is per import: the CONTACT import is a different `audimp_<id>` with its own list.
+- No credits are spent by any of these calls; they are workspace-config writes.
+- Orphan fields: the two-call write is not atomic. Validate the existing `fieldMappings`
+  before `POST /audiences/field` (the SDK does — an incomplete pair would otherwise be rejected
+  by the PATCH only after the fields exist), and treat a PATCH failure afterwards as fields that
+  exist unmapped: the SDK raises `AudienceFieldsOrphanedError` with the created `audf_` ids and,
+  when the create response paired with the request, the exact mapping to re-send (idempotent —
+  the PATCH is a REPLACE). No wrapped delete exists; remove orphans with the official CLI
+  `clay audiences fields delete <audf_id> --entity-type people|companies` (soft, idempotent) or
+  the UI, and only after a re-read confirms they are unmapped — a connection error after the
+  PATCH was sent leaves its outcome unknown.
+- The endpoints do not dedupe: `POST /audiences/field` creates a second field for a repeated
+  displayName and the PATCH accepts two pairs for one `salesforceFieldId`. The SDK collapses
+  repeats within one `add_salesforce_import_fields` call client-side (conflicting displayName /
+  dataType raise before any request), skips API names already mapped, and requires distinct
+  displayNames among the new fields; duplicates already inside the import's current mapping are
+  preserved verbatim.
+
+---
+
+## Audiences: segments (saved filters) — create / update / delete / count (verified live 2026-09-30, wrapped)
+
+Captured with `clay_browser.py` while clicking Create segment → Rename → Delete segment in the
+Companies audience, then replayed through the SDK (workspace 12345). SDK:
+`create_audience_segment`, `update_audience_segment`, `delete_audience_segment`,
+`get_audience_segment`, `count_audience_records`, `count_audience_filter_stages`,
+`verify_audience_filter_complement`, and the module-level `af_*` filter-AST builder in
+`clay_client.py`. No credits — workspace-config writes.
+
+| Call | Body | Response / notes |
+|---|---|---|
+| `POST /v3/workspaces/{ws}/audiences/segments` | `{"name", "filterAst": <root GroupOp>, "entityType": "ACCOUNT"\|"CONTACT"}` | the segment object: `id` (`audseg_…`), `name`, `description`, `filterAst`, `entityType`, `estimatedSize` (cached member count), `ownerId`, `order`, `segmentType`, `signalDaysLookback`, `bitmapProcessedAt`, timestamps. **Every AST node needs a UUID `id`** (`af_root()` stamps them) or the call is 400 `Field "filterAst.items.N" - Invalid input`. The UI's "Create segment" button sends an empty `items: []` (matches everything) and opens the editor. |
+| `PUT /v3/workspaces/{ws}/audiences/segments/{id}` | partial — any of `name`, `description`, `filterAst` | the full segment; `estimatedSize` is recomputed immediately. The UI's Rename sends just `{"name"}`. `PATCH` and `DELETE` on this URL are 404 `NoMatchingURL`. |
+| `POST /v3/workspaces/{ws}/audiences/segments/{id}/delete` | `{}` | `{"success": true, "segmentId"}`. HARD delete: `GET …/segments/{id}` is then 404 `Segment not found` and the segment is gone from the list — no undo. |
+| `GET /v3/workspaces/{ws}/audiences/segments/{id}` | — | the segment object; `filterAst` is the saved filter (the official CLI names the same object `filter`). |
+| `POST /v3/workspaces/{ws}/audiences/count` | `{"entityType", "isArchived": false, "shouldInjectDraftFilter": true, "segmentType": null, "filters": <AST>}` | `{"count"}`. **`segmentId` alone does NOT apply the segment's filter** — the editor keeps the filter client-side and sends it as `filters`; a body with only `segmentId` returns the size of the whole entity (a latent bug in `count_audience_segment`, fixed 2026-09-30 by fetching `filterAst` first; it also sent `entityType: "CONTACT"` for ACCOUNT segments unless the caller passed one). Since 2026-09-30 claycast reads `entityType` from the fetched segment for segment counts (`export_audience_segment` does the same before paging `/audiences/{accounts\|contacts}`) and rejects a contradicting explicit value; whole-entity and ad-hoc counts still take `entityType` from the caller. Server precedence when both `segmentId` and `filters` are present (AND, `filters` wins, or `segmentId` ignored) is unverified. |
+| `POST /v3/workspaces/{ws}/audiences/{ACCOUNT\|CONTACT}/signals` | `{"segmentId"}` | signal summaries for the segment (and `"ALL"`). |
+
+### The filter AST (what the UI writes; the `af_*` helpers produce exactly these shapes)
+
+```json
+{"type": "GroupOp", "combinationMode": "And", "id": "<uuid>", "items": [
+  {"type": "BinOp", "key": "audf_<id>", "dataPath": ["account_entity_field_values", "field", "audf_<id>"],
+   "operator": "NotEqual", "value": "Current Client", "entityType": "ACCOUNT", "id": "<uuid>"},
+  {"type": "BinOp", "key": "title::acttyp_<id>", "dataPath": ["activities", "fields", "title", "acttyp_<id>"],
+   "operator": "NotEmpty", "id": "<uuid>"}
+]}
+```
+
+- Node ids: the internal segments endpoint **requires** a UUID `id` on every node (400 `Field
+  "filterAst.items.N" - Invalid input` without one, verified 2026-09-30 — `af_root()` stamps them),
+  while the official CLI / public API document the same ids as UI-editor bookkeeping that is
+  ignored and stripped. Both hold: stamp ids here, never author them for the official surface.
+- Entity field paths: `["account_entity_field_values", "field", <fieldId>]` for companies,
+  `["contact_entity_field_values", "field", <fieldId>]` for people; a people segment may include
+  ACCOUNT-path conditions (evaluated on the linked company). Built-in ids (`org_name`, `domain`,
+  `sfdc_owner_id`, `email`, `title`, `linkedin_url`, …) and custom `audf_…` ids both work.
+- Activity conditions: `key: "<fieldId>::<activityTypeId>"`, `dataPath: ["activities", "fields",
+  <fieldId>, <activityTypeId>]` (`fieldId` = `title`, `created_at` or a custom `actf_…`). This is
+  the one-row shape the UI renders. **Two sibling activity rows are evaluated independently** —
+  "type = X" AND "date within 30d" as siblings means "ever had type X" AND "any activity within
+  30d" (measured: 65 vs the true 25). Conditions that must hold on the same activity go inside a
+  `ColOp` (`{"type": "ColOp", "dataPath": ["activities", <activityTypeId>], "operator": "AnyItems"|"NoItems",
+  "entityType", "condition": <GroupOp>}`, with `["activities", "activity_timestamp"]` for recency)
+  — which evaluates correctly but **renders as "deleted field" in the UI**.
+- Operators by data type (the official CLI's filter reference; all accepted here): date —
+  `WithinLast`/`NotWithinLast`/`WithinNext`/`NotWithinNext` (`value` + `timeUnit` day|week|month —
+  `af_field(..., time_unit=)` or, in an `af_exclusion_pair` rule table, `(op, value, time_unit)`;
+  a node without `timeUnit` is a server error (500) and `year` is rejected (400), verified live
+  2026-09-29, so every builder raises `ValueError` instead of emitting either),
+  `Before`/`After` (ISO timestamp), `Empty`/`NotEmpty`; number/currency — `GreaterThan`, `LessThan`,
+  `Equal`, `GreaterThanOrEqual`, `LessThanOrEqual`, `Empty`, `NotEmpty`; boolean — `True`, `False`;
+  select/text/email/url — `Equal`, `NotEqual`, `Contain`, `NotContain`, `ContainAny` (list),
+  `StartsWith`, `EndsWith`, `Empty`, `NotEmpty`. Text operators are case-insensitive substring/exact.
+- `ContainAny` with a list of 18-char Salesforce IDs on `sfdc_owner_id` is exact and renders as
+  one row (counted identically to an Or of 125 `Equal` rows).
+- Blank cells. Verified live 2026-09-29 (one production workspace, ACCOUNT entity, read-only
+  counts): NotEqual and NotContain match blank cells; Equal "" matches blank cells; Equal/NotEqual
+  are case-insensitive and exact complements on populated cells; positive operators never match a
+  blank; Empty + NotEmpty = total. Booleans: Empty/NotEmpty are accepted, an unset checkbox is
+  blank, and False matches blank cells (True + False = total). timeUnit accepts day/week/month;
+  year is rejected (400); a time node without timeUnit is a server error (500). Nested
+  And(NotEmpty, ...) / Or(..., Empty) evaluate as ordinary conjunction/disjunction — and both
+  shapes were opened in the segment editor on 2026-09-30: they render as ordinary editable rows
+  and groups (no "deleted field"), the editor's count equals the API count, and the saved filter
+  round-trips with the nesting intact. So an
+  exclusion and its "everything else" complement cannot use a bare negative operator:
+  `af_any_of()` pins a field that has one under `And(NotEmpty, …)` (a blank is never excluded)
+  unless the field has an `("Empty",)` rule — which excludes blanks, and makes `af_none_of()` drop
+  its `Empty` guard; a `("NotEmpty",)` rule makes the included side `And(Empty)`; True/False
+  rules use the bare, unpinned pair because a blank boolean is False. Rule tables accept only the
+  operators in `AUDIENCE_NEGATED_OPERATOR` — Contain, Empty, Equal, False, NotContain, NotEmpty,
+  NotEqual, NotWithinLast, NotWithinNext, True, WithinLast, WithinNext
+  (`StartsWith`/`EndsWith`/`GreaterThan`/`ContainAny` have no exact negation) — as `(op,)`,
+  `(op, value)` or `(op, value, time_unit)`; time rules must carry a unit in day|week|month; `""`,
+  `None` and list values, empty rule lists and an empty table raise `ValueError`. Prove the pair
+  with `verify_audience_filter_complement()`: `both` and `neither` must both be 0; `neither` > 0
+  means an import is back-filling (counts drift — re-run) or records lack the related object.
+- Use real values: `GET …/audiences/{accounts|contacts}/columns?includeSystemFields=true` lists
+  fields; the official CLI's `audiences fields list-values <id>` lists values with counts. A rule
+  on a value that does not exist ("Current Customer" where the data says "Current Client")
+  silently matches nothing. Lookup fields (e.g. owner, BDR owner) hold IDs, not names.
 
 ---
 

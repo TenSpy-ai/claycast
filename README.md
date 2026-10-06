@@ -13,7 +13,9 @@ It ships as a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) **sk
 - **Schema operations** — create/modify/clone tables, columns, formula columns, and action columns programmatically.
 - **Enrichment** — trigger runs and wait for completion (`run_column`, `run_and_wait`).
 - **Export / import** — serialize a table's column structure (the portable **ClayPrint** format) to copy or clone structure across tables; export rows to CSV/JSON; export whole workspaces.
-- **Discovery** — a Playwright-based browser daemon (`clay_browser.py`) that runs Clay with your session cookie and auto-captures every `api.clay.com` request/response, so you can reverse the shape of endpoints ClayCast doesn't wrap yet.
+- **Discovery** — a Playwright-based browser daemon (`clay_browser.py`) that runs Clay with your session cookie and auto-captures every `api.clay.com` request/response, so you can reverse the shape of endpoints ClayCast doesn't wrap yet. Runs on macOS, Linux and Windows.
+- **Audiences ↔ Salesforce sync** — map more Salesforce fields into the People / Companies audience (`add_salesforce_import_fields`), something neither the official CLI nor the public API can do.
+- **Audiences segments** — build filter ASTs in code with the `af_*` helpers (the exact shapes the UI writes, so segments stay editable), count them before saving, prove an exclusion list and its complement partition the audience, then create / update / delete segments.
 
 ## Install as a Claude Code skill
 
@@ -36,7 +38,7 @@ git clone https://github.com/TenSpy-ai/claycast.git .claude/skills/claycast
 pip install -r .claude/skills/claycast/references/requirements.txt
 ```
 
-Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+.
+Either way the skill must end up at `…/skills/claycast/` with `SKILL.md` at its root. Claude Code reads `SKILL.md`'s front-matter and loads ClayCast automatically when a task matches it. Requires Python 3.10+. On Windows, `clay_browser.py` uses a loopback TCP control socket and `%TEMP%\clay-browser\` instead of a UNIX socket and `/tmp` (set `CLAY_BROWSER_DIR` to override on any platform; on POSIX a dir long enough to push `server.sock` past the AF_UNIX limit — 103 bytes on macOS, 107 on Linux — also switches to the loopback TCP channel, with a NOTE at launch). Both channels require a per-daemon token from `server.token` (0600 in the runtime dir) on every command, so other local processes cannot drive the browser — which runs JS in your logged-in Clay session; on Windows only the NTFS ACL of `%TEMP%` protects that file.
 
 > Project-level beats global when two projects need different versions, or when you want the skill version-controlled alongside the project. Global is simplest for personal use across many projects.
 
@@ -54,9 +56,11 @@ claycast/                      # ~/.claude/skills/claycast/  (or  <project>/.cla
 │   ├── feature-gaps.md        # roadmap: what's missing / what to build next
 │   ├── requirements.txt       # Python dependencies
 │   └── .env.example           # CLAY_SESSION placeholder
-└── scripts/
-    ├── clay_client.py         # the ClayClient SDK (authenticated REST client)
-    └── clay_browser.py        # Playwright daemon for request-capture / discovery
+├── requirements-dev.txt       # pytest, for the offline test suite
+├── scripts/
+│   ├── clay_client.py         # the ClayClient SDK (authenticated REST client)
+│   └── clay_browser.py        # Playwright daemon for request-capture / discovery
+└── tests/                     # offline pytest suite + e2e_browser.sh + tools/check_partition.py
 ```
 
 ## Authentication
@@ -108,6 +112,21 @@ clay.create_formula_column(table["tableId"], name="Domain", formula='...')
 | [`references/action-registry.md`](references/action-registry.md) | Action-column input shapes and integration gotchas. |
 | [`references/cookie-setup.md`](references/cookie-setup.md) | Getting and configuring `CLAY_SESSION`. |
 | [`references/feature-gaps.md`](references/feature-gaps.md) | **Roadmap** — capabilities not yet built, tiered by impact. Start here if you want to contribute a feature. |
+
+## Running the tests
+
+The offline suite under `tests/` needs no Clay cookie, makes no network calls and spends no credits: it drives `ClayClient` through a recording fake session and asserts the exact request each method sends, checks the `af_*` filter builders, and probes `clay_browser.py`'s helpers in subprocesses.
+
+```bash
+pip install -r requirements-dev.txt   # pytest
+python -m pytest tests -q
+```
+
+The tests that bind a UNIX socket, assert the `/tmp` defaults or send POSIX signals skip on Windows. Two more tools live next to the suite and are not run by `pytest`:
+
+- **`tests/e2e_browser.sh [unix|tcp|longpath]`** — the macOS-only live harness for `scripts/clay_browser.py` (it uses `stat -f %Lp` and `lsof`). It launches headless Chromium through the daemon, drives it and checks the teardown; `tcp` runs a temp copy with `USE_UNIX_SOCKET` forced off to exercise the Windows control channel on a Mac. Needs Playwright and a `CLAY_SESSION` value that resolves, but not a working cookie — the only page it opens is a local `data:` URL.
+- **`python tests/tools/check_partition.py scripts/clay_client.py`** — the exclusion-pair partition checker: for every rule table in its battery it evaluates both sides of `af_exclusion_pair()` over a small record domain under every blank-value model for the operators not measured live (16 by default — `False` is fixed to "matches a blank", as measured 2026-09-29; `--all-models` enumerates all 32 for reference) and reports whether each record lands on exactly one side and whether boolean tables stay unpinned (`--json` for machine-readable output). Any `af_*` candidate module can be checked the same way; `tests/test_partition_property.py` and `tests/test_af_fuzz.py` run the same checker inside `pytest`.
+- **`tests/live/*.py`** — read-only checks against a real workspace (segment counts take the entity from the segment, where the Salesforce sync settings live, the `dry_run=True` validation paths of `add_salesforce_import_fields`, and the blank-semantics probe behind the `af_*` design). Each needs a real cookie, a workspace with Audiences and `--workspace <id>`; they only list and count, never write, and spend no credits. Share their PASS/FAIL lines, not the raw counts or ids they print. `tests/test_live_scripts_offline.py` byte-compiles them and runs the probe's dry run offline as part of the suite.
 
 ## Contributing
 
