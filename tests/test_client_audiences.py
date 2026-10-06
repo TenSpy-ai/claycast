@@ -7,13 +7,14 @@ these shapes is a live claim and cannot be re-checked offline.
 import copy
 import json
 import pickle
+import re
 import sys
 from pathlib import Path
 
 import pytest
 import requests
 
-from conftest import all_nodes, cc, is_uuid
+from conftest import FakeResponse, all_nodes, cc, is_uuid
 
 WS = 12345
 IMPORTS = f"/workspaces/{WS}/audiences/imports"
@@ -142,11 +143,46 @@ def test_import_history_path_entity_and_shape(client):
         c.get_audience_import_history("deal")
 
 
-def test_import_history_tolerates_wrapped_or_empty(client):
-    # Live shape is a bare list; a wrapped dict or an empty body must still yield a list.
+def test_import_history_tolerates_wrapped_or_null(client):
+    # Live shape is a bare list; one key wrapping the rows is unwrapped and a JSON null body
+    # yields []. (A truly empty body is not JSON at all: ClayClient.get raises JSONDecodeError.)
     assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", {"history": [{"importId": "x"}]})]).get_audience_import_history("ACCOUNT") == [{"importId": "x"}]
-    assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", {})]).get_audience_import_history("ACCOUNT") == []
+    assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", {"history": []})]).get_audience_import_history("ACCOUNT") == []
     assert client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", None)]).get_audience_import_history("ACCOUNT") == []
+
+
+@pytest.mark.parametrize("body,shape", [
+    ({}, "dict with keys []"),
+    ({"message": "forbidden", "errors": [{"code": "E1"}]}, "dict with keys ['errors', 'message']"),  # never rows
+    ({"warnings": [], "history": [{"importId": "a"}]}, "dict with keys ['history', 'warnings']"),
+    ({"activityImports": [{"importId": "a"}], "objectImports": [{"importId": "o"}]}, "dict with keys ['activityImports', 'objectImports']"),
+    ({"importId": "audimp_1", "importSyncType": "sync_full"}, "dict with keys ['importId', 'importSyncType']"),  # a bare row
+    ({"history": ["audimp_1"]}, "dict with keys ['history']"),  # one key, but not a list of rows
+    ({"history": {"importId": "x"}}, "dict with keys ['history']"),
+    ("OK", "str"),
+    (5, "int"),
+    (True, "bool"),
+])
+def test_import_history_rejects_any_other_shape(client, body, shape):
+    c = client([("GET", IMPORTS + "/external-source-import-history/ACCOUNT", body)])
+    with pytest.raises(ValueError, match=r"get_audience_import_history: unexpected response shape \(" + re.escape(shape) + r"\)"):
+        c.get_audience_import_history("ACCOUNT")
+
+
+def test_import_history_workspace_override_reaches_the_path(client):
+    c = client([("GET", "/workspaces/999/audiences/imports/external-source-import-history/CONTACT", [{"importId": "w"}])])
+    assert c.get_audience_import_history("contact", workspace_id=999) == [{"importId": "w"}]
+    assert c.session.calls[-1]["path"] == "/workspaces/999/audiences/imports/external-source-import-history/CONTACT"
+
+
+@pytest.mark.parametrize("call", [lambda c: c.get_audience_import_history("ACCOUNT"),
+                                  lambda c: c.get_audience_import_sync_status("audimp_1")])
+def test_import_reads_propagate_http_errors(client, call):
+    # ClayClient.get raises on a 5xx: neither read swallows it (the caller decides on a retry).
+    c = client()
+    c.session.get = lambda url, **kw: FakeResponse({"message": "Internal Server Error"}, status=500)
+    with pytest.raises(requests.HTTPError, match="500"):
+        call(c)
 
 
 def test_salesforce_fields_path_and_params(client):

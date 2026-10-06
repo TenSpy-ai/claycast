@@ -3545,17 +3545,31 @@ class ClayClient:
         Treat `[]` as "nothing to show right now", not "no imports"; list_audience_imports() is
         the inventory. Use this for an at-a-glance view across imports and
         get_audience_import_sync_status() for one import's timestamps. The UI calls it from
-        Settings > Audiences > Sources. Verified live 2026-09-30.
+        Settings > Audiences > Sources.
+
+        A JSON null body returns []; a dict whose only key holds the list of rows is unwrapped
+        (never seen live); any other shape raises ValueError naming it, so an error body or a
+        changed shape is never passed off as rows or as "nothing to show". Verified live
+        2026-09-30.
         """
         entity_type = str(entity_type).upper()
         if entity_type not in {"CONTACT", "ACCOUNT"}:
             raise ValueError(f"entity_type must be CONTACT or ACCOUNT, got {entity_type!r}")
         ws_id = self._resolve_workspace_id(workspace_id)
         res = self.get(f"/workspaces/{ws_id}/audiences/imports/external-source-import-history/{entity_type}")
-        if isinstance(res, dict):
-            # Defensive: the live response is a bare list; if Clay ever wraps it, return the list.
-            return next((v for v in res.values() if isinstance(v, list)), [])
-        return res or []
+        if res is None:
+            return []
+        if isinstance(res, list):
+            return res
+        if isinstance(res, dict) and len(res) == 1:
+            (rows,) = res.values()
+            if isinstance(rows, list) and all(isinstance(r, dict) for r in rows):
+                return rows
+        shape = f"dict with keys {sorted(res)}" if isinstance(res, dict) else type(res).__name__
+        raise ValueError(
+            f"get_audience_import_history: unexpected response shape ({shape}); expected a bare "
+            f"list of import rows, or a dict whose only key holds that list"
+        )
 
     def list_salesforce_import_fields(
         self,
