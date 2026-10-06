@@ -1728,8 +1728,9 @@ destroys finished answers.
   backfill (under "View filter/sort write path + replication side-effects") record `isStale: true` +
   `staleReason` in the cell metadata of armed action columns after an upstream formula edit.
   `get_record` returns cell metadata unchanged; `fetch_all_records_full` keeps only the full value and
-  `status`, so it does not show the flag. Whether `isStale` is also set after an "Only run if" input
-  change was not checked, so for that case the UI count is the only check measured here.
+  `status`, so it does not show the flag. That marker is not confirmed on AI columns, and `isStale`
+  was not checked after an "Only run if" input change, so for those cases the UI count is the only
+  check measured here.
 - **The non-force menu item honors "Only run if"; "Force run" bypasses it.** So a gate scopes a
   whole-column UI run only when you use the non-force item.
 
