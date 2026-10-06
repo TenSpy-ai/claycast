@@ -6366,10 +6366,10 @@ class ClayClient:
             raise RuntimeError(f"Claygent column {field_id} did not match its Claygent: {check['problems']}")
         return col
 
-    def _claygent_column_settings(self, table_id: str, field_id: str) -> tuple[dict, dict]:
+    def _claygent_column_settings(self, table_id: str, field_id: str, method: str) -> tuple[dict, dict]:
         f = next((x for x in self.list_fields(table_id) if x["field_id"] == field_id), None)
         if f is None:
-            raise ValueError(f"field {field_id} not found on {table_id}")
+            raise ValueError(f"{method}: field {field_id} not found on {table_id}")
         ts = f.get("type_settings") or {}
         return ts, {b["name"]: b for b in ts.get("inputsBinding") or []}
 
@@ -6397,7 +6397,7 @@ class ClayClient:
         (2026-09-30). Changing an input the condition reads DOES (see
         clay-api-reference.md "Table run traps").
         """
-        ts, b = self._claygent_column_settings(table_id, field_id)
+        ts, b = self._claygent_column_settings(table_id, field_id, "sync_claygent_column")
         cid = self._binding_literal(b.get("claygentId"))
         if not cid or not isinstance(cid, str):
             raise ValueError(f"sync_claygent_column: field {field_id} is not bound to a saved Claygent")
@@ -6459,12 +6459,19 @@ class ClayClient:
         return -1
 
     @staticmethod
-    def _prompt_formula_segments(formula: str) -> list[str] | None:
+    def _prompt_formula_segments(formula: str, slots=()) -> list[str] | None:
         """A stored prompt formula as the literal text around its
         Clay.formatForAIPrompt(...) slots: n slots give n + 1 segments (whitespace
         around `+` is ignored). None when the formula is anything other than
-        `+`-joined JSON string literals and such slots."""
+        `+`-joined JSON string literals and such slots.
+
+        slots: the column's own mapping expressions ('Clay.formatForAIPrompt(<expr>)',
+        what Clay renders into the prompt). A slot is matched against them first,
+        longest first; only a slot that is none of them is read up to its closing
+        ')' by bracket matching, which skips string literals but not regex literals."""
         slot = "Clay.formatForAIPrompt("
+        known = sorted({s for s in slots if isinstance(s, str) and s.startswith(slot) and s.endswith(")")},
+                       key=len, reverse=True)
         dec = json.JSONDecoder(strict=False)
         segs, i, n, operand_next, started = [""], 0, len(formula), True, False
         while True:
@@ -6484,10 +6491,14 @@ class ClayClient:
                 segs[-1] += text
                 operand_next, started = False, True
             elif formula.startswith(slot, i):
-                i = ClayClient._close_paren(formula, i + len(slot) - 1)
-                if i < 0:
-                    return None
-                i += 1
+                hit = next((s for s in known if formula.startswith(s, i)), None)
+                if hit:
+                    i += len(hit)
+                else:
+                    i = ClayClient._close_paren(formula, i + len(slot) - 1)
+                    if i < 0:
+                        return None
+                    i += 1
                 segs.append("")
                 operand_next, started = False, True
             else:
@@ -6507,12 +6518,12 @@ class ClayClient:
         return out
 
     @staticmethod
-    def _claygent_prompt_problems(version: dict, stored_prompt: str) -> list[str]:
+    def _claygent_prompt_problems(version: dict, stored_prompt: str, slots=()) -> list[str]:
         """verify_claygent_column's prompt check: the stored prompt must hold one
         slot per variable placeholder in the Claygent's prompt and the same text
-        between them, whitespace re-flow aside."""
+        between them, whitespace re-flow aside. slots: see _prompt_formula_segments."""
         names = [x["name"] for x in version.get("variables") or []]
-        raw = ClayClient._prompt_formula_segments(stored_prompt)
+        raw = ClayClient._prompt_formula_segments(stored_prompt, slots)
         if raw is None:
             return ["stored prompt is not a +-joined list of string literals and Clay.formatForAIPrompt(...) slots"]
         want = ClayClient._norm_prompt_segments(ClayClient._claygent_split(version.get("userPrompt") or "", names)[::2])
@@ -6547,14 +6558,17 @@ class ClayClient:
           ignored (spaces around `+`, trailing spaces at line ends, runs of blank
           lines, either end of the prompt). A mismatch means the stored prompt
           differs from the Claygent's current prompt, e.g. the Claygent was edited
-          after the column was last written;
+          after the column was last written. Slots are matched against the
+          column's own mapping expressions first, so any var_map expression reads
+          back; a slot that is none of them is read by bracket matching, which
+          does not understand regex literals;
         - the mapping covers exactly the Claygent's variables; with var_map, also
           each mapping expression.
         Returns {"ok", "problems", "claygent_id"}. Use after anyone opened the
         column's panel in the UI: opening it can arm "Save", and saving re-writes
         Clay's re-parsed copy.
         """
-        ts, b = self._claygent_column_settings(table_id, field_id)
+        ts, b = self._claygent_column_settings(table_id, field_id, "verify_claygent_column")
         problems = []
         cid = self._binding_literal(b.get("claygentId"))
         if not cid or not isinstance(cid, str):
@@ -6570,8 +6584,8 @@ class ClayClient:
             have = self._decoded_schema_copy((b.get("answerSchemaType") or {}).get("formulaMap") or {})
             if have is None or have != self._decoded_schema_copy(want):
                 problems.append("output schema copy differs from the Claygent's (UI: 'Unable to parse the output schema')")
-        problems += self._claygent_prompt_problems(v, (b.get("prompt") or {}).get("formulaText") or "")
         fm = (b.get("claygentFieldMapping") or {}).get("formulaMap") or {}
+        problems += self._claygent_prompt_problems(v, (b.get("prompt") or {}).get("formulaText") or "", fm.values())
         wanted = {"{{" + x["name"] + "}}" for x in v.get("variables") or []}
         if set(fm) != wanted:
             problems.append(f"variable mapping {sorted(fm)} != Claygent variables {sorted(wanted)}")

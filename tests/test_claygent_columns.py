@@ -511,21 +511,21 @@ def test_create_bad_var_map_sends_nothing():
 def test_column_settings_returns_typesettings_and_binding_index():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
-    ts, b = fc.client._claygent_column_settings(T, "f_1")
+    ts, b = fc.client._claygent_column_settings(T, "f_1", "verify_claygent_column")
     assert ts["actionKey"] == "use-ai"
     assert set(b) == set(USE_AI_PARAMS) and b["claygentId"] == {"name": "claygentId", "formulaText": '"c_1"'}
 
 
-def test_column_settings_unknown_field():
+def test_column_settings_unknown_field_names_the_calling_method():
     fc = FakeClay()
-    with pytest.raises(ValueError, match="field f_zz not found on t_1"):
-        fc.client._claygent_column_settings(T, "f_zz")
+    with pytest.raises(ValueError, match="^sync_claygent_column: field f_zz not found on t_1$"):
+        fc.client._claygent_column_settings(T, "f_zz", "sync_claygent_column")
 
 
 def test_column_settings_field_without_type_settings():
     fc = FakeClay()
     fc.fields.append({"id": "f_txt", "name": "Plain", "type": "text"})
-    assert fc.client._claygent_column_settings(T, "f_txt") == ({}, {})
+    assert fc.client._claygent_column_settings(T, "f_txt", "verify_claygent_column") == ({}, {})
 
 
 # ── verify_claygent_column ────────────────────────────────────────────────────
@@ -564,7 +564,7 @@ def test_verify_unbound_column(cid_binding):
 
 
 def test_verify_unknown_field():
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(ValueError, match="^verify_claygent_column: field f_1 not found on t_1$"):
         _verify(FakeClay())
 
 
@@ -803,6 +803,48 @@ def test_verify_slot_expressions_with_parens_quotes_and_escapes():
     fc = FakeClay()
     fc.add_column(_expected_inputs(var_map=vm))
     assert _verify(fc, var_map=vm)["ok"] is True
+
+
+# var_map expressions holding a regex literal with a quote or a paren in it: bracket matching alone
+# cannot find where such a slot ends.
+REGEX_EXPRS = ['{{f_x}}.replace(/"/g, "\'")', "{{f_x}}.replace(/'/g, \"\")", '{{f_x}}.replace(/\\(/g, "")']
+
+
+@pytest.mark.parametrize("expr", REGEX_EXPRS)
+def test_regex_literal_var_map_creates_verifies_and_syncs(expr):
+    # The slot is matched against the column's own mapping expressions first, so create and sync
+    # read their write back as ok instead of raising after it.
+    vm = {"company": expr, "notes": "{{f_notes}}"}
+    fc = FakeClay()
+    fc.client.create_claygent_column(T, "Research", "c_1", vm)
+    stored = fc.binding("f_new")["prompt"]["formulaText"]
+    assert f"Clay.formatForAIPrompt({expr})" in stored
+    assert cc.ClayClient._prompt_formula_segments(stored) is None  # what the bracket scan alone made of it
+    assert fc.client.verify_claygent_column(T, "f_new", var_map=vm) == {"ok": True, "problems": [], "claygent_id": "c_1"}
+    _edit_claygent(fc)
+    assert fc.client.sync_claygent_column(T, "f_new") == {"ok": True, "problems": [], "claygent_id": "c_1"}
+    assert fc.binding("f_new")["claygentFieldMapping"]["formulaMap"]["{{company}}"] == f"Clay.formatForAIPrompt({expr})"
+
+
+def test_regex_literal_slot_still_catches_prompt_drift():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs(var_map={"company": REGEX_EXPRS[0], "notes": "{{f_notes}}"}))
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = PROMPT.replace(" for fit.", "")  # text removed
+    assert _verify(fc)["problems"] == ["stored prompt text differs from the Claygent prompt near: '\\nNotes: '"]
+
+
+def test_prompt_segments_match_the_columns_own_slots_first():
+    seg = cc.ClayClient._prompt_formula_segments
+    slot = f"Clay.formatForAIPrompt({REGEX_EXPRS[0]})"
+    assert seg('"a"+' + slot + '+"b"') is None
+    assert seg('"a"+' + slot + '+"b"', [slot]) == ["a", "b"]
+    # mapping values that are not slots are ignored; a slot that is none of them falls back to
+    # bracket matching
+    assert seg('"a" + Clay.formatForAIPrompt({{f_y}})', [None, 42, "{{f_y}}", slot]) == ["a", ""]
+    # the longest known slot wins when one is a prefix of another
+    short = 'Clay.formatForAIPrompt(/"/)'
+    longer = short + '.concat(/"/)'
+    assert seg(longer + '+"z"', [short, longer]) == ["", "z"]
 
 
 def test_verify_spaced_and_dotted_variable_names():
@@ -1059,6 +1101,13 @@ def test_sync_unbound_column_raises_clear_error(cid_binding):
     if cid_binding is not None:
         fc.ts(fid)["inputsBinding"].append(cid_binding)
     with pytest.raises(ValueError, match="^sync_claygent_column: field f_1 is not bound to a saved Claygent$"):
+        fc.client.sync_claygent_column(T, "f_1")
+    assert not fc.writes()
+
+
+def test_sync_unknown_field_raises_before_writing():
+    fc = FakeClay()
+    with pytest.raises(ValueError, match="^sync_claygent_column: field f_1 not found on t_1$"):
         fc.client.sync_claygent_column(T, "f_1")
     assert not fc.writes()
 
