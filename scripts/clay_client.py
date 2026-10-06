@@ -3497,9 +3497,10 @@ class ClayClient:
         GET /workspaces/{ws}/audiences/imports/external-source-sync-status/{SOURCE}/{import_id}
         -> {importSyncStatus: "success" | "in_progress" | ..., importSyncType:
         "sync_incremental" | "sync_full", lastSyncedTime, numImportRecordsSynced,
-        numImportRecordsTotal, lastExportedTime, hasExportInProgress, numExportRecordsSynced,
-        numExportRecordsTotal}. The UI polls this every ~5 s after a mapping change; Clay's
-        server occasionally answers 500 mid-run — retry, do not treat it as a failed sync.
+        numImportRecordsTotal, exportSyncStatus, lastExportedTime, hasExportInProgress,
+        numExportRecordsSynced, numExportRecordsTotal}. The UI polls this every ~5 s after a
+        mapping change; Clay's server occasionally answers 500 mid-run — retry, do not treat it
+        as a failed sync.
 
         How to read it (measured 2026-09-30 on a large Salesforce import):
         - `sync_incremental` runs on the workspace's plan cadence (per Clay's docs: every 15 min
@@ -3511,13 +3512,17 @@ class ClayClient:
           backfill was still running never got one, and one backfill stopped at ~60 % of the
           records. Measure the fill (count non-null values in the new column) before you build
           on the field; see the reference ("Import sync state, cadence and the backfill caveat").
-        - `numImportRecordsSynced == numImportRecordsTotal` means the last run finished, not
-          that every mapped field is populated.
+        - A run has finished when `importSyncStatus == "success"` and `lastSyncedTime` is later
+          than your save. `numImportRecordsSynced` / `numImportRecordsTotal` are the import's
+          cumulative record totals, not the progress of a run: they were equal while a run was
+          still `in_progress` (verified live 2026-10-06). They show neither run progress nor how
+          far a newly mapped field is filled.
         - The import's own `status` (from list_audience_imports) flips to PENDING after any
           mapping PATCH and stays there; it does not mean a sync is queued.
         - Nothing triggers a `sync_full` on demand — not this API, not re-saving the mapping,
           not removing and re-adding a field, and the UI has no "sync now" (checked 2026-09-30).
-        Verified live 2026-09-29 and 2026-09-30.
+        Verified live 2026-09-29 and 2026-09-30 (the record totals and `exportSyncStatus`:
+        2026-10-06).
         """
         ws_id = self._resolve_workspace_id(workspace_id)
         return self.get(
@@ -3531,27 +3536,31 @@ class ClayClient:
         *,
         workspace_id: int | str | None = None,
     ) -> list[dict]:
-        """Per-import sync state for every external-source import feeding one entity.
+        """Current sync state per external-source import feeding one entity (rows can be missing).
 
         GET /workspaces/{ws}/audiences/imports/external-source-import-history/{ACCOUNT|CONTACT}
-        -> bare list, up to one row per import that feeds the entity — the object import plus
-        any activity import (`audactimp_…`, which also carries `activityTypeId`):
-        [{importId, importSourceType, importSyncStatus, importSyncType,
+        -> bare list, up to one row per external-source (e.g. Salesforce) import that feeds the
+        entity — the object import plus any activity import (`audactimp_…`, which also carries
+        `activityTypeId` and is listed under both ACCOUNT and CONTACT):
+        [{importId, importSourceType, importSyncStatus, importSyncType, lastSyncedTime,
           numImportRecordsSynced, numImportRecordsTotal, activityTypeId?}, ...].
-        Despite the name it is the CURRENT state per import, not a run log: on 2026-09-30 a
-        workspace with weeks of syncs returned two rows (the Salesforce object import and the
-        activity import), both `sync_incremental`. Rows can also be MISSING: the same ACCOUNT
-        call returned two rows at 06:00Z and an empty list 80 minutes later — after two mapping
-        PATCHes on that import — while get_audience_import_sync_status() kept answering for it.
-        Treat `[]` as "nothing to show right now", not "no imports"; list_audience_imports() is
-        the inventory. Use this for an at-a-glance view across imports and
-        get_audience_import_sync_status() for one import's timestamps. The UI calls it from
-        Settings > Audiences > Sources.
+        Each row reads like get_audience_import_sync_status() for that import, with the same
+        caveats. Imports that are not external-source (a Find People / CPJ import) are not
+        listed. Despite the name it is the CURRENT state per import, not a run log: on
+        2026-09-30 a workspace with weeks of syncs returned two rows (the Salesforce object
+        import and the activity import), both `sync_incremental`. Rows can also be MISSING: the
+        same ACCOUNT call returned two rows at 06:00Z and an empty list 80 minutes later — after
+        two mapping PATCHes on that import — while get_audience_import_sync_status() kept
+        answering for it. Treat `[]` as "nothing to show right now", not "no imports";
+        list_audience_imports() is the inventory. Use this for an at-a-glance view across
+        imports and get_audience_import_sync_status() for one import's full status (it adds the
+        export-side fields). The UI calls it from Settings > Audiences > Sources.
 
         A JSON null body returns []; a dict whose only key holds the list of rows is unwrapped
         (never seen live); any other shape raises ValueError naming it, so an error body or a
         changed shape is never passed off as rows or as "nothing to show". Verified live
-        2026-09-30.
+        2026-09-30 (`lastSyncedTime` on every row, the activity import under both entities and
+        the external-source-only listing: 2026-10-06).
         """
         entity_type = str(entity_type).upper()
         if entity_type not in {"CONTACT", "ACCOUNT"}:
@@ -3664,10 +3673,12 @@ class ClayClient:
         not import state, and keeps its default.
 
         Shape trap: you send `fieldMapping: [...]`, the response nests it as
-        `fieldMapping.fieldMappings`. The response `status` flips to PENDING and the import
-        backfills the new fields (it took a few minutes). Prefer
-        add_salesforce_import_fields() unless you need to remove mappings. Verified live
-        2026-09-29. No credits.
+        `fieldMapping.fieldMappings`. The response `status` flips to PENDING. Clay usually
+        starts a backfill of newly mapped fields (it has taken from minutes to many hours), but
+        it is NOT guaranteed: watch the run with get_audience_import_sync_status() and count the
+        new field's non-null values before relying on it — see the reference section "Import
+        sync state, cadence and the backfill caveat". Prefer add_salesforce_import_fields()
+        unless you need to remove mappings. Verified live 2026-09-29. No credits.
         """
         where = "update_salesforce_import_field_mapping"
         given = {
@@ -3828,7 +3839,10 @@ class ClayClient:
         endpoint was never captured): orphans go through the official CLI
         `clay audiences fields delete <audf_id> --entity-type people|companies` (soft,
         idempotent) or the UI. Verified live 2026-09-29: two fields added to a large Account
-        import, backfill started immediately (status PENDING). No credits.
+        import, backfill started immediately (status PENDING). A backfill is not guaranteed,
+        though: check with get_audience_import_sync_status() and count the new fields'
+        non-null values before relying on them (reference: "Import sync state, cadence and the
+        backfill caveat"). No credits.
         """
         where = "add_salesforce_import_fields"
         # 1. network-free
