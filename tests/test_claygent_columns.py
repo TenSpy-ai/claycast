@@ -2,7 +2,7 @@
 
 Covers get_claygent, _use_ai_param_names, _claygent_prompt_formula, claygent_column_inputs,
 create_claygent_column, _claygent_column_settings, sync_claygent_column,
-verify_claygent_column and unwrap_claygent_output.
+verify_claygent_column, unwrap_claygent_output and their private helpers.
 
 A small in-memory "Clay" (FakeClay) answers the routes and models the one server behaviour
 the docs measured live (clay-api-reference "Claygent columns from code"): on every column
@@ -11,8 +11,9 @@ Claygent's CURRENT prompt, each {{variable}} replaced by its claygentFieldMappin
 without spaces around `+`. Whether Clay really does that is a live claim and cannot be
 re-checked offline; these tests check that the code does what its docstrings say given it.
 
-Tests marked xfail(strict=True) assert the CORRECT behaviour where the shipped code is wrong;
-each reason names the defect.
+Shapes labelled "UI-made" (the Fields schema copy, modelSource `generated`, a UI-saved prompt
+with re-flowed whitespace, an answer wrapped in `parameters`) mirror columns and cells read
+from a live workspace on 2026-10-06, with every id, name and text replaced.
 """
 import copy
 import json
@@ -27,6 +28,7 @@ T = "t_1"
 CG_PATH = f"/workspaces/{WS}/claygents/c_1"
 FIELDS = f"/tables/{T}/fields"
 USE_AI_PKG = "67ba01e9-1898-4e7d-afe7-7ebe24819a57"
+SCHEMA_PROBLEM = "output schema copy differs from the Claygent's (UI: 'Unable to parse the output schema')"
 
 # Every input the fake `use-ai` action declares, in its declared order.
 USE_AI_PARAMS = ["useCase", "prompt", "model", "claygentId", "claygentFieldMapping",
@@ -36,6 +38,22 @@ SCHEMA = {"type": "object", "additionalProperties": False, "required": ["score",
           "properties": {"score": {"type": "number"}, "reason": {"type": "string", "description": "é"}}}
 PROMPT = 'Score {{company}} for fit.\nNotes: {{notes}} — say "why". é'
 VAR_MAP = {"company": "{{f_co}}", "notes": "{{f_notes}}"}
+
+# A Fields-mode output format, shaped like the UI's (each field carries id/type/options/description).
+FIELDS_SPEC = {
+    "score": {"id": "00000000-0000-4000-8000-000000000001", "type": "number", "options": "", "description": ""},
+    "summary": {"id": "00000000-0000-4000-8000-000000000002", "type": "string", "options": "",
+                "description": "é — one line"},
+}
+FIELDS_FMT = {"type": "json", "fields": FIELDS_SPEC, "jsonType": "Fields"}
+# The copy a UI-made Fields column carries: keys in this order, fields as a compact object literal.
+FIELDS_COPY = {
+    "type": '"json"',
+    "fields": '{"score":{"id":"00000000-0000-4000-8000-000000000001","type":"number","options":"",'
+              '"description":""},"summary":{"id":"00000000-0000-4000-8000-000000000002","type":"string",'
+              '"options":"","description":"é — one line"}}',
+    "jsonType": '"Fields"',
+}
 
 
 def _claygent(prompt=PROMPT, model="claude-sonnet-x", fmt=None, variables=("company", "notes"), cid="c_1"):
@@ -50,10 +68,13 @@ def _claygent(prompt=PROMPT, model="claude-sonnet-x", fmt=None, variables=("comp
 
 def _render(user_prompt, fmap, sep="+"):
     """What Clay stores as `prompt` after a write (per the docs): the Claygent's prompt with
-    each {{var}} -> its mapping expression; literals as JSON strings; no spaces around +."""
+    each mapping key ({{var}}) -> its mapping expression; literals as JSON strings; no spaces
+    around +."""
+    keys = sorted(fmap, key=len, reverse=True)
+    parts = re.split("(" + "|".join(map(re.escape, keys)) + ")", user_prompt) if keys else [user_prompt]
     pieces = []
-    for part in re.split(r"(\{\{[A-Za-z0-9_]+\}\})", user_prompt):
-        if re.fullmatch(r"\{\{[A-Za-z0-9_]+\}\}", part):
+    for i, part in enumerate(parts):
+        if i % 2:
             pieces.append(fmap[part])
         elif part:
             pieces.append(json.dumps(part, ensure_ascii=False))
@@ -87,6 +108,9 @@ class FakeClay:
     @property
     def calls(self):
         return self.client.session.calls
+
+    def writes(self):
+        return [c for c in self.calls if c["method"] != "GET"]
 
     def _get_claygent(self, call):
         cg = self.claygents[call["path"].rsplit("/", 1)[1]]
@@ -153,7 +177,8 @@ class FakeClay:
         return next(x for x in self.fields if x["id"] == fid)["typeSettings"]
 
 
-def _expected_inputs(byo=True, prompt=PROMPT, var_map=VAR_MAP, model="claude-sonnet-x", schema=SCHEMA):
+def _expected_inputs(byo=True, prompt=PROMPT, var_map=VAR_MAP, model="claude-sonnet-x", schema=SCHEMA,
+                     schema_copy=None):
     exp = {n: None for n in USE_AI_PARAMS}
     exp.update({
         "useCase": '"claygent"',
@@ -161,8 +186,8 @@ def _expected_inputs(byo=True, prompt=PROMPT, var_map=VAR_MAP, model="claude-son
         "model": json.dumps(model),
         "claygentFieldMapping": {"{{" + k + "}}": f"Clay.formatForAIPrompt({e})" for k, e in var_map.items()},
         "prompt": cc.ClayClient._claygent_prompt_formula(prompt, var_map),
-        "answerSchemaType": {"type": '"json"', "jsonType": '"JSONSchema"',
-                             "jsonSchema": json.dumps(json.dumps(schema), ensure_ascii=False)},
+        "answerSchemaType": schema_copy or {"type": '"json"', "jsonType": '"JSONSchema"',
+                                            "jsonSchema": json.dumps(json.dumps(schema), ensure_ascii=False)},
     })
     if byo:
         exp["_metadata"] = {"modelSource": '"user"'}
@@ -227,14 +252,61 @@ def test_prompt_formula_empty_and_literal_only():
 
 
 def test_prompt_formula_non_variable_braces_stay_literal():
-    # {{not a var}} (spaces) and {single} do not match the variable pattern.
+    # {{not a var}} is not in var_map and {single} is not a placeholder at all.
     assert cc.ClayClient._claygent_prompt_formula("{{not a var}} {x}", {}) == '"{{not a var}} {x}"'
 
 
-def test_prompt_formula_undeclared_variable_raises():
-    # A {{token}} in the prompt with no mapping cannot be rendered; it surfaces as KeyError.
-    with pytest.raises(KeyError):
-        cc.ClayClient._claygent_prompt_formula("{{a}} {{b}}", {"a": "1"})
+def test_prompt_formula_only_var_map_names_become_slots():
+    # A {{token}} the Claygent does not declare stays literal text; nothing raises.
+    assert cc.ClayClient._claygent_prompt_formula("{{a}} {{b}}", {"a": "1"}) == \
+        'Clay.formatForAIPrompt(1) + " {{b}}"'
+
+
+@pytest.mark.parametrize("name", ["Company Name", "Account.Domain", "Parent: Website", "a-b"])
+def test_prompt_formula_variable_names_with_spaces_dots_colons(name):
+    f = cc.ClayClient._claygent_prompt_formula("Visit {{" + name + "}} now, {{" + name + "}}.", {name: "{{f_w}}"})
+    assert f == '"Visit " + Clay.formatForAIPrompt({{f_w}}) + " now, " + Clay.formatForAIPrompt({{f_w}}) + "."'
+
+
+def test_prompt_formula_longest_name_wins():
+    # "{{a b}}" must not be read as a shorter name that happens to be a prefix.
+    f = cc.ClayClient._claygent_prompt_formula("{{a}}|{{a b}}", {"a": "1", "a b": "2"})
+    assert f == 'Clay.formatForAIPrompt(1) + "|" + Clay.formatForAIPrompt(2)'
+
+
+# ── _claygent_schema_copy / output formats ────────────────────────────────────
+
+def test_schema_copy_json_schema_is_a_string_literal_of_the_claygent_string():
+    copy_ = cc.ClayClient._claygent_schema_copy({"type": "json", "jsonType": "JSONSchema",
+                                                 "jsonSchema": json.dumps(SCHEMA, ensure_ascii=False)})
+    assert list(copy_) == ["type", "jsonType", "jsonSchema"]
+    assert json.loads(json.loads(copy_["jsonSchema"])) == SCHEMA
+    assert not _has_u_escape(copy_["jsonSchema"])
+
+
+def test_schema_copy_fields_matches_the_ui_encoding_exactly():
+    assert cc.ClayClient._claygent_schema_copy(FIELDS_FMT) == FIELDS_COPY
+    assert list(cc.ClayClient._claygent_schema_copy(FIELDS_FMT)) == ["type", "fields", "jsonType"]
+
+
+def test_schema_copy_fields_empty():
+    assert cc.ClayClient._claygent_schema_copy({"type": "json", "fields": {}, "jsonType": "Fields"})["fields"] == "{}"
+
+
+@pytest.mark.parametrize("fmt,desc", [
+    (None, "null"),
+    ({"type": "text"}, "type='text', jsonType=None"),
+    ({"type": "json"}, "type='json', jsonType=None"),                                   # no mode marker
+    ({"type": "json", "fields": {"a": {}}}, "type='json', jsonType=None"),
+    ({"type": "json", "jsonType": "JSONSchema", "jsonSchema": SCHEMA}, "type='json', jsonType='JSONSchema'"),
+    ({"type": "json", "jsonType": "Fields"}, "type='json', jsonType='Fields'"),          # no fields
+    ({"type": "json", "jsonType": "Table"}, "type='json', jsonType='Table'"),
+    ({}, "type=None, jsonType=None"),
+    ("text", "'text'"),
+])
+def test_schema_copy_unsupported_formats_raise(fmt, desc):
+    with pytest.raises(ValueError, match=re.escape(f"unsupported output format ({desc})")):
+        cc.ClayClient._claygent_schema_copy(fmt)
 
 
 # ── claygent_column_inputs ────────────────────────────────────────────────────
@@ -267,21 +339,26 @@ def test_inputs_byo_adds_metadata_even_if_action_does_not_declare_it():
 
 
 def test_inputs_fields_output_format():
-    fields = {"score": {"type": "number"}, "reason": {"type": "string", "description": "é"}}
-    fc = FakeClay(claygents={"c_1": _claygent(fmt={"type": "json", "fields": fields})})
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=FIELDS_FMT)})
     inputs = fc.client.claygent_column_inputs("c_1", VAR_MAP)
-    assert inputs["answerSchemaType"] == {"type": '"json"', "fields": json.dumps(fields, ensure_ascii=False)}
+    assert inputs["answerSchemaType"] == FIELDS_COPY
+    assert not _has_u_escape(inputs["answerSchemaType"]["fields"])
 
 
-def test_inputs_fields_output_format_without_fields():
-    fc = FakeClay(claygents={"c_1": _claygent(fmt={"type": "json"})})
-    assert fc.client.claygent_column_inputs("c_1", VAR_MAP)["answerSchemaType"] == {"type": '"json"', "fields": "{}"}
-
-
-def test_inputs_text_output_has_no_schema():
-    fc = FakeClay(claygents={"c_1": _claygent(fmt={"type": "text"})})
-    inputs = fc.client.claygent_column_inputs("c_1", VAR_MAP)
-    assert inputs["answerSchemaType"] is None
+@pytest.mark.parametrize("fmt,desc", [
+    (None, "null"),
+    ({"type": "text"}, "type='text', jsonType=None"),
+    ({"type": "json"}, "type='json', jsonType=None"),
+])
+def test_inputs_unsupported_output_format_fails_closed(fmt, desc):
+    cg = _claygent()
+    cg["currentVersion"]["outputFormat"] = fmt
+    fc = FakeClay(claygents={"c_1": cg})
+    with pytest.raises(ValueError, match=re.escape(
+            f"claygent_column_inputs: Claygent c_1 has an unsupported output format ({desc}); "
+            "only JSON Schema and Fields output can be copied onto a column")):
+        fc.client.claygent_column_inputs("c_1", VAR_MAP)
+    assert [c["path"] for c in fc.calls] == [CG_PATH]  # refused before the action catalog is read
 
 
 def test_inputs_claygent_without_variables():
@@ -299,7 +376,8 @@ def test_inputs_claygent_without_variables():
 ])
 def test_inputs_var_map_must_match_claygent_variables(var_map):
     fc = FakeClay()
-    with pytest.raises(ValueError, match=r"Claygent c_1 variables \['company', 'notes'\] != var_map keys"):
+    with pytest.raises(ValueError, match=r"^claygent_column_inputs: Claygent c_1 variables "
+                                         r"\['company', 'notes'\] != var_map keys"):
         fc.client.claygent_column_inputs("c_1", var_map)
     # validated before the action catalog is read
     assert [c["path"] for c in fc.calls] == [CG_PATH]
@@ -313,7 +391,32 @@ def test_inputs_any_expression_in_var_map():
     assert "Clay.formatForAIPrompt(JSON.stringify({{f_n}}))" in inputs["prompt"]
 
 
+def test_inputs_spaced_and_dotted_variable_names():
+    prompt = "Visit {{Account.Domain}} for {{Company Name}} ({{Parent: Site}}), then {{Account.Domain}} again."
+    names = ("Account.Domain", "Company Name", "Parent: Site")
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt, variables=names)})
+    vm = {"Account.Domain": "{{f_w}}", "Company Name": "{{f_n}}", "Parent: Site": "{{f_p}}"}
+    inputs = fc.client.claygent_column_inputs("c_1", vm)
+    assert inputs["claygentFieldMapping"] == {"{{Account.Domain}}": "Clay.formatForAIPrompt({{f_w}})",
+                                              "{{Company Name}}": "Clay.formatForAIPrompt({{f_n}})",
+                                              "{{Parent: Site}}": "Clay.formatForAIPrompt({{f_p}})"}
+    assert inputs["prompt"].count("Clay.formatForAIPrompt(") == 4
+    assert "{{Account" not in inputs["prompt"] and "{{Parent" not in inputs["prompt"]
+
+
 # ── create_claygent_column ────────────────────────────────────────────────────
+
+def _binding_list(inputs):
+    out = []
+    for k, v in inputs.items():
+        if isinstance(v, dict):
+            out.append({"name": k, "formulaMap": v})
+        elif v:
+            out.append({"name": k, "formulaText": v})
+        else:
+            out.append({"name": k})
+    return out
+
 
 def test_create_exact_request_then_verifies():
     fc = FakeClay()
@@ -322,15 +425,7 @@ def test_create_exact_request_then_verifies():
     assert col["id"] == "f_new"
     post = [c for c in fc.calls if c["method"] == "POST"]
     assert len(post) == 1 and post[0]["path"] == FIELDS
-    exp = _expected_inputs()
-    binding = []
-    for k, v in exp.items():
-        if isinstance(v, dict):
-            binding.append({"name": k, "formulaMap": v})
-        elif v:
-            binding.append({"name": k, "formulaText": v})
-        else:
-            binding.append({"name": k})
+    binding = _binding_list(_expected_inputs())
     assert post[0]["json"] == {
         "type": "action", "name": "Research", "activeViewId": "gv_1",
         "typeSettings": {
@@ -369,6 +464,32 @@ def test_create_passes_with_clay_rerendered_prompt():
     assert " + " not in stored and stored == _render(PROMPT, _expected_inputs()["claygentFieldMapping"])
 
 
+def test_create_fields_claygent_sends_the_ui_fields_copy_and_verifies():
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=FIELDS_FMT)})
+    fc.client.create_claygent_column(T, "Research", "c_1", VAR_MAP)
+    body = next(c for c in fc.calls if c["method"] == "POST")["json"]
+    sent = {x["name"]: x for x in body["typeSettings"]["inputsBinding"]}
+    assert sent["answerSchemaType"] == {"name": "answerSchemaType", "formulaMap": FIELDS_COPY}
+
+
+def test_create_spaced_variable_names_round_trip():
+    prompt = "Visit {{Account.Domain}} as {{Company Name}}."
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt, variables=("Account.Domain", "Company Name"))})
+    fc.client.create_claygent_column(T, "Research", "c_1", {"Account.Domain": "{{f_w}}", "Company Name": "{{f_n}}"})
+    assert fc.binding("f_new")["prompt"]["formulaText"] == \
+        '"Visit "+Clay.formatForAIPrompt({{f_w}})+" as "+Clay.formatForAIPrompt({{f_n}})+"."'
+
+
+@pytest.mark.parametrize("fmt", [None, {"type": "text"}])
+def test_create_unsupported_output_format_writes_nothing(fmt):
+    cg = _claygent()
+    cg["currentVersion"]["outputFormat"] = fmt
+    fc = FakeClay(claygents={"c_1": cg})
+    with pytest.raises(ValueError, match="unsupported output format"):
+        fc.client.create_claygent_column(T, "Research", "c_1", VAR_MAP)
+    assert fc.writes() == [] and fc.fields == []
+
+
 def test_create_raises_when_read_back_differs_but_column_exists():
     def drop_schema(b):
         b["answerSchemaType"].pop("formulaMap")  # stored bare: the schema copy did not stick
@@ -382,7 +503,7 @@ def test_create_bad_var_map_sends_nothing():
     fc = FakeClay()
     with pytest.raises(ValueError):
         fc.client.create_claygent_column(T, "Research", "c_1", {"company": "{{f_co}}"})
-    assert not [c for c in fc.calls if c["method"] != "GET"]
+    assert not fc.writes()
 
 
 # ── _claygent_column_settings ─────────────────────────────────────────────────
@@ -428,7 +549,9 @@ def test_verify_accepts_our_own_spaced_prompt_too():
 
 
 @pytest.mark.parametrize("cid_binding", [None, {"name": "claygentId"}, {"name": "claygentId", "formulaText": "null"},
-                                         {"name": "claygentId", "formulaText": '""'}])
+                                         {"name": "claygentId", "formulaText": '""'},
+                                         {"name": "claygentId", "formulaText": "'c_1'"},   # not a JSON literal
+                                         {"name": "claygentId", "formulaText": "42"}])
 def test_verify_unbound_column(cid_binding):
     fc = FakeClay()
     inputs = _expected_inputs()
@@ -453,13 +576,11 @@ def test_verify_model_differs_after_claygent_edit():
     assert r["ok"] is False and r["problems"] == ["model differs from the Claygent's"]
 
 
-def test_verify_model_binding_unset():
+@pytest.mark.parametrize("model", [None, "'claude-sonnet-x'"])  # unset, or not a JSON literal
+def test_verify_model_binding_unset_or_unreadable(model):
     fc = FakeClay()
-    fc.add_column({**_expected_inputs(), "model": None})
+    fc.add_column({**_expected_inputs(), "model": model})
     assert _verify(fc)["problems"] == ["model differs from the Claygent's"]
-
-
-SCHEMA_PROBLEM = "output schema copy differs from the Claygent's (UI: 'Unable to parse the output schema')"
 
 
 @pytest.mark.parametrize("stored", [
@@ -469,6 +590,9 @@ SCHEMA_PROBLEM = "output schema copy differs from the Claygent's (UI: 'Unable to
     {"type": '"json"', "jsonType": '"JSONSchema"', "jsonSchema": json.dumps(SCHEMA)},  # single-encoded
     {"type": '"json"', "jsonType": '"JSONSchema"',
      "jsonSchema": json.dumps(json.dumps({**SCHEMA, "required": ["score"]}))},  # different schema
+    {"type": '"json"', "jsonSchema": json.dumps(json.dumps(SCHEMA))},           # no mode marker
+    {"type": '"json"', "jsonType": '"Fields"', "jsonSchema": json.dumps(json.dumps(SCHEMA))},  # wrong marker
+    FIELDS_COPY,                                                                # the other mode's copy
 ])
 def test_verify_schema_copy_problems(stored):
     fc = FakeClay()
@@ -479,8 +603,8 @@ def test_verify_schema_copy_problems(stored):
 def test_verify_schema_compare_ignores_key_order_and_whitespace():
     fc = FakeClay()
     reordered = json.dumps(dict(reversed(list(SCHEMA.items()))), indent=2)
-    fc.add_column({**_expected_inputs(), "answerSchemaType": {"type": '"json"', "jsonType": '"JSONSchema"',
-                                                              "jsonSchema": json.dumps(reordered)}})
+    fc.add_column({**_expected_inputs(), "answerSchemaType": {"jsonSchema": json.dumps(reordered),
+                                                              "jsonType": ' "JSONSchema" ', "type": '"json"'}})
     assert _verify(fc)["ok"] is True
 
 
@@ -492,34 +616,75 @@ def test_verify_schema_stale_after_claygent_schema_edit():
     assert _verify(fc)["problems"] == [SCHEMA_PROBLEM]
 
 
-def test_verify_text_output_claygent_skips_schema_check():
-    fc = FakeClay(claygents={"c_1": _claygent(fmt={"type": "text"})})
-    fc.add_column({**_expected_inputs(), "answerSchemaType": None})
-    assert _verify(fc)["ok"] is True
+def test_verify_claygent_schema_that_is_not_json_is_a_problem():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["outputFormat"]["jsonSchema"] = "{oops"
+    assert _verify(fc)["problems"] == [SCHEMA_PROBLEM]
 
 
-def test_verify_prompt_missing_piece_after_claygent_prompt_edit():
+def test_verify_fields_copy_from_a_ui_made_column_is_ok():
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=FIELDS_FMT)})
+    fc.add_column(_expected_inputs(schema_copy=FIELDS_COPY))
+    assert _verify(fc, var_map=VAR_MAP) == {"ok": True, "problems": [], "claygent_id": "c_1"}
+
+
+@pytest.mark.parametrize("stored", [
+    None,                                                                           # copy missing
+    {"type": '"json"', "fields": FIELDS_COPY["fields"]},                            # no jsonType marker
+    {**FIELDS_COPY, "fields": '{"totally_wrong":{"type":"string"}}'},              # stale / wrong fields
+    {**FIELDS_COPY, "fields": json.dumps(json.dumps(FIELDS_SPEC))},                # double-encoded
+    {**FIELDS_COPY, "fields": "{broken"},
+])
+def test_verify_checks_the_fields_copy(stored):
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=FIELDS_FMT)})
+    fc.add_column({**_expected_inputs(), "answerSchemaType": stored})
+    assert _verify(fc)["problems"] == [SCHEMA_PROBLEM]
+
+
+def test_verify_fields_copy_stale_after_claygent_fields_edit():
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=copy.deepcopy(FIELDS_FMT))})
+    fc.add_column(_expected_inputs(schema_copy=FIELDS_COPY))
+    fc.claygents["c_1"]["currentVersion"]["outputFormat"]["fields"]["summary"]["type"] = "boolean"
+    assert _verify(fc)["problems"] == [SCHEMA_PROBLEM]
+
+
+@pytest.mark.parametrize("fmt,desc", [
+    (None, "null"),
+    ({"type": "text"}, "type='text', jsonType=None"),
+    ({"type": "json", "jsonType": "Table"}, "type='json', jsonType='Table'"),
+])
+def test_verify_unsupported_output_format_is_reported_not_passed(fmt, desc):
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["outputFormat"] = fmt
+    r = _verify(fc)
+    assert r["ok"] is False
+    assert r["problems"] == [f"schema copy not checked: unsupported output format ({desc})"]
+
+
+def test_verify_prompt_differs_after_claygent_prompt_edit():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
     fc.claygents["c_1"]["currentVersion"]["userPrompt"] = PROMPT.replace("for fit.", "for ICP fit.")
     r = _verify(fc)
     assert r["ok"] is False
-    assert r["problems"] == ["stored prompt is missing a piece of the Claygent prompt near: ' for ICP fit.\\nNotes: '"]
+    assert r["problems"] == ["stored prompt text differs from the Claygent prompt near: ' for ICP fit.\\nNotes: '"]
 
 
 def test_verify_prompt_pieces_must_be_in_order():
     fc = FakeClay(claygents={"c_1": _claygent(prompt="AAA {{company}} BBB {{notes}}")})
     fc.add_column(_expected_inputs(prompt="AAA {{company}} BBB {{notes}}"))
     fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "BBB {{company}} AAA {{notes}}"
-    assert any("missing a piece" in p for p in _verify(fc)["problems"])
+    assert _verify(fc)["problems"] == ["stored prompt text differs from the Claygent prompt near: 'BBB '"]
 
 
-def test_verify_prompt_reports_only_first_missing_piece():
+def test_verify_prompt_reports_only_first_differing_piece():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
     fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "X {{company}} Y {{notes}} Z"
-    probs = [p for p in _verify(fc)["problems"] if "missing a piece" in p]
-    assert probs == ["stored prompt is missing a piece of the Claygent prompt near: 'X '"]
+    probs = [p for p in _verify(fc)["problems"] if "differs" in p]
+    assert probs == ["stored prompt text differs from the Claygent prompt near: 'X '"]
 
 
 def test_verify_prompt_long_piece_truncated_in_message():
@@ -530,21 +695,133 @@ def test_verify_prompt_long_piece_truncated_in_message():
     assert f"near: {'L' * 60!r}" in _verify(fc)["problems"][0]
 
 
+def test_verify_flags_text_removed_from_claygent_prompt():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    # Claygent edited after the column's last write: the trailing instruction is deleted.
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "Score {{company}} for fit.\nNotes: {{notes}}"
+    assert _verify(fc)["problems"] == [
+        "stored prompt text differs from the Claygent prompt near: ' — say \"why\". é'"]
+
+
+def test_verify_flags_text_removed_before_the_first_variable():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = PROMPT.replace("Score ", "")
+    assert _verify(fc)["problems"] == ["stored prompt text differs from the Claygent prompt near: 'Score '"]
+
+
+def test_verify_flags_text_added_to_claygent_prompt():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = PROMPT + " Be brief."
+    assert _verify(fc)["ok"] is False
+
+
+def test_verify_flags_a_moved_variable():
+    fc = FakeClay(claygents={"c_1": _claygent(prompt="A {{company}}{{notes}} B")})
+    fc.add_column(_expected_inputs(prompt="A {{company}}{{notes}} B"))
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "A {{company}} B{{notes}}"
+    assert _verify(fc)["problems"] == ["stored prompt text differs from the Claygent prompt near: ' B'"]
+
+
 def test_verify_prompt_fewer_variable_slots():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
     b = fc.binding()
     # keep every literal piece but drop the second variable's slot
     b["prompt"]["formulaText"] = b["prompt"]["formulaText"].replace("Clay.formatForAIPrompt({{f_notes}})", '""')
-    assert _verify(fc)["problems"] == ["stored prompt has fewer variable slots than the Claygent prompt"]
+    assert _verify(fc)["problems"] == ["stored prompt has 1 variable slot(s), the Claygent prompt has 2"]
+
+
+def test_verify_prompt_extra_variable_slot():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    b = fc.binding()
+    b["prompt"]["formulaText"] += "+Clay.formatForAIPrompt({{f_x}})"
+    assert _verify(fc)["problems"] == ["stored prompt has 3 variable slot(s), the Claygent prompt has 2"]
+
+
+def test_verify_prompt_slot_count_and_text_both_reported():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "Only {{company}} here."
+    fc.claygents["c_1"]["currentVersion"]["variables"].pop()
+    probs = _verify(fc)["problems"]
+    assert probs[:2] == ["stored prompt text differs from the Claygent prompt near: 'Only '",
+                         "stored prompt has 2 variable slot(s), the Claygent prompt has 1"]
 
 
 def test_verify_prompt_binding_unset():
     fc = FakeClay()
     fc.add_column({**_expected_inputs(), "prompt": None}, rerender=False)
-    probs = _verify(fc)["problems"]
-    assert probs[0].startswith("stored prompt is missing a piece")
-    assert probs[1] == "stored prompt has fewer variable slots than the Claygent prompt"
+    assert _verify(fc)["problems"] == [
+        "stored prompt text differs from the Claygent prompt near: 'Score '",
+        "stored prompt has 0 variable slot(s), the Claygent prompt has 2"]
+
+
+@pytest.mark.parametrize("stored", [
+    '"a" +',                                   # dangling +
+    '+ "a"',                                   # leading +
+    '"a" "b"',                                 # no operator
+    '"unterminated',
+    'Clay.formatForAIPrompt({{f_co}}',          # unbalanced
+    'Clay.formatForAIPrompt({{f_co}} + ")"',    # unbalanced after a string holding ')'
+    'Clay.formatForAIPrompt({{f_co}} + ")',     # unterminated string inside a slot
+    '"a" + {{f_co}}',                          # a bare reference, not a slot
+    "'single'",
+])
+def test_verify_unreadable_prompt_formula_is_a_problem(stored):
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.binding()["prompt"]["formulaText"] = stored
+    assert _verify(fc)["problems"] == [
+        "stored prompt is not a +-joined list of string literals and Clay.formatForAIPrompt(...) slots"]
+
+
+def test_verify_whitespace_reflowed_by_a_ui_save_is_ok():
+    # UI-made: a column saved from the UI stored the Claygent's prompt with the blank line after a
+    # heading dropped, trailing spaces gone, the trailing blank lines dropped, and " + " separators.
+    prompt = "### Goal\n\nScore {{company}}.  \n\n\n### Notes\n\n{{notes}}\n\n"
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt)}, rerender=False)
+    fc.add_column(_expected_inputs(prompt=prompt), rerender=False)
+    fc.binding()["prompt"]["formulaText"] = (
+        '"### Goal\\nScore " + Clay.formatForAIPrompt({{f_co}}) + ".\\n### Notes\\n" + '
+        'Clay.formatForAIPrompt({{f_notes}})')
+    assert _verify(fc, var_map=VAR_MAP) == {"ok": True, "problems": [], "claygent_id": "c_1"}
+
+
+def test_verify_whitespace_inside_a_line_still_counts():
+    fc = FakeClay()
+    fc.add_column(_expected_inputs())
+    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = PROMPT.replace("for fit.", "for  fit.")
+    assert _verify(fc)["ok"] is False
+
+
+def test_verify_slot_expressions_with_parens_quotes_and_escapes():
+    vm = {"company": '{{f_co}} + " (" + ({{f_dom}} || \'?\') + ")"', "notes": 'String({{f_n}}).replace(/x/g, "\\")")'}
+    fc = FakeClay()
+    fc.add_column(_expected_inputs(var_map=vm))
+    assert _verify(fc, var_map=vm)["ok"] is True
+
+
+def test_verify_spaced_and_dotted_variable_names():
+    # UI-made: Claygent variables such as "Account.Domain" or "Parent: Website".
+    prompt = "Visit {{Account.Domain}} ({{Parent: Website}}). Use only {{Account.Domain}}."
+    names = ("Account.Domain", "Parent: Website")
+    vm = {"Account.Domain": "{{f_w}}", "Parent: Website": "{{f_p}}"}
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt, variables=names)})
+    fc.add_column(_expected_inputs(prompt=prompt, var_map=vm))
+    assert _verify(fc, var_map=vm) == {"ok": True, "problems": [], "claygent_id": "c_1"}
+    assert fc.binding()["prompt"]["formulaText"].count("Clay.formatForAIPrompt(") == 3
+
+
+def test_verify_undeclared_placeholder_is_literal_text():
+    # {{other}} is not a declared variable: it is plain text on both sides.
+    prompt = "Score {{company}} and {{notes}} with {{other}} as text."
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt)})
+    fc.add_column(_expected_inputs(prompt=prompt))
+    assert _verify(fc)["ok"] is True
 
 
 def test_verify_mapping_keys_differ():
@@ -582,29 +859,9 @@ def test_verify_collects_every_problem():
     probs = _verify(fc)["problems"]
     assert len(probs) == 5
     assert probs[0] == "model differs from the Claygent's" and probs[1] == SCHEMA_PROBLEM
-    assert probs[2].startswith("stored prompt is missing a piece")
-    assert probs[3] == "stored prompt has fewer variable slots than the Claygent prompt"
+    assert probs[2].startswith("stored prompt text differs")
+    assert probs[3] == "stored prompt has 2 variable slot(s), the Claygent prompt has 3"
     assert probs[4].startswith("variable mapping")
-
-
-@pytest.mark.xfail(strict=True, reason="verify only checks that the Claygent's literal pieces appear in the stored "
-                   "prompt in order; text REMOVED from the Claygent (a whole literal piece next to a variable) leaves "
-                   "the stale column reporting ok=True")
-def test_verify_flags_text_removed_from_claygent_prompt():
-    fc = FakeClay()
-    fc.add_column(_expected_inputs())
-    # Claygent edited after the column's last write: the trailing instruction is deleted.
-    fc.claygents["c_1"]["currentVersion"]["userPrompt"] = "Score {{company}} for fit.\nNotes: {{notes}}"
-    assert _verify(fc)["ok"] is False
-
-
-@pytest.mark.xfail(strict=True, reason="verify skips the schema copy entirely for a 'fields'-type json Claygent, so a "
-                   "stale or missing answerSchemaType is reported ok=True despite the docstring's 'schema copy (exact)'")
-def test_verify_checks_fields_type_schema_copy():
-    fields = {"score": {"type": "number"}}
-    fc = FakeClay(claygents={"c_1": _claygent(fmt={"type": "json", "fields": fields})})
-    fc.add_column({**_expected_inputs(), "answerSchemaType": None})  # schema copy missing
-    assert _verify(fc)["ok"] is False
 
 
 # ── sync_claygent_column ──────────────────────────────────────────────────────
@@ -615,6 +872,12 @@ def _edit_claygent(fc, model="claude-opus-y", schema=None, prompt=None):
     v["outputFormat"]["jsonSchema"] = json.dumps(schema or {**SCHEMA, "required": ["score"]})
     if prompt:
         v["userPrompt"] = prompt
+
+
+def _patch_bindings(fc, n_before=0):
+    patches = [c for c in fc.calls[n_before:] if c["method"] == "PATCH"]
+    assert len(patches) == 1
+    return patches[0]["json"]["typeSettings"]["inputsBinding"]
 
 
 def test_sync_recopies_schema_and_model_keeps_everything_else():
@@ -656,6 +919,17 @@ def test_sync_reads_complex_existing_mapping_back():
     assert fc.binding()["claygentFieldMapping"]["formulaMap"]["{{company}}"] == f"Clay.formatForAIPrompt({vm['company']})"
 
 
+def test_sync_reads_spaced_and_dotted_names_back():
+    prompt = "Visit {{Account.Domain}} for {{Company Name}} ({{Parent: Website}})."
+    names = ("Account.Domain", "Company Name", "Parent: Website")
+    vm = {"Account.Domain": "{{f_w}}", "Company Name": "{{f_n}}", "Parent: Website": "{{f_p}}"}
+    fc = FakeClay(claygents={"c_1": _claygent(prompt=prompt, variables=names)})
+    fc.add_column(_expected_inputs(prompt=prompt, var_map=vm))
+    _edit_claygent(fc)
+    assert fc.client.sync_claygent_column(T, "f_1") == {"ok": True, "problems": [], "claygent_id": "c_1"}
+    assert fc.binding()["claygentFieldMapping"]["formulaMap"] == _expected_inputs(var_map=vm)["claygentFieldMapping"]
+
+
 def test_sync_with_explicit_var_map_remaps():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
@@ -684,6 +958,53 @@ def test_sync_without_byo_keeps_metadata_bare():
     assert fc.binding()["_metadata"] == {"name": "_metadata"}
 
 
+@pytest.mark.parametrize("meta", [
+    {"modelSource": "generated"},      # UI-made: Clay's own value, written unquoted
+    {"modelSource": '"generated"'},
+    {"modelSource": '"clay"'},
+    {"modelSource": '"user"', "other": '"x"'},
+])
+def test_sync_never_changes_the_columns_metadata(meta):
+    # _metadata decides which key a column bills; sync must send it back exactly as found.
+    fc = FakeClay()
+    fc.add_column({**_expected_inputs(), "_metadata": meta})
+    _edit_claygent(fc)
+    n_before = len(fc.calls)
+    fc.client.sync_claygent_column(T, "f_1")
+    sent = {x["name"]: x for x in _patch_bindings(fc, n_before)}
+    assert sent["_metadata"] == {"name": "_metadata", "formulaMap": meta}
+    assert fc.binding()["_metadata"]["formulaMap"] == meta
+
+
+def test_sync_never_adds_metadata_the_column_lacks():
+    fc = FakeClay()  # the fake action declares _metadata
+    inputs = _expected_inputs()
+    del inputs["_metadata"]
+    fc.add_column(inputs)
+    fc.client.sync_claygent_column(T, "f_1")
+    assert "_metadata" not in [x["name"] for x in _patch_bindings(fc)]
+
+
+def test_sync_ui_made_column_keeps_its_billing_and_extra_inputs():
+    # UI-made: modelSource `generated`, an input the action no longer declares, a Fields copy.
+    fc = FakeClay(claygents={"c_1": _claygent(fmt=FIELDS_FMT)},
+                  params=[p for p in USE_AI_PARAMS if p != "_metadata"] + ["maxTokens"])
+    inputs = _expected_inputs(schema_copy=FIELDS_COPY)
+    del inputs["temperature"], inputs["_metadata"]
+    inputs.update({"browserbaseContextId": None, "_metadata": {"modelSource": "generated"}})
+    fc.add_column(inputs, extra_ts={"authAccountId": "aa_9"})
+    fc.client.sync_claygent_column(T, "f_1")
+    names = [x["name"] for x in _patch_bindings(fc)]
+    # create's order (declared params), then the column's own extras in their order
+    assert names == ["useCase", "prompt", "model", "claygentId", "claygentFieldMapping", "answerSchemaType",
+                     "temperature", "maxTokens", "browserbaseContextId", "_metadata"]
+    b = fc.binding()
+    assert b["_metadata"] == {"name": "_metadata", "formulaMap": {"modelSource": "generated"}}
+    assert b["temperature"] == {"name": "temperature"} and b["maxTokens"] == {"name": "maxTokens"}
+    assert b["answerSchemaType"]["formulaMap"] == FIELDS_COPY
+    assert fc.ts()["authAccountId"] == "aa_9"
+
+
 @pytest.mark.parametrize("bad", [
     {"{{company}}": "{{f_co}}", "{{notes}}": "Clay.formatForAIPrompt({{f_notes}})"},   # not wrapped
     {"company": "Clay.formatForAIPrompt({{f_co}})", "{{notes}}": "Clay.formatForAIPrompt({{f_notes}})"},  # bad key
@@ -691,7 +1012,7 @@ def test_sync_without_byo_keeps_metadata_bare():
 def test_sync_unreadable_mapping_raises_before_writing(bad):
     fc = FakeClay()
     fc.add_column({**_expected_inputs(), "claygentFieldMapping": bad}, rerender=False)
-    with pytest.raises(ValueError, match="cannot read the existing mapping for .*; pass var_map"):
+    with pytest.raises(ValueError, match="^sync_claygent_column: cannot read the existing mapping for .*; pass var_map"):
         fc.client.sync_claygent_column(T, "f_1")
     assert not [c for c in fc.calls if c["method"] == "PATCH"]
 
@@ -729,61 +1050,84 @@ def test_sync_verifies_with_the_var_map_it_wrote():
         fc.client.sync_claygent_column(T, "f_1", {"company": "{{f_new}}", "notes": "{{f_notes}}"})
 
 
-@pytest.mark.xfail(strict=True, raises=KeyError, reason="sync on a column with no claygentId binding raises a bare "
-                   "KeyError('claygentId') instead of a clear error (verify handles the same case gracefully)")
-def test_sync_unbound_column_raises_clear_error():
+@pytest.mark.parametrize("cid_binding", [None, {"name": "claygentId"}, {"name": "claygentId", "formulaText": "'c_1'"}])
+def test_sync_unbound_column_raises_clear_error(cid_binding):
     fc = FakeClay()
     inputs = _expected_inputs()
     del inputs["claygentId"]
-    fc.add_column(inputs, rerender=False)
-    with pytest.raises(ValueError, match="not bound"):
+    fid = fc.add_column(inputs, rerender=False)
+    if cid_binding is not None:
+        fc.ts(fid)["inputsBinding"].append(cid_binding)
+    with pytest.raises(ValueError, match="^sync_claygent_column: field f_1 is not bound to a saved Claygent$"):
         fc.client.sync_claygent_column(T, "f_1")
+    assert not fc.writes()
 
 
-@pytest.mark.xfail(strict=True, reason="sync only rewrites inputsBinding entries that already exist; a column with no "
-                   "answerSchemaType entry (the 'Unable to parse the output schema' case sync is meant to repair) never "
-                   "gets one, so sync PATCHes and then raises 'sync did not stick'")
 def test_sync_adds_missing_schema_binding():
+    # The "Unable to parse the output schema" state: the column has no answerSchemaType entry.
     fc = FakeClay()
     inputs = _expected_inputs()
     del inputs["answerSchemaType"]
     fc.add_column(inputs)
+    assert fc.client.verify_claygent_column(T, "f_1")["problems"] == [SCHEMA_PROBLEM]
     assert fc.client.sync_claygent_column(T, "f_1")["ok"] is True
-    assert "answerSchemaType" in fc.binding()
+    assert fc.binding()["answerSchemaType"] == {"name": "answerSchemaType",
+                                                "formulaMap": _expected_inputs()["answerSchemaType"]}
+    assert [x["name"] for x in fc.ts()["inputsBinding"]] == USE_AI_PARAMS  # in create's position
 
 
-@pytest.mark.xfail(strict=True, reason="when the Claygent's output changes from a JSON schema to text, "
-                   "claygent_column_inputs yields answerSchemaType=None and sync treats None as 'keep existing', so the "
-                   "column keeps the OLD schema copy; verify skips the schema check for text output and reports ok")
-def test_sync_clears_schema_when_claygent_switches_to_text():
+def test_sync_adds_owned_inputs_the_column_lacks():
+    fc = FakeClay()
+    fc.add_column({"claygentId": '"c_1"', "claygentFieldMapping": _expected_inputs()["claygentFieldMapping"]},
+                  rerender=False)
+    assert fc.client.sync_claygent_column(T, "f_1")["ok"] is True
+    assert [x["name"] for x in fc.ts()["inputsBinding"]] == [p for p in USE_AI_PARAMS if p != "_metadata"]
+
+
+def test_sync_binds_an_empty_owned_value_bare():
+    # A Claygent with an empty prompt renders an empty prompt formula: bound bare, as create does.
+    fc = FakeClay(claygents={"c_1": _claygent(prompt="", variables=None)})
+    fc.add_column(_expected_inputs(prompt="", var_map={}))
+    fc.client.sync_claygent_column(T, "f_1")
+    assert {"name": "prompt"} in _patch_bindings(fc)
+
+
+def test_sync_replaces_a_stale_copy_when_the_output_mode_changes():
     fc = FakeClay()
     fc.add_column(_expected_inputs())
-    fc.claygents["c_1"]["currentVersion"]["outputFormat"] = {"type": "text"}
+    fc.claygents["c_1"]["currentVersion"]["outputFormat"] = copy.deepcopy(FIELDS_FMT)
+    assert fc.client.verify_claygent_column(T, "f_1")["problems"] == [SCHEMA_PROBLEM]
     assert fc.client.sync_claygent_column(T, "f_1")["ok"] is True
-    assert fc.binding()["answerSchemaType"] == {"name": "answerSchemaType"}
+    assert fc.binding()["answerSchemaType"]["formulaMap"] == FIELDS_COPY
 
 
-@pytest.mark.xfail(strict=True, reason="sync infers byo_key from ANY non-empty _metadata formulaMap and then writes "
-                   "modelSource '\"user\"', overwriting whatever modelSource the column had")
-def test_sync_preserves_existing_model_source():
+@pytest.mark.parametrize("fmt", [{"type": "text"}, None])
+def test_sync_refuses_an_unsupported_output_format_before_writing(fmt):
+    # A switch to text (or a null format) is unmeasured: sync must neither keep the stale copy and
+    # report ok, nor guess a new one.
     fc = FakeClay()
-    fc.add_column({**_expected_inputs(), "_metadata": {"modelSource": '"clay"'}})
-    fc.client.sync_claygent_column(T, "f_1")
-    assert fc.binding()["_metadata"]["formulaMap"] == {"modelSource": '"clay"'}
+    fc.add_column(_expected_inputs())
+    before = copy.deepcopy(fc.ts())
+    fc.claygents["c_1"]["currentVersion"]["outputFormat"] = fmt
+    with pytest.raises(ValueError, match="unsupported output format"):
+        fc.client.sync_claygent_column(T, "f_1")
+    assert not fc.writes() and fc.ts() == before
 
 
 # ── unwrap_claygent_output ────────────────────────────────────────────────────
 
 U = cc.ClayClient.unwrap_claygent_output
 KEYS = ["score", "reason"]
+META = {"stepsTaken": [], "totalInputTokens": 9, "totalOutputTokens": 50, "timeTakenInSeconds": "4.2",
+        "totalCostToAIProvider": "$0.01", "forcedToFinishEarlyBecauseOfCost": False}
 
 
 @pytest.mark.parametrize("value,expected", [
     ({"score": 7, "reason": "fit"}, {"score": 7, "reason": "fit"}),                      # top level
-    ({"score": 7, "other": 1}, {"score": 7, "other": 1}),                                # any key -> top level
+    ({"score": 7, "other": 1}, {"score": 7, "other": 1}),                                # partial top level
     ({"body": {"score": 7, "reason": "fit"}}, {"score": 7, "reason": "fit"}),            # one level down
     ({"parameters": {"score": 1, "reason": "x", "extra": 2}}, {"score": 1, "reason": "x", "extra": 2}),
-    ({"body": {"score": 7}}, {}),                                                         # nested, partial -> {}
+    ({"body": {"score": 7}}, {"score": 7}),                                               # nested partial
     ({"a": "s", "b": [1], "c": {"score": 1, "reason": "r"}}, {"score": 1, "reason": "r"}),  # skips non-dicts
     ({"a": {"score": 1, "reason": "first"}, "b": {"score": 2, "reason": "second"}}, {"score": 1, "reason": "first"}),
     ({"body": {"inner": {"score": 1, "reason": "r"}}}, {}),                              # only one level searched
@@ -803,12 +1147,65 @@ def test_unwrap(value, expected):
     assert U(value, KEYS) == expected
 
 
-def test_unwrap_returns_same_object_and_is_static():
+def test_unwrap_prefers_the_object_holding_all_keys():
+    # The top level holds one key, the wrapped answer both: the wrapped answer wins.
+    assert U({"score": 1, "body": {"score": 2, "reason": "r"}}, KEYS) == {"score": 2, "reason": "r"}
+    # Neither holds all: the one holding the most wins; a tie goes to the top level.
+    v = {"score": 1, "body": {"score": 2, "reason": "r", "x": 0}}
+    assert U(v, ["score", "reason", "summary"]) == {"score": 2, "reason": "r", "x": 0}
+    assert U({"score": 1, "body": {"reason": "r"}}, ["score", "reason", "summary"]) == \
+        {"score": 1, "body": {"reason": "r"}}
+
+
+def test_unwrap_strips_clay_metadata_unless_requested():
+    cell = {"score": 1, "reason": "r", "reasoning": "clay", "confidence": "high", **META}
+    assert U(cell, KEYS) == {"score": 1, "reason": "r"}
+    assert U(cell, ["score", "reason", "totalOutputTokens", "confidence"]) == \
+        {"score": 1, "reason": "r", "confidence": "high", "totalOutputTokens": 50}
+    assert set(cc.ClayClient.CLAYGENT_META_KEYS) == set(META) | {"reasoning", "confidence"}
+
+
+def test_unwrap_metadata_named_schema_key_with_a_wrapped_answer():
+    # A schema key named like Clay's metadata ("reasoning") must not make the top level look
+    # like the answer when the real answer is wrapped.
+    cell = {"body": {"score": 1, "reasoning": "mine"}, "reasoning": "clay-meta", **META}
+    assert U(cell, ["score", "reasoning"]) == {"score": 1, "reasoning": "mine"}
+    assert U(cell, ["score"]) == {"score": 1}
+
+
+def test_unwrap_real_wrapped_shape():
+    # UI-made: the answer arrived under "parameters"; Clay's keys sit at the top level, and the
+    # wrapper also carries reasoning/confidence.
+    cell = {"confidence": "high", "parameters": {"reasoning": "why", "confidence": "medium", "pitch": "p",
+                                                 "angle": {"name": "a", "reasoning": "nested"}},
+            **META}
+    assert U(cell, ["angle", "pitch"]) == {"pitch": "p", "angle": {"name": "a", "reasoning": "nested"}}
+    assert U(cell, ["angle", "confidence"]) == {"confidence": "medium", "pitch": "p",
+                                                "angle": {"name": "a", "reasoning": "nested"}}
+
+
+def test_unwrap_truncated_answer_is_partial_and_flag_can_be_kept():
+    cell = {"score": 1, "reasoning": "clay", **META, "totalOutputTokens": 4096}
+    assert U(cell, ["score", "reason", "summary"]) == {"score": 1}
+    assert U(cell, ["score", "reason", "totalOutputTokens"]) == {"score": 1, "totalOutputTokens": 4096}
+
+
+def test_unwrap_only_metadata_names_requested():
+    cell = {"reasoning": "clay", "score": 1, **META}
+    assert U(cell, ["reasoning"]) == {"reasoning": "clay", "score": 1}
+    assert U({"parameters": {"confidence": "low"}, "stepsTaken": []}, ["confidence"]) == {"confidence": "low"}
+
+
+def test_unwrap_empty_keys_returns_the_top_level_without_metadata():
+    assert U({"score": 1, **META}, []) == {"score": 1}
+
+
+def test_unwrap_returns_a_new_dict_and_is_static():
     v = {"score": 1, "reason": "r"}
-    assert U(v, KEYS) is v
+    assert U(v, KEYS) == v and U(v, KEYS) is not v
     nested = {"body": {"score": 1, "reason": "r"}}
-    assert U(nested, KEYS) is nested["body"]
-    assert make_client(cc).unwrap_claygent_output(v, KEYS) is v
+    assert U(nested, KEYS) == nested["body"] and U(nested, KEYS) is not nested["body"]
+    assert make_client(cc).unwrap_claygent_output(v, KEYS) == v
 
 
 def test_use_ai_package_id_matches_create_action_column_docs():
