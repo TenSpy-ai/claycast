@@ -1537,9 +1537,16 @@ and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. 
 - **There is no json-typed formula column:** PATCHing a formula with
   `dataTypeSettings.type: "json"` returns 400 `Data type "json" is not supported for basic fields`.
   A formula returns text; pass structure as a JSON string and `JSON.parse` it downstream.
+- `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
+- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost.
+  To name an intermediate value, pass it into an arrow IIFE: `((x) => x.a + x.b)(JSON.parse(s))`.
+- ~~`.includes()`, `.indexOf()`, `.some()`, `.filter()`, `.map()`, `.find()`, regex `\b`~~: all
+  **WORK** as of 2026-09-30 (probe above). These entries dated from earlier testing; either Clay's
+  evaluator changed or the original failures had another cause, such as a statement body in the
+  same formula.
 
-**Cell size cap: 8,192 characters, and a longer value is DROPPED SILENTLY** (verified
-2026-09-30):
+**Cell size cap for text and formula cells: 8,192 characters, and a longer value is DROPPED
+SILENTLY** (verified 2026-09-30):
 - A formula RESULT of 8,193+ characters stores nothing. The cell still reports `status: SUCCESS`,
   with `coercionErrorCode: "SIZE_LIMIT_EXCEED"` in its metadata.
 - **Plain TEXT cells have the same cap:** writing 8,193 / 20k / 100k / 300k characters via the
@@ -1549,8 +1556,10 @@ and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. 
 - Formula TEXT (the source) is not capped this way: a 60,000-character string literal inside a
   formula evaluated fine.
 - Design rule: keep each formula's output well under 8 KB, split big results across columns, and
-  check any input that could exceed 8 KB before trusting a formula that reads it. The limit for
-  action cells (AI, HTTP, SOQL results) was not measured here.
+  check any input that could exceed 8 KB before trusting a formula that reads it.
+- **SOQL action cells are not capped this way:** a 1,000-row SOQL result (~204 KB of JSON) arrived
+  whole in its action cell (action-registry.md, SOQL gotcha 4). AI and HTTP action cells were not
+  measured.
 
 **Also verified working 2026-09-30:**
 - values and coercion: `undefined`, `==`/`!=`, `Math.trunc`, `Number(' 72 ')` / `Number('0x40')` /
@@ -1562,13 +1571,6 @@ and `[...iterable]`. Use `Object.assign({}, a, b)` and `Array.from(x)` instead. 
 
 A formula that throws (e.g. `JSON.parse('{')`) shows status ERROR with `staleReason: FORMULA_ERROR`
 (visible, unlike the silent failures above).
-- `REGEXMATCH()`, `REGEXEXTRACT()`, `LOWER()` — these are spreadsheet functions, NOT available in Clay
-- Multi-statement `let` with semicolons — only last expression returns, earlier variables lost.
-  To name an intermediate value, pass it into an arrow IIFE: `((x) => x.a + x.b)(JSON.parse(s))`.
-- ~~`.includes()`, `.indexOf()`, `.some()`, `.filter()`, `.map()`, `.find()`, regex `\b`~~: all
-  **WORK** as of 2026-09-30 (probe above). These entries dated from earlier testing; either Clay's
-  evaluator changed or the original failures had another cause, such as a statement body in the
-  same formula.
 
 **Pattern for complex formulas:** Nested ternaries with inline expressions still work and stay
 readable for short rules. For anything longer, bind values once through an arrow IIFE and use the
@@ -1659,8 +1661,9 @@ clay.patch(f"/tables/{tid}/fields/{fid}", {
 | Run rejected: "Field runRecords - Required" | Missing runRecords | Always include `"runRecords": {"recordIds": [...]}` or `{"viewId": ...}` |
 | `ERROR_TOO_MANY_RUNS` | Column triggered too many times in short window | Wait ~3 minutes, then retry |
 | http-api-v2 queryString/headers broken (chars 0,1,2,3...) — verified 2026-04-23 | Used `formulaText` with JSON object | Use `formulaMap` with per-key formulas. The cell preview `"Status Code: 200"` can hide this if the target server accepts any GET — verify via `externalContent.fullValue` on the full record endpoint. |
-| Claygent "Unable to parse output schema" | `answerSchemaType` + `_metadata` missing, or `jsonSchema` single-encoded | Add both inputs with `formulaMap`. `jsonSchema` must be double-encoded: `json.dumps(json.dumps(schema))`. `_metadata` must have `modelSource: '"user"'` (inner quotes). |
-| Formula "Error evaluating formula" | Used `.indexOf()`, `.includes()`, `REGEXMATCH()`, or `LOWER()` | Use `/pattern/i.test(String({{f_id}}) \|\| "")` for matching. See Formula Syntax section. |
+| Claygent "Unable to parse output schema" | `answerSchemaType` missing (a column bound to a saved Claygent needs its own copy), or `jsonSchema` single-encoded | Add `answerSchemaType` with `formulaMap`. `jsonSchema` must be double-encoded: `json.dumps(json.dumps(schema))`. `_metadata` is not part of this: add it only for a bring-your-own-key column, with `modelSource: '"user"'` (inner quotes). See "Saved Claygents". |
+| Formula "Error evaluating formula" | Used a spreadsheet function: `REGEXMATCH()`, `REGEXEXTRACT()` or `LOWER()` (not available in Clay) | Use JavaScript: `/pattern/i.test(String({{f_id}}) \|\| "")`, `String({{f_id}}).toLowerCase()`. See Formula Syntax section. |
+| Formula column produces no cell at all (no value, no error status) | A statement body (`try{...}`, a block-bodied arrow), spread syntax (`{...obj}`, `[...xs]`), or `typeof` / `instanceof` anywhere in the formula | Rewrite it as one expression: ternaries, an expression-bodied arrow IIFE, `Object.assign` / `Array.from`, `Number.isFinite` / `Array.isArray`. See Formula Syntax section ("Does NOT work"). |
 | Webhook columns blank despite data in source | Extraction columns are plain text, not formulas | PATCH with `formulaText: "{{source_field}}?.key"`, `formulaType: "text"`, `dataTypeSettings: {"type": "text"}` |
 | 404 "NoMatchingURL" on `/views/{view_id}/records` | Endpoint does not exist | Use 2-step: `/views/{view_id}/records/ids` then `bulk-fetch-records` |
 | `bulk-fetch-records` 400 error | Empty or missing `recordIds` | Always pass a non-empty `recordIds` array |
@@ -2610,8 +2613,8 @@ Lower-risk footguns trimmed out of `SKILL.md` (the top-3 highest-risk ones remai
 
 - **HTTP API `queryString` and `headers`** must use `formulaMap`, not `formulaText` — `formulaText` splits the JSON character-by-character. Verified 2026-04-23: a `formulaText` value of `'{"q": hello}'` produced `?0={&1="&2=q&3="&4=:&5= &6=h...` when sent. Cell previews (`"Status Code: 200"`) can mask the bug if the target accepts any GET; inspect `externalContent.fullValue` via `GET /tables/{t}/records/{r}` to verify what Clay actually sent.
 - **Formula columns:** create as `text` first, then PATCH with `formulaText` + `formulaType: "text"`. Creating with the formula in one shot drops it.
-- **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded; `_metadata.modelSource` needs inner quotes: `'"user"'`.
-- **Formula string ops:** `.indexOf()` and `.includes()` are unreliable — use `/pattern/i.test(String({{f_id}}) || "")`.
+- **`answerSchemaType`** requires `formulaMap`; `jsonSchema` must be double-JSON-encoded. `_metadata` is a separate input, needed only for bring-your-own-key columns; its `modelSource` needs inner quotes: `'"user"'`.
+- **Formulas that fail silently:** a statement body, spread syntax (`{...obj}`, `[...xs]`), `typeof` or `instanceof` makes the column produce no cell at all, with no error; a text or formula result over 8,192 characters is dropped while the cell still reports SUCCESS; `JSON.stringify` sorts object keys. (`.indexOf()` and `.includes()` work, re-measured 2026-09-30.) Details and workarounds: "Formula Syntax — What Clay Actually Supports".
 - **Lookup columns** use a `fields|` prefix on filter inputs: `fields|targetColumn`, `fields|filterOperator`, `fields|rowValue`. Extractor mechanics (verified 2026-07-24): the CELL value is only the preview string `"✅ Record Found"` (`metadata.isPreview`); the real payload is formula-visible only, shaped `{"record": {"<Column Name>": value, ...}}` keyed by COLUMN NAMES. Bracket-key access works in the formula engine (`{{f_lookup}}?.record?.["Target Column Name"]`); `mappedResultPath` on a formula PATCH does NOT take effect. Lookup execution is 0 credits. Details: action-registry.md → lookup-row-in-other-table.
 - **Webhook source tables** need formula extractors — incoming columns are not auto-populated; PATCH each downstream column with `formulaText` + `formulaType`.
 

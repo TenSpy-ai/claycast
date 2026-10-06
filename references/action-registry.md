@@ -38,7 +38,9 @@ Generates text/JSON from data already in the table. Cheap, fast, deterministic.
 - **gotchas:**
   - actionKey is `"use-ai"`, NOT `"ai"` — `"ai"` silently drops all inputs
   - For JSON output: use Grok + `answerSchemaType`. Gemini/GPT wrap JSON in code fences.
-  - `answerSchemaType` needs `formulaMap` (not `formulaText`) + `_metadata` input with `"modelSource": "user"`
+  - `answerSchemaType` needs `formulaMap` (not `formulaText`). A `_metadata` input with
+    `modelSource: '"user"'` is needed only for a bring-your-own-key column, not for the schema
+    (corrected 2026-08-06, see the checklist in clay-api-reference.md "Creating a Use AI Column")
   - JSON schemas must be double-encoded: `json.dumps(json.dumps(schema))`
 
 ```python
