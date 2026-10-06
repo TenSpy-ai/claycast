@@ -1815,18 +1815,22 @@ clay.patch(path, {
   check it before you use it: it produced **camelCase** keys for a prompt whose instructions and
   downstream code used snake_case, and it wrote descriptions that added rules the prompt did not have.
 
-### Structured output is capped at 4,096 output tokens, and truncation still reports SUCCESS
+### Output is capped at 4,096 tokens per generation, and truncation still reports SUCCESS
 
 The `use-ai` action's `maxTokens` parameter reads *"Defaults to 4096, Maximum of 4096"*
-(`clay workflows actions schema` / `list_actions`), and a Claygent column cannot go above it.
+(`clay workflows actions schema` / `list_actions`). It limits one generation, not the cell's total.
 Measured 2026-09-30 on 12 cells (a ~20-key JSON Schema, `claude-opus-5`, ~26k input tokens):
 **all 12 reported `totalOutputTokens: 4096` exactly**, and on 7 of 12 the object was cut short. The
 **last keys in the answer were simply absent**. That happened even though the schema listed them in
 `required` with `additionalProperties: false`, and every one of those cells still said
 `status: SUCCESS`. The schema is a request, not a guarantee.
 
-- Treat `totalOutputTokens == 4096` as a truncation flag, and validate required keys yourself before
-  you use the object.
+- **The truncation signal is a missing required key, not `totalOutputTokens == 4096`.** Validate the
+  required keys yourself before you use the object. The token count misleads both ways: 5 of the 12
+  cells above read exactly 4096 and were not cut short, and on tool-using (web-search) Claygents
+  `totalOutputTokens` appears to sum over the agent's steps. Complete `SUCCESS` answers from such
+  Claygents read above 4,096 (verified live 2026-10-06), so a cut-short final answer there need not
+  read 4096 at all.
 - Keep a structured answer well under ~4k output tokens. Put the keys you cannot lose **first** in the
   prompt's output instructions (the model writes in that order, so the tail is what gets cut). If the
   answer is genuinely long, split it across two Claygents (a short scoring call and a separate copy
@@ -1864,20 +1868,32 @@ mapping expression changed the prompt's slot to match. Sending the rendered prom
 and matches what the UI sends.
 
 ```python
-# prompt = the Claygent's userPrompt, with {{score_input}} replaced by the column reference
-before, after = v["userPrompt"].split("{{score_input}}")
+import json, re
+
+def lit(s):   # a formula string literal; ensure_ascii=False because Clay rejects \uXXXX escapes
+    return json.dumps(s, ensure_ascii=False)
+
+# each Claygent variable -> the formula expression that feeds it (here, one column reference)
+var_expr = {"score_input": "{{" + input_fid + "}}"}
+mapping = {"{{" + name + "}}": "Clay.formatForAIPrompt(" + expr + ")" for name, expr in var_expr.items()}
+
+# prompt = the Claygent's userPrompt with every {{variable}} replaced by its mapping. re.split with a
+# capture group alternates literal text (even indexes) and variable names (odd indexes); a name may
+# contain spaces, dots or colons, and may appear more than once.
+pieces = re.split(r"\{\{(.+?)\}\}", v["userPrompt"])
+prompt = " + ".join(mapping["{{" + p + "}}"] if i % 2 else lit(p)   # KeyError = a variable with no mapping
+                    for i, p in enumerate(pieces) if p)
+
 bindings = {
     "useCase":   {"formulaText": '"claygent"'},
-    "claygentId": {"formulaText": json.dumps(claygent_id)},
-    "model":     {"formulaText": json.dumps(v["modelSettings"]["model"])},
-    "claygentFieldMapping": {"formulaMap": {
-        "{{score_input}}": "Clay.formatForAIPrompt({{" + input_fid + "}})"}},   # Claygent var -> column
+    "claygentId": {"formulaText": lit(claygent_id)},
+    "model":     {"formulaText": lit(v["modelSettings"]["model"])},
+    "claygentFieldMapping": {"formulaMap": mapping},                # Claygent var -> expression
     # REQUIRED even though the Claygent already has it:
     "answerSchemaType": {"formulaMap": {"type": '"json"', "jsonType": '"JSONSchema"',
-                                        "jsonSchema": json.dumps(v["outputFormat"]["jsonSchema"])}},
+                                        "jsonSchema": lit(v["outputFormat"]["jsonSchema"])}},
     # Optional: Clay replaces it with its own rendering (see above).
-    "prompt":    {"formulaText": json.dumps(before) + " + Clay.formatForAIPrompt({{" + input_fid + "}}) + "
-                                 + json.dumps(after)},
+    "prompt":    {"formulaText": prompt},
 }
 ```
 
@@ -1900,9 +1916,10 @@ bindings = {
 
 ### Workflow agent nodes are PINNED to a Claygent version
 
-A workflow agent node stores `agentClaygentId` **and** `claygentVersionId`, both on the node record
-and inside `nodeConfig`. PATCHing the Claygent mints a new version, **and the node keeps running the
-old one**:
+A workflow agent node stores `claygentId` **and** `claygentVersionId` on the node record, and repeats
+`claygentVersionId` inside `nodeConfig` (some nodes also carry `claygentId` there). `agentClaygentId`
+is the official CLI's node-edit input for the same id, not a stored key. PATCHing the Claygent mints
+a new version, **and the node keeps running the old one**:
 
 - workflow **runs** use the pinned version;
 - single-node **tests** (`clay workflows nodes test`) use the latest version;
