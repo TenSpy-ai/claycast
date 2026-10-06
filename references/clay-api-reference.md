@@ -1701,9 +1701,9 @@ cell exists that flips when the work is done, gate on that cell instead.
 
 ## Table run traps: out-of-date cells, error propagation, error views (verified 2026-09-30)
 
-Measured on a 7-row table with 10 action/AI columns (web-research Claygents, a scoring Claygent, SOQL
-lookups) and 49 formula columns, run from the UI with auto-run OFF. Two of these traps spend money,
-and one silently destroys finished answers.
+Measured on a small table with several AI/action columns (Claygents and SOQL lookups) and a long
+formula chain, run from the UI with auto-run OFF. Two of these traps spend money, and one silently
+destroys finished answers.
 
 ### "Out of date": what re-arms a finished AI cell
 
