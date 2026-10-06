@@ -75,7 +75,7 @@ These methods are live-verified in the current ClayCast SDK and are the preferre
   - `top_n=` + `view_id=` (`viewIdTopRecords`)
   - `force_run=`
   - omitted field list = resolve all runnable fields (`action`, `enrichment`, `source`, `waterfall`, `claygent`)
-  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) Columns with `conditionalRunFormulaText` whose condition doesn't pass are skipped with a completely blank cell — no status, no error; `force_run=True` bypasses. (b) `use-ai` columns never executed via the API at all in testing (claygent-useCase; the plain `"use-ai"` useCase DOES auto-run on arriving rows — see the corrected scheduling-boundary entry in "AI Columns"; its run_column/force-run path is untested) — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
+  - **Silent-skip gotchas (verified 2026-07-30):** the ACK (`{"runMode": "INDIVIDUAL"}`) does NOT mean the run will execute. (a) A column whose `conditionalRunFormulaText` doesn't pass behaves per action: `http-api-v2` rows were skipped with a completely blank cell — no status, no error — and `force_run=True` bypassed the gate; SOQL rows record `ERROR_RUN_CONDITION_NOT_MET` (2026-09-30); `execute-subroutine` honors the gate even with `force_run=True` (2026-08-06). See "Conditional Execution". (b) `use-ai` columns never executed via the API at all in testing (claygent-useCase; the plain `"use-ai"` useCase DOES auto-run on arriving rows — see the corrected scheduling-boundary entry in "AI Columns"; its run_column/force-run path is untested) — and (verified 2026-08-06) provider enrichment actions (e.g. `leadmagic-enrich-company`) stall the same way on dark tables — see "AI Columns" checklist below. `lookup-row-in-other-table` columns ran fine through the same call in the same session.
 - `clay.get_run_status(table_id)` normalizes both `GET /tables/{t}/fieldrun` and `GET /workspaces/{ws}/tables/{t}/fields/runstatus`.
 - `clay.wait_for_runs(...)` is the shared polling / stall-detection surface used to cover the Datagen job-monitor behavior.
 - `clay.rerun_errored_cells(...)` is the SDK recipe for Datagen `rerun_errors`: find the Errored Rows view, inspect which specific cells failed, then re-run only those field+record combinations.
@@ -1711,14 +1711,23 @@ Add `conditionalRunFormulaText` to `typeSettings` to gate column execution:
 # When condition not met, cell status is ERROR_RUN_CONDITION_NOT_MET
 ```
 
-**API-run skip is SILENT (verified 2026-07-30):** triggering a gated column via
-`run_column` when the condition doesn't pass leaves the cell **completely blank** (`{}` —
-no value, no metadata status; the `ERROR_RUN_CONDITION_NOT_MET` status above was observed
-in other contexts, not on API-triggered runs). Worse, a `!!{{boolean_field}}`-style gate
-was observed skipping even when the referenced gate cell read `true` — evaluation
-semantics are unclear (possibly stale-dependency related). `force_run: true` bypasses the
-conditional and is the reliable manual-activation path; treat `conditionalRunFormulaText`
-as a spend-guard for auto-run mode, not as logic you can depend on during API-driven runs.
+**API-run gate behaviour is action-dependent:** what `run_column` does with a row whose
+condition doesn't pass was measured per action, and the actions disagree:
+- **`http-api-v2` (verified 2026-07-30):** the cell stays **completely blank** (`{}` — no
+  value, no metadata status). Worse, a `!!{{boolean_field}}`-style gate was observed skipping
+  even when the referenced gate cell read `true` — evaluation semantics are unclear (possibly
+  stale-dependency related). `force_run: true` bypassed the conditional. `use-ai` Claygent
+  columns stayed blank too, but those never execute from the API at all (see "Creating a Use
+  AI Column"), so their blank cell says nothing about the gate.
+- **SOQL lookups (verified 2026-09-30):** a non-forced run recorded
+  `ERROR_RUN_CONDITION_NOT_MET` on the gated rows, as in the comment above.
+- **`execute-subroutine` (verified 2026-08-06):** even `force_run=True` honored the gate
+  (`ERROR_RUN_CONDITION_NOT_MET` on gate-failing rows); a non-forced run of this action parks
+  at `QUEUED` (see "Creating a Use AI Column").
+
+So a blank cell after an API run can be a gate skip, and `force_run` is not a universal bypass.
+Treat `conditionalRunFormulaText` as a spend-guard for auto-run mode, not as logic you can
+depend on during API-driven runs; pass only the `record_ids` you mean to run.
 
 **Gate references are dependency-DAG edges (verified 2026-08-06):** PATCHing an action
 column whose `conditionalRunFormulaText` references a formula column that — transitively,
